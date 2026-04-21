@@ -90,7 +90,31 @@ class PairingRegistry:
         self.path = Path(path)
         self._allowed: dict[str, dict[str, AllowedEntry]] = {}  # platform -> user_id -> entry
         self._pending: dict[str, dict[str, PendingEntry]] = {}
+        self._last_mtime: float = 0.0
         self.reload()
+        self._last_mtime = self._current_mtime()
+
+    # -- mtime-based hot reload ------------------------------
+
+    def _current_mtime(self) -> float:
+        try:
+            return self.path.stat().st_mtime
+        except FileNotFoundError:
+            return 0.0
+
+    def reload_if_changed(self) -> bool:
+        """Re-read the yaml iff its mtime changed since the last read/write.
+
+        Returns True if a reload actually happened, False otherwise. Used by
+        the gateway's pairing-watcher task so CLI-side `yuxu pair approve`
+        takes effect inside a running daemon without a restart.
+        """
+        m = self._current_mtime()
+        if m == self._last_mtime:
+            return False
+        self.reload()
+        self._last_mtime = m
+        return True
 
     # -- persistence -----------------------------------------
 
@@ -156,6 +180,7 @@ class PairingRegistry:
             yaml.safe_dump(out, sort_keys=False, allow_unicode=True),
             encoding="utf-8",
         )
+        self._last_mtime = self._current_mtime()
 
     # -- queries ---------------------------------------------
 

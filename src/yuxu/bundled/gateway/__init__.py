@@ -233,10 +233,16 @@ async def start(ctx) -> None:
     global _manager
     pairing, required = _build_pairing()
     pending_tmpl = os.environ.get("GATEWAY_PAIRING_PENDING_MESSAGE") or None
+    poll_raw = os.environ.get("GATEWAY_PAIRING_POLL_SEC", "").strip()
+    try:
+        poll_sec = float(poll_raw) if poll_raw else 1.0
+    except ValueError:
+        poll_sec = 1.0
     _manager = GatewayManager(
         ctx.bus, pairing=pairing,
         pairing_required_platforms=required,
         pending_reply_template=pending_tmpl,
+        pairing_poll_seconds=max(0.0, poll_sec),
     )
     for adapter in _build_adapters():
         try:

@@ -21,6 +21,11 @@ log = logging.getLogger(__name__)
 
 CANCEL_TOKENS = {"/stop", "/cancel"}
 
+# How often the pairing-watcher task re-stats pairings.yaml. Cheap (one
+# stat() call) so the default is aggressive enough for CLI→daemon hot
+# reload to feel immediate without burning measurable CPU.
+DEFAULT_PAIRING_POLL_SEC = 1.0
+
 DEFAULT_PENDING_TEMPLATE = (
     "👋 你好，我还没被授权和你聊天。\n"
     "请把下面这行命令发给管理员，让他批准：\n\n"
@@ -35,7 +40,8 @@ class GatewayManager:
     def __init__(self, bus, *,
                  pairing: Optional[PairingRegistry] = None,
                  pairing_required_platforms: Optional[set[str]] = None,
-                 pending_reply_template: Optional[str] = None) -> None:
+                 pending_reply_template: Optional[str] = None,
+                 pairing_poll_seconds: float = DEFAULT_PAIRING_POLL_SEC) -> None:
         self.bus = bus
         self.adapters: dict[str, PlatformAdapter] = {}
         self.sessions: dict[str, SessionEntry] = {}
@@ -47,6 +53,8 @@ class GatewayManager:
         )
         # Plugin command registry:  "/dashboard" -> {agent, help}
         self.commands: dict[str, dict] = {}
+        self._pairing_poll_seconds = pairing_poll_seconds
+        self._pairing_watch_task: Optional[asyncio.Task] = None
         self._started = False
 
     # -- adapter wiring --------------------------------------------
@@ -69,17 +77,52 @@ class GatewayManager:
             except Exception:
                 log.exception("gateway: adapter %s failed to connect",
                               adapter.platform)
+        if self.pairing is not None and self._pairing_poll_seconds > 0:
+            self._pairing_watch_task = asyncio.create_task(
+                self._pairing_watch_loop(),
+                name="gateway.pairing_watch",
+            )
         self._started = True
 
     async def stop(self) -> None:
         self._started = False
         self.bus.unsubscribe("gateway.reply", self._on_reply_topic)
+        if self._pairing_watch_task is not None:
+            self._pairing_watch_task.cancel()
+            try:
+                await asyncio.wait_for(self._pairing_watch_task, timeout=2.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                pass
+            self._pairing_watch_task = None
         for adapter in self.adapters.values():
             try:
                 await adapter.disconnect()
             except Exception:
                 log.exception("gateway: adapter %s disconnect raised",
                               adapter.platform)
+
+    async def _pairing_watch_loop(self) -> None:
+        """Poll pairings.yaml mtime; reload in-memory registry on change.
+
+        Lets `yuxu pair approve` in another process take effect inside a
+        running daemon without a restart. Cheap: one stat() per tick.
+        """
+        while True:
+            try:
+                await asyncio.sleep(self._pairing_poll_seconds)
+            except asyncio.CancelledError:
+                raise
+            if self.pairing is None:
+                continue
+            try:
+                if self.pairing.reload_if_changed():
+                    log.info("gateway: pairings reloaded from %s",
+                             self.pairing.path)
+                    await self.bus.publish("gateway.pairings_reloaded", {
+                        "path": str(self.pairing.path),
+                    })
+            except Exception:
+                log.exception("gateway: pairings reload failed")
 
     # -- inbound: adapter -> bus -----------------------------------
 
