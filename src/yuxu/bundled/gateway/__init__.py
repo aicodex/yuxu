@@ -47,19 +47,48 @@ def _build_adapters() -> list:
             ),
             api_base=os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org"),
         ))
-    # feishu: opt-in via app_id + app_secret (outbound only for now)
-    fs_app_id = os.environ.get("FEISHU_APP_ID", "").strip()
-    fs_app_secret = os.environ.get("FEISHU_APP_SECRET", "").strip()
+    # feishu: env vars win, else fall back to config/secrets/feishu.yaml
+    # (written by `yuxu feishu register`).
+    fs_app_id, fs_app_secret, fs_api_base, fs_rit = _load_feishu_config()
     if fs_app_id and fs_app_secret:
         adapters.append(FeishuAdapter(
             app_id=fs_app_id,
             app_secret=fs_app_secret,
-            api_base=os.environ.get("FEISHU_API_BASE", "https://open.feishu.cn"),
-            default_receive_id_type=os.environ.get(
-                "FEISHU_RECEIVE_ID_TYPE", "chat_id",
-            ),
+            api_base=fs_api_base,
+            default_receive_id_type=fs_rit,
         ))
     return adapters
+
+
+def _load_feishu_config() -> tuple[str, str, str, str]:
+    """Return (app_id, app_secret, api_base, receive_id_type).
+
+    Priority: env vars > ./config/secrets/feishu.yaml.
+    """
+    app_id = os.environ.get("FEISHU_APP_ID", "").strip()
+    app_secret = os.environ.get("FEISHU_APP_SECRET", "").strip()
+    api_base = os.environ.get("FEISHU_API_BASE", "").strip()
+    rit = os.environ.get("FEISHU_RECEIVE_ID_TYPE", "chat_id").strip()
+
+    if not (app_id and app_secret):
+        from pathlib import Path as _P
+        cfg_path = _P("config/secrets/feishu.yaml")
+        if cfg_path.exists():
+            try:
+                import yaml as _yaml
+                data = _yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+            except Exception:
+                log.exception("gateway: failed to read %s", cfg_path)
+                data = {}
+            app_id = app_id or str(data.get("app_id", "")).strip()
+            app_secret = app_secret or str(data.get("app_secret", "")).strip()
+            if not api_base:
+                domain = str(data.get("domain") or "feishu")
+                api_base = ("https://open.larksuite.com" if domain == "lark"
+                             else "https://open.feishu.cn")
+    if not api_base:
+        api_base = "https://open.feishu.cn"
+    return app_id, app_secret, api_base, rit
 
 
 async def start(ctx) -> None:

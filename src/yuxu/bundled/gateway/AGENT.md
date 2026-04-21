@@ -26,6 +26,19 @@ ready_timeout: 10
 | `FEISHU_API_BASE` | 可选，默认 `https://open.feishu.cn`；国际版 Lark 用 `https://open.larksuite.com` |
 | `FEISHU_RECEIVE_ID_TYPE` | 可选，默认 `chat_id`；可选 `open_id` / `user_id` / `email` / `union_id` |
 
+**Feishu 凭证获取**：不用手动去管理后台建应用。跑一次扫码：
+
+```
+yuxu feishu register               # 默认 feishu 域
+yuxu feishu register --lark         # Lark 国际版
+yuxu feishu register --no-save      # 不写文件，打印 export 语句让你手贴 shell
+```
+
+用户手机扫码 + Feishu App 内授权后，**Feishu 自动建好一个 bot 应用**，
+CLI 会把 `{app_id, app_secret, domain, open_id, bot_name}` 写到
+`<project>/config/secrets/feishu.yaml`（`.gitignore` 已包含），下次
+`yuxu serve` 启动时 gateway 自动读取。
+
 ## 操作（通过 `bus.request("gateway", {...})`)
 
 ### 简单发送

@@ -25,6 +25,11 @@ dev = [
     "pytest-asyncio>=0.21",
     "ruff",
 ]
+# Optional terminal QR for `yuxu feishu register`. Falls back to
+# printing the URL when qrcode is not installed.
+qr = [
+    "qrcode>=7.0",
+]
 
 [project.scripts]
 yuxu = "yuxu.cli.app:main"

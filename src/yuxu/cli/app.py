@@ -106,6 +106,65 @@ def _cmd_version(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_feishu_register(args: argparse.Namespace) -> int:
+    """Scan-to-create Feishu/Lark onboarding. Saves credentials to
+    <project>/config/secrets/feishu.yaml unless --no-save."""
+    from ..bundled.gateway.adapters.feishu_onboard import register_feishu
+
+    domain = "lark" if args.lark else "feishu"
+    print(f"[yuxu] Starting Feishu/Lark ({domain}) onboarding...")
+    creds = register_feishu(initial_domain=domain, timeout_seconds=args.timeout)
+    if not creds:
+        print("error: onboarding failed (denied, timed out, or network error).",
+              file=sys.stderr)
+        return 1
+
+    print("[yuxu] ✓ Registered.")
+    print(f"        app_id:       {creds['app_id']}")
+    print(f"        domain:       {creds['domain']}")
+    if creds.get("bot_name"):
+        print(f"        bot_name:     {creds['bot_name']}")
+    if creds.get("bot_open_id"):
+        print(f"        bot_open_id:  {creds['bot_open_id']}")
+    if creds.get("open_id"):
+        print(f"        your open_id: {creds['open_id']}")
+
+    if args.no_save:
+        base = ("larksuite.com" if creds["domain"] == "lark"
+                else "feishu.cn")
+        print("\n[yuxu] --no-save: not writing credentials. Export yourself:")
+        print(f"  export FEISHU_APP_ID='{creds['app_id']}'")
+        print(f"  export FEISHU_APP_SECRET='{creds['app_secret']}'")
+        print(f"  export FEISHU_API_BASE='https://open.{base}'")
+        return 0
+
+    project = Path(args.project or ".").expanduser().resolve()
+    if not (project / "yuxu.json").exists():
+        print(f"error: {project} is not a yuxu project (no yuxu.json). "
+              f"Run `yuxu init` first, or use --no-save.",
+              file=sys.stderr)
+        return 1
+
+    import yaml as _yaml
+    secrets_dir = project / "config" / "secrets"
+    secrets_dir.mkdir(parents=True, exist_ok=True)
+    target = secrets_dir / "feishu.yaml"
+    target.write_text(
+        _yaml.safe_dump({
+            "app_id":       creds["app_id"],
+            "app_secret":   creds["app_secret"],
+            "domain":       creds["domain"],
+            "open_id":      creds.get("open_id"),
+            "bot_name":     creds.get("bot_name"),
+            "bot_open_id":  creds.get("bot_open_id"),
+        }, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+    print(f"\n[yuxu] Credentials saved to {target}")
+    print("[yuxu] `yuxu serve` will pick them up automatically next run.")
+    return 0
+
+
 # -- parser -----------------------------------------------------
 
 
@@ -161,6 +220,25 @@ def build_parser() -> argparse.ArgumentParser:
     # version
     p_ver = subs.add_parser("version", help="Print yuxu version.")
     p_ver.set_defaults(func=_cmd_version)
+
+    # feishu
+    p_fs = subs.add_parser("feishu",
+                            help="Feishu / Lark onboarding + bot management.")
+    fs_subs = p_fs.add_subparsers(dest="feishu_cmd", required=True)
+    p_fs_reg = fs_subs.add_parser(
+        "register",
+        help="Scan-to-create: show QR, user scans in Feishu app, "
+             "we get app_id+app_secret.",
+    )
+    p_fs_reg.add_argument("--project", default=None,
+                          help="Project dir to save credentials into (default: cwd).")
+    p_fs_reg.add_argument("--lark", action="store_true",
+                          help="Use Lark (international) instead of Feishu.")
+    p_fs_reg.add_argument("--timeout", type=int, default=600,
+                          help="Max seconds to wait for QR scan (default 600).")
+    p_fs_reg.add_argument("--no-save", action="store_true",
+                          help="Don't write to config/secrets/feishu.yaml; print env vars instead.")
+    p_fs_reg.set_defaults(func=_cmd_feishu_register)
 
     return p
 
