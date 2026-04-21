@@ -50,6 +50,8 @@ yuxu = [
     "bundled/**/*.yml",
     "templates/**/*",
     "templates/**/.gitignore",
+    "examples/**/*.md",
+    "examples/**/*.yaml",
 ]
 
 [tool.ruff]

@@ -106,6 +106,78 @@ def _cmd_version(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_examples_list(args: argparse.Namespace) -> int:
+    """List shipped example agents."""
+    import yuxu.examples
+    root = Path(yuxu.examples.__file__).parent
+    names = sorted(
+        d.name for d in root.iterdir()
+        if d.is_dir() and not d.name.startswith((".", "_"))
+    )
+    if not names:
+        print("(no examples)")
+        return 0
+    for n in names:
+        agent_md = root / n / "AGENT.md"
+        summary = ""
+        if agent_md.exists():
+            # Take the first non-frontmatter, non-header line as summary.
+            in_fm = False
+            for line in agent_md.read_text(encoding="utf-8").splitlines():
+                s = line.strip()
+                if s == "---":
+                    in_fm = not in_fm
+                    continue
+                if in_fm or not s or s.startswith("#"):
+                    continue
+                summary = s
+                break
+        print(f"  {n:<15} {summary}")
+    return 0
+
+
+def _cmd_examples_install(args: argparse.Namespace) -> int:
+    """Copy an example agent into <project>/agents/."""
+    import shutil
+
+    import yuxu.examples
+    examples_root = Path(yuxu.examples.__file__).parent
+    src = examples_root / args.name
+    if not src.is_dir():
+        available = sorted(
+            d.name for d in examples_root.iterdir()
+            if d.is_dir() and not d.name.startswith((".", "_"))
+        )
+        print(f"error: no such example: {args.name!r}. "
+              f"Available: {', '.join(available) or '(none)'}",
+              file=sys.stderr)
+        return 1
+
+    project = Path(args.project or ".").expanduser().resolve()
+    if not (project / "yuxu.json").exists():
+        print(f"error: {project} is not a yuxu project (no yuxu.json). "
+              f"Run `yuxu init` first.", file=sys.stderr)
+        return 1
+
+    dest = project / "agents" / args.name
+    if dest.exists() and not args.force:
+        print(f"error: {dest} already exists. Use --force to overwrite.",
+              file=sys.stderr)
+        return 1
+    if dest.exists():
+        shutil.rmtree(dest)
+
+    shutil.copytree(src, dest,
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    # prune .gitkeep placeholder from agents/
+    gk = project / "agents" / ".gitkeep"
+    if gk.exists():
+        gk.unlink()
+    print(f"[yuxu] Installed example {args.name!r} → {dest}")
+    print("[yuxu] Next: cd to the project and `yuxu serve`.")
+    return 0
+
+
 def _cmd_feishu_register(args: argparse.Namespace) -> int:
     """Scan-to-create Feishu/Lark onboarding. Saves credentials to
     <project>/config/secrets/feishu.yaml unless --no-save."""
@@ -220,6 +292,23 @@ def build_parser() -> argparse.ArgumentParser:
     # version
     p_ver = subs.add_parser("version", help="Print yuxu version.")
     p_ver.set_defaults(func=_cmd_version)
+
+    # examples
+    p_ex = subs.add_parser("examples",
+                            help="Shipped example agents.")
+    ex_subs = p_ex.add_subparsers(dest="examples_cmd", required=True)
+    p_ex_list = ex_subs.add_parser("list", help="List available examples.")
+    p_ex_list.set_defaults(func=_cmd_examples_list)
+    p_ex_install = ex_subs.add_parser(
+        "install",
+        help="Copy an example agent into <project>/agents/.",
+    )
+    p_ex_install.add_argument("name", help="Example folder name, e.g. echo_bot.")
+    p_ex_install.add_argument("--project", default=None,
+                               help="Project dir (default: cwd).")
+    p_ex_install.add_argument("--force", action="store_true",
+                               help="Overwrite if already present.")
+    p_ex_install.set_defaults(func=_cmd_examples_install)
 
     # feishu
     p_fs = subs.add_parser("feishu",
