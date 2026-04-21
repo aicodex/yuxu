@@ -14,6 +14,7 @@ from typing import Optional
 
 from .adapters.base import PlatformAdapter
 from .draft import DraftHandle, DraftMessage
+from .pairing import PairingRegistry
 from .session import InboundMessage, SendResult, SessionEntry, SessionSource
 
 log = logging.getLogger(__name__)
@@ -24,11 +25,15 @@ CANCEL_TOKENS = {"/stop", "/cancel"}
 class GatewayManager:
     NAME = "gateway"
 
-    def __init__(self, bus) -> None:
+    def __init__(self, bus, *,
+                 pairing: Optional[PairingRegistry] = None,
+                 pairing_required_platforms: Optional[set[str]] = None) -> None:
         self.bus = bus
         self.adapters: dict[str, PlatformAdapter] = {}
         self.sessions: dict[str, SessionEntry] = {}
         self.drafts: dict[str, DraftHandle] = {}
+        self.pairing = pairing
+        self.pairing_required: set[str] = set(pairing_required_platforms or [])
         self._started = False
 
     # -- adapter wiring --------------------------------------------
@@ -77,7 +82,39 @@ class GatewayManager:
                                    {"session_key": msg.session_key})
             return
 
+        # Pairing gate: if platform requires pairing and user isn't allowed,
+        # stash as pending + notify admins instead of delivering.
+        if self._pairing_gate_blocks(msg):
+            await self._record_and_notify_pending(msg)
+            return
+
         await self.bus.publish("gateway.user_message", msg.as_dict())
+
+    def _pairing_gate_blocks(self, msg: InboundMessage) -> bool:
+        if self.pairing is None:
+            return False
+        if msg.source.platform not in self.pairing_required:
+            return False
+        user_id = msg.source.user_id or ""
+        if not user_id:
+            # Anonymous inbound on a pairing-required platform — block.
+            return True
+        return not self.pairing.is_allowed(msg.source.platform, user_id)
+
+    async def _record_and_notify_pending(self, msg: InboundMessage) -> None:
+        user_id = msg.source.user_id or "<anonymous>"
+        self.pairing.add_pending(
+            msg.source.platform, user_id,
+            first_message=msg.text[:200],
+            chat_id=msg.source.chat_id,
+        )
+        await self.bus.publish("gateway.pairing_requested", {
+            "platform": msg.source.platform,
+            "user_id": user_id,
+            "chat_id": msg.source.chat_id,
+            "first_message": msg.text,
+            "session_key": msg.session_key,
+        })
 
     # -- outbound: bus -> adapter ----------------------------------
 
@@ -196,6 +233,14 @@ class GatewayManager:
                 return await self._op_update_draft(payload)
             if op == "close_draft":
                 return await self._op_close_draft(payload)
+            if op == "pair_list":
+                return self._op_pair_list(payload)
+            if op == "pair_approve":
+                return self._op_pair_approve(payload)
+            if op == "pair_reject":
+                return self._op_pair_reject(payload)
+            if op == "pair_revoke":
+                return self._op_pair_revoke(payload)
             return {"ok": False, "error": f"unknown op: {op!r}"}
         except KeyError as e:
             return {"ok": False, "error": f"missing field: {e.args[0]}"}
@@ -256,3 +301,46 @@ class GatewayManager:
             return {"ok": False, "error": "unknown draft_id"}
         await handle.close()
         return {"ok": True, "message_id": handle.message_id}
+
+    # -- pairing ops ------------------------------------------------
+
+    def _op_pair_list(self, payload: dict) -> dict:
+        if self.pairing is None:
+            return {"ok": False, "error": "pairing not enabled"}
+        platform = payload.get("platform")
+        return {
+            "ok": True,
+            "allowed": [e.as_dict() | {"platform": e.platform}
+                        for e in self.pairing.list_allowed(platform)],
+            "pending": [e.as_dict() | {"platform": e.platform}
+                        for e in self.pairing.list_pending(platform)],
+            "required_platforms": sorted(self.pairing_required),
+        }
+
+    def _op_pair_approve(self, payload: dict) -> dict:
+        if self.pairing is None:
+            return {"ok": False, "error": "pairing not enabled"}
+        platform = payload.get("platform")
+        user_id = payload.get("user_id")
+        if not platform or not user_id:
+            return {"ok": False, "error": "platform and user_id required"}
+        entry = self.pairing.approve_pending(
+            platform, user_id, note=payload.get("note", ""),
+        )
+        return {"ok": True, "approved": entry.as_dict() | {"platform": platform}}
+
+    def _op_pair_reject(self, payload: dict) -> dict:
+        if self.pairing is None:
+            return {"ok": False, "error": "pairing not enabled"}
+        removed = self.pairing.reject_pending(
+            payload.get("platform", ""), payload.get("user_id", ""),
+        )
+        return {"ok": True, "removed": removed}
+
+    def _op_pair_revoke(self, payload: dict) -> dict:
+        if self.pairing is None:
+            return {"ok": False, "error": "pairing not enabled"}
+        removed = self.pairing.revoke_allowed(
+            payload.get("platform", ""), payload.get("user_id", ""),
+        )
+        return {"ok": True, "removed": removed}

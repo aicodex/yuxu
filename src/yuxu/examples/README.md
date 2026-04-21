@@ -85,7 +85,65 @@ different user turns still produces fresh cards. If you want to verify
 the in-draft dedup, the test suite covers it
 (`tests/test_gateway_draft.py::test_dedup_skips_identical_snapshots`).
 
-### Scenario 4 — Telegram path (optional)
+### Scenario 4 — Feishu inbound without public HTTPS
+
+You don't need a public URL or reverse proxy to smoke the Feishu path.
+`yuxu feishu inject-event` posts a synthetic event to the local webhook.
+Combined with the **pairing gate** you can test the trust-bootstrap
+flow end-to-end.
+
+```bash
+# 1. Scan-to-create a Feishu bot (see `yuxu feishu register` — you only need
+#    to do this once; it creates an app and saves app_id/app_secret).
+# 2. Enable webhook + pairing.
+cat >> /tmp/yuxu_demo/config/secrets/feishu.yaml <<'YAML'
+webhook_host: 127.0.0.1
+webhook_port: 7001
+# verification_token: left empty → inject-event passes straight through
+YAML
+export GATEWAY_PAIRING_PLATFORMS=feishu   # require pairing for feishu
+yuxu serve
+```
+
+In a second terminal:
+
+```bash
+# Try to "send" a message as an unknown user.
+yuxu feishu inject-event --text "hello" --user-id ou_alice --chat-id oc_x \
+  --project /tmp/yuxu_demo
+```
+
+**Expect first time**: no card in the serve terminal. The user is unknown,
+the gateway holds the message and emits `gateway.pairing_requested`.
+Now on the admin side:
+
+```bash
+yuxu pair list --project /tmp/yuxu_demo
+# [pairing] pending (1):
+#    ⏳ feishu     ou_alice                     2026-...  "hello"
+
+yuxu pair approve feishu ou_alice --project /tmp/yuxu_demo --note "QA"
+# [pairing] ✓ approved feishu:ou_alice
+```
+
+Now retry (or send any new text):
+```bash
+yuxu feishu inject-event --text "hello again" --user-id ou_alice --chat-id oc_x
+```
+
+**Expect**: echo_bot now sees the user as allowed; its streaming draft
+flows via FeishuAdapter.render_draft → PATCH /im/v1/messages/{id}
+(the card update will fail if your app lacks permissions to the chat,
+but you can see the adapter did make the call in the log — that
+proves the full path worked).
+
+**Pre-provisioning for solo testing**: add yourself before the first message:
+```bash
+yuxu pair approve feishu ou_your_open_id --project /tmp/yuxu_demo --note "me"
+```
+(Your `open_id` was printed by `yuxu feishu register` as `your open_id: ou_...`.)
+
+### Scenario 5 — Telegram path (optional)
 
 Point a real Telegram bot at your daemon (long-poll):
 ```bash
@@ -100,7 +158,7 @@ for the quote + blockquote for thinking + content + italic footer.
 Same quote/thinking/content/footer layout, edited in place as chunks
 stream (because `TelegramAdapter.supports_edit=True`).
 
-### Scenario 5 — swap in a real LLM (optional)
+### Scenario 6 — swap in a real LLM (optional)
 
 The echo_bot is mock only. For a real-LLM test, drop the example and
 wire `llm_driver` + `llm_service` yourself:

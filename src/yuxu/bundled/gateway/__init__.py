@@ -5,8 +5,11 @@ import logging
 import os
 from typing import Optional
 
+from pathlib import Path
+
 from .adapters import ConsoleAdapter, FeishuAdapter, TelegramAdapter
 from .handler import GatewayManager
+from .pairing import DEFAULT_PAIRING_PATH, PairingRegistry
 
 NAME = "gateway"
 
@@ -160,9 +163,22 @@ def _load_feishu_config() -> dict:
     }
 
 
+def _build_pairing() -> tuple[PairingRegistry, set[str]]:
+    path = Path(os.environ.get("GATEWAY_PAIRING_PATH") or DEFAULT_PAIRING_PATH)
+    required = {
+        p.strip() for p in
+        (os.environ.get("GATEWAY_PAIRING_PLATFORMS") or "").split(",")
+        if p.strip()
+    }
+    return PairingRegistry(path), required
+
+
 async def start(ctx) -> None:
     global _manager
-    _manager = GatewayManager(ctx.bus)
+    pairing, required = _build_pairing()
+    _manager = GatewayManager(
+        ctx.bus, pairing=pairing, pairing_required_platforms=required,
+    )
     for adapter in _build_adapters():
         try:
             _manager.register_adapter(adapter)

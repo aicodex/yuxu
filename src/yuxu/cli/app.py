@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import Optional
 
 from ..bundled.project_manager.handler import ProjectManager
 from .bootstrap import ensure_home, home_dir
@@ -178,6 +179,136 @@ def _cmd_examples_install(args: argparse.Namespace) -> int:
     return 0
 
 
+def _pairing_registry(project: Path):
+    from ..bundled.gateway.pairing import PairingRegistry
+    return PairingRegistry(project / "config" / "secrets" / "pairings.yaml")
+
+
+def _project_dir(args: argparse.Namespace) -> Optional["Path"]:
+    target = Path(args.project or ".").expanduser().resolve()
+    if not (target / "yuxu.json").exists():
+        print(f"error: {target} is not a yuxu project (no yuxu.json). "
+              f"Run `yuxu init` first, or pass --project DIR.",
+              file=sys.stderr)
+        return None
+    return target
+
+
+def _cmd_pair_list(args: argparse.Namespace) -> int:
+    project = _project_dir(args)
+    if project is None:
+        return 1
+    reg = _pairing_registry(project)
+    platform = args.platform
+    allowed = reg.list_allowed(platform)
+    pending = reg.list_pending(platform)
+    print(f"[pairing] file: {reg.path}")
+    print(f"[pairing] allowed ({len(allowed)}):")
+    for e in allowed:
+        note = f" — {e.note}" if e.note else ""
+        print(f"   ✓ {e.platform:<10} {e.user_id:<28} {e.approved_at}{note}")
+    print(f"[pairing] pending ({len(pending)}):")
+    for e in pending:
+        snippet = e.first_message.replace("\n", " ")[:40]
+        print(f"   ⏳ {e.platform:<10} {e.user_id:<28} {e.first_seen} "
+              f'"{snippet}"')
+    return 0
+
+
+def _cmd_pair_approve(args: argparse.Namespace) -> int:
+    project = _project_dir(args)
+    if project is None:
+        return 1
+    reg = _pairing_registry(project)
+    reg.approve_pending(args.platform, args.user_id, note=args.note or "")
+    print(f"[pairing] ✓ approved {args.platform}:{args.user_id}")
+    return 0
+
+
+def _cmd_pair_reject(args: argparse.Namespace) -> int:
+    project = _project_dir(args)
+    if project is None:
+        return 1
+    reg = _pairing_registry(project)
+    removed = reg.reject_pending(args.platform, args.user_id)
+    if removed:
+        print(f"[pairing] ✗ rejected {args.platform}:{args.user_id}")
+    else:
+        print(f"[pairing] (no pending record for {args.platform}:{args.user_id})")
+    return 0
+
+
+def _cmd_pair_revoke(args: argparse.Namespace) -> int:
+    project = _project_dir(args)
+    if project is None:
+        return 1
+    reg = _pairing_registry(project)
+    removed = reg.revoke_allowed(args.platform, args.user_id)
+    if removed:
+        print(f"[pairing] ↺ revoked {args.platform}:{args.user_id}")
+    else:
+        print(f"[pairing] (not currently allowed)")
+    return 0
+
+
+def _cmd_feishu_inject_event(args: argparse.Namespace) -> int:
+    """POST a synthetic Feishu event to the local webhook for testing.
+
+    Lets you verify the full inbound path (webhook → parse → gateway →
+    agent) without needing a public HTTPS URL.
+    """
+    import asyncio
+    import json
+    import time as _time
+
+    if args.file:
+        try:
+            payload = json.loads(Path(args.file).read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+    elif args.text is not None:
+        # Synthesize a minimal im.message.receive_v1 event
+        payload = {
+            "header": {"event_type": "im.message.receive_v1"},
+            "event": {
+                "sender": {"sender_id": {"open_id": args.user_id or "ou_tester"}},
+                "message": {
+                    "message_id": "om_test_" + str(int(_time.time() * 1000)),
+                    "message_type": "text",
+                    "chat_id": args.chat_id or "oc_test",
+                    "chat_type": args.chat_type,
+                    "content": json.dumps({"text": args.text}, ensure_ascii=False),
+                },
+            },
+        }
+    else:
+        print("error: must provide --file or --text", file=sys.stderr)
+        return 1
+
+    url = args.url
+    headers = {"Content-Type": "application/json"}
+    if args.token:
+        # Inject the verification token into the payload (for plaintext mode)
+        payload.setdefault("token", args.token)
+
+    async def _post():
+        import httpx
+        async with httpx.AsyncClient() as c:
+            resp = await c.post(url, json=payload, headers=headers, timeout=10.0)
+            return resp.status_code, resp.text
+    try:
+        status, body = asyncio.run(_post())
+    except Exception as e:
+        import traceback as _tb
+        print(f"error: {e!r}", file=sys.stderr)
+        _tb.print_exc(file=sys.stderr)
+        return 1
+    print(f"[feishu inject-event] {url} → HTTP {status}")
+    print(body)
+    return 0 if status < 400 else 1
+
+
 def _cmd_feishu_register(args: argparse.Namespace) -> int:
     """Scan-to-create Feishu/Lark onboarding. Saves credentials to
     <project>/config/secrets/feishu.yaml unless --no-save."""
@@ -310,6 +441,44 @@ def build_parser() -> argparse.ArgumentParser:
                                help="Overwrite if already present.")
     p_ex_install.set_defaults(func=_cmd_examples_install)
 
+    # pair
+    p_pair = subs.add_parser("pair",
+                              help="Manage per-platform pairing (allowlist + pending).")
+    pair_subs = p_pair.add_subparsers(dest="pair_cmd", required=True)
+    p_pair_list = pair_subs.add_parser("list", help="Show allowed + pending pairings.")
+    p_pair_list.add_argument("--project", default=None)
+    p_pair_list.add_argument("--platform", default=None,
+                              help="Filter (e.g. 'feishu', 'telegram').")
+    p_pair_list.set_defaults(func=_cmd_pair_list)
+
+    def _add_id_args(sp):
+        sp.add_argument("platform", help="Platform name (feishu, telegram, ...).")
+        sp.add_argument("user_id", help="Platform-specific user id (e.g. open_id).")
+        sp.add_argument("--project", default=None)
+
+    p_pair_approve = pair_subs.add_parser(
+        "approve",
+        help="Approve pending (or pre-provision) a user.",
+    )
+    _add_id_args(p_pair_approve)
+    p_pair_approve.add_argument("--note", default=None,
+                                 help="Human-readable note (e.g. Alice / QA tester).")
+    p_pair_approve.set_defaults(func=_cmd_pair_approve)
+
+    p_pair_reject = pair_subs.add_parser(
+        "reject",
+        help="Drop a pending user without approving.",
+    )
+    _add_id_args(p_pair_reject)
+    p_pair_reject.set_defaults(func=_cmd_pair_reject)
+
+    p_pair_revoke = pair_subs.add_parser(
+        "revoke",
+        help="Remove a currently-allowed user.",
+    )
+    _add_id_args(p_pair_revoke)
+    p_pair_revoke.set_defaults(func=_cmd_pair_revoke)
+
     # feishu
     p_fs = subs.add_parser("feishu",
                             help="Feishu / Lark onboarding + bot management.")
@@ -328,6 +497,27 @@ def build_parser() -> argparse.ArgumentParser:
     p_fs_reg.add_argument("--no-save", action="store_true",
                           help="Don't write to config/secrets/feishu.yaml; print env vars instead.")
     p_fs_reg.set_defaults(func=_cmd_feishu_register)
+
+    p_fs_inj = fs_subs.add_parser(
+        "inject-event",
+        help="POST a synthetic Feishu event to the local webhook "
+             "(tests inbound path without needing a public HTTPS URL).",
+    )
+    p_fs_inj.add_argument("--url", default="http://127.0.0.1:7001/feishu/webhook",
+                           help="Local webhook URL.")
+    p_fs_inj.add_argument("--text", default=None,
+                           help="Synthesize a plain text message with this content.")
+    p_fs_inj.add_argument("--file", default=None,
+                           help="Post this JSON file (raw event payload).")
+    p_fs_inj.add_argument("--user-id", default=None,
+                           help="sender open_id for synthesized event (default ou_tester).")
+    p_fs_inj.add_argument("--chat-id", default=None,
+                           help="chat_id for synthesized event (default oc_test).")
+    p_fs_inj.add_argument("--chat-type", default="p2p",
+                           choices=["p2p", "group"])
+    p_fs_inj.add_argument("--token", default=None,
+                           help="verification_token to include in the payload.")
+    p_fs_inj.set_defaults(func=_cmd_feishu_inject_event)
 
     return p
 
