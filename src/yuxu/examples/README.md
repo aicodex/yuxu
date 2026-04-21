@@ -151,7 +151,34 @@ yuxu pair approve feishu ou_your_open_id --project /tmp/yuxu_demo --note "me"
 ```
 (Your `open_id` was printed by `yuxu feishu register` as `your open_id: ou_...`.)
 
-### Scenario 5 — Telegram path (optional)
+### Scenario 5 — `/dashboard` live card + `/help` plugin
+
+The `dashboard` and `help_plugin` bundled agents ship with every
+project and auto-register their slash commands when gateway starts.
+
+**Type:** `/help`
+
+**Expect:** the gateway replies with a formatted list of every
+registered `/xxx` and its one-line help string (e.g. `/dashboard`,
+`/help`, `/stop`). Try `/help /dashboard` for single-command detail.
+
+**Type:** `/dashboard`
+
+**Expect:** a DraftMessage opens in this session and refreshes every
+second. Footer shows `Dashboard: 🔄 Live`. Content lists every agent
+bucketed by status (ready / running / loading / failed / stopped).
+
+**Type:** `hello` (any non-slash message)
+
+**Expect:** the dashboard freezes, footer flips to `📴 Exited`,
+content marks `frozen`, and no further edits happen. Re-invoking
+`/dashboard` opens a fresh card.
+
+`/dashboard` refresh rate is controlled by env `DASHBOARD_REFRESH_SEC`
+(default `1.0`). Any other registered `/cmd` sent into an active
+dashboard session also exits it — exactly one card per session.
+
+### Scenario 6 — Telegram path (optional)
 
 Point a real Telegram bot at your daemon (long-poll):
 ```bash
@@ -166,7 +193,7 @@ for the quote + blockquote for thinking + content + italic footer.
 Same quote/thinking/content/footer layout, edited in place as chunks
 stream (because `TelegramAdapter.supports_edit=True`).
 
-### Scenario 6 — swap in a real LLM (optional)
+### Scenario 7 — swap in a real LLM (optional)
 
 The echo_bot is mock only. For a real-LLM test, drop the example and
 wire `llm_driver` + `llm_service` yourself:

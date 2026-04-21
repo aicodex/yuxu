@@ -45,6 +45,8 @@ class GatewayManager:
         self.pending_reply_template = (
             pending_reply_template or DEFAULT_PENDING_TEMPLATE
         )
+        # Plugin command registry:  "/dashboard" -> {agent, help}
+        self.commands: dict[str, dict] = {}
         self._started = False
 
     # -- adapter wiring --------------------------------------------
@@ -98,6 +100,24 @@ class GatewayManager:
         if self._pairing_gate_blocks(msg):
             await self._record_and_notify_pending(msg)
             return
+
+        # Slash-command routing: if the first token is a registered command,
+        # publish gateway.command_invoked instead of gateway.user_message.
+        # Unknown commands fall through as a normal user message.
+        if msg.text.startswith("/") and " " not in msg.text[:1]:
+            parts = msg.text.split(maxsplit=1)
+            command = parts[0]
+            if command in self.commands:
+                await self.bus.publish("gateway.command_invoked", {
+                    "command": command,
+                    "args": parts[1] if len(parts) > 1 else "",
+                    "handler_agent": self.commands[command].get("agent"),
+                    "source": msg.source.as_dict(),
+                    "session_key": msg.session_key,
+                    "raw_text": msg.text,
+                    "ts": msg.ts,
+                })
+                return
 
         await self.bus.publish("gateway.user_message", msg.as_dict())
 
@@ -270,6 +290,12 @@ class GatewayManager:
                 return await self._op_update_draft(payload)
             if op == "close_draft":
                 return await self._op_close_draft(payload)
+            if op == "register_command":
+                return self._op_register_command(payload)
+            if op == "unregister_command":
+                return self._op_unregister_command(payload)
+            if op == "list_commands":
+                return {"ok": True, "commands": dict(self.commands)}
             if op == "pair_list":
                 return self._op_pair_list(payload)
             if op == "pair_approve":
@@ -338,6 +364,25 @@ class GatewayManager:
             return {"ok": False, "error": "unknown draft_id"}
         await handle.close()
         return {"ok": True, "message_id": handle.message_id}
+
+    # -- command registry ops ---------------------------------------
+
+    def _op_register_command(self, payload: dict) -> dict:
+        command = str(payload.get("command", "")).strip()
+        if not command or not command.startswith("/"):
+            return {"ok": False, "error": "command must start with '/'"}
+        if " " in command:
+            return {"ok": False, "error": "command may not contain spaces"}
+        self.commands[command] = {
+            "agent": payload.get("agent", ""),
+            "help": payload.get("help", ""),
+        }
+        return {"ok": True}
+
+    def _op_unregister_command(self, payload: dict) -> dict:
+        command = str(payload.get("command", "")).strip()
+        self.commands.pop(command, None)
+        return {"ok": True}
 
     # -- pairing ops ------------------------------------------------
 

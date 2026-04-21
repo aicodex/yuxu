@@ -87,6 +87,31 @@ publish 到 `gateway.user_message` topic。
 | `pair_approve` | `{platform, user_id, note?}` | `{ok, approved}` |
 | `pair_reject` | `{platform, user_id}` | `{ok, removed}` |
 | `pair_revoke` | `{platform, user_id}` | `{ok, removed}` |
+| `register_command` | `{command:"/x", agent, help?}` | `{ok}` |
+| `unregister_command` | `{command:"/x"}` | `{ok}` |
+| `list_commands` | `{}` | `{ok, commands: {"/x": {agent, help}, ...}}` |
+
+### Slash-command 路由
+
+消息以 `/` 开头且首 token 命中命令注册表时，gateway 不再 publish `gateway.user_message`，
+而是 publish `gateway.command_invoked`：
+
+```
+gateway.command_invoked
+  payload: {
+    command: "/dashboard",
+    args: "",                 # /help /dashboard 时 args 就是 "/dashboard"
+    handler_agent: "dashboard",
+    source: {...}, session_key, raw_text, ts
+  }
+```
+
+未命中的 `/xxx` 走正常 `gateway.user_message`（给未来的 shell/router 自己拒绝或兜底）。
+`/stop` / `/cancel` 始终优先走 `gateway.user_cancel`，不受注册表影响。
+
+插件 agent（如 `dashboard` / `help_plugin`）在 `start(ctx)` 里通过
+`bus.request("gateway", {op:"register_command", command, agent, help})` 注册自己，
+stop 时无需显式反注册（loader 卸载后命令再被调用也无害——对应 agent 只是不响应）。
 
 ### 结构化 draft（OpenClaw 风格，quote + 💭thinking + content + footer 卡片）
 
@@ -131,6 +156,12 @@ gateway.user_message
 
 gateway.user_cancel         # 用户发了 /stop
   payload: { session_key: str }
+
+gateway.command_invoked     # 已注册的 /xxx（详见上面 "Slash-command 路由"）
+  payload: { command, args, handler_agent, source, session_key, raw_text, ts }
+
+gateway.pairing_requested   # 未批准用户首条消息（如果 platform 在 pairing 名单里）
+  payload: { platform, user_id, chat_id, first_message, session_key }
 ```
 
 ## 订阅的事件
