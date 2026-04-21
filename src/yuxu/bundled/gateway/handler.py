@@ -21,19 +21,30 @@ log = logging.getLogger(__name__)
 
 CANCEL_TOKENS = {"/stop", "/cancel"}
 
+DEFAULT_PENDING_TEMPLATE = (
+    "👋 你好，我还没被授权和你聊天。\n"
+    "请把下面这行命令发给管理员，让他批准：\n\n"
+    "    yuxu pair approve {platform} {user_id}\n\n"
+    "（你的 id: {user_id}）"
+)
+
 
 class GatewayManager:
     NAME = "gateway"
 
     def __init__(self, bus, *,
                  pairing: Optional[PairingRegistry] = None,
-                 pairing_required_platforms: Optional[set[str]] = None) -> None:
+                 pairing_required_platforms: Optional[set[str]] = None,
+                 pending_reply_template: Optional[str] = None) -> None:
         self.bus = bus
         self.adapters: dict[str, PlatformAdapter] = {}
         self.sessions: dict[str, SessionEntry] = {}
         self.drafts: dict[str, DraftHandle] = {}
         self.pairing = pairing
         self.pairing_required: set[str] = set(pairing_required_platforms or [])
+        self.pending_reply_template = (
+            pending_reply_template or DEFAULT_PENDING_TEMPLATE
+        )
         self._started = False
 
     # -- adapter wiring --------------------------------------------
@@ -115,6 +126,32 @@ class GatewayManager:
             "first_message": msg.text,
             "session_key": msg.session_key,
         })
+        await self._send_pending_reply(msg, user_id)
+
+    async def _send_pending_reply(self, msg: InboundMessage, user_id: str) -> None:
+        """Reply to the unapproved user with the approval hint."""
+        adapter = self.adapters.get(msg.source.platform)
+        if adapter is None:
+            return
+        try:
+            text = self.pending_reply_template.format(
+                platform=msg.source.platform,
+                user_id=user_id,
+                chat_id=msg.source.chat_id,
+            )
+        except (KeyError, IndexError):
+            text = DEFAULT_PENDING_TEMPLATE.format(
+                platform=msg.source.platform, user_id=user_id,
+                chat_id=msg.source.chat_id,
+            )
+        try:
+            await adapter.send(msg.source, text)
+        except Exception:
+            log.exception("gateway: pending-reply send failed for %s/%s",
+                          msg.source.platform, user_id)
+            return
+        if self.pairing is not None:
+            self.pairing.mark_notified(msg.source.platform, user_id)
 
     # -- outbound: bus -> adapter ----------------------------------
 

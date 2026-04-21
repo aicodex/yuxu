@@ -176,8 +176,11 @@ def _build_pairing() -> tuple[PairingRegistry, set[str]]:
 async def start(ctx) -> None:
     global _manager
     pairing, required = _build_pairing()
+    pending_tmpl = os.environ.get("GATEWAY_PAIRING_PENDING_MESSAGE") or None
     _manager = GatewayManager(
-        ctx.bus, pairing=pairing, pairing_required_platforms=required,
+        ctx.bus, pairing=pairing,
+        pairing_required_platforms=required,
+        pending_reply_template=pending_tmpl,
     )
     for adapter in _build_adapters():
         try:

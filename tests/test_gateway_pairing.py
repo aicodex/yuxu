@@ -186,6 +186,109 @@ async def test_gateway_pairing_cancel_still_bypasses(tmp_path):
     assert len(cancel_events) == 1
 
 
+async def test_gateway_pending_sends_reply_to_unknown_user(tmp_path):
+    """Unknown user's first message gets a "please get admin approval" reply."""
+    from yuxu.bundled.gateway.handler import GatewayManager as GM
+    # Reuse the RecordingAdapter from the draft tests' module pattern
+    from yuxu.bundled.gateway.adapters.base import PlatformAdapter as _PA
+    from yuxu.bundled.gateway.session import SendResult as _SR
+
+    class Rec(_PA):
+        platform = "feishu"
+
+        def __init__(self):
+            super().__init__()
+            self.outbox = []
+
+        async def connect(self): pass
+        async def disconnect(self): pass
+
+        async def send(self, source, text, *, reply_to_message_id=None):
+            self.outbox.append((source.user_id, text))
+            return _SR(ok=True, message_id="m1")
+
+    bus = Bus()
+    reg = PairingRegistry(tmp_path / "p.yaml")
+    gm = GM(bus, pairing=reg, pairing_required_platforms={"feishu"})
+    adapter = Rec()
+    gm.register_adapter(adapter)
+    await gm.start()
+    try:
+        await gm._on_inbound(InboundMessage(
+            source=SessionSource(platform="feishu", chat_id="oc_x",
+                                  user_id="ou_alice"),
+            text="hello",
+        ))
+        await asyncio.sleep(0)
+
+        assert len(adapter.outbox) == 1
+        sent_user, sent_text = adapter.outbox[0]
+        assert sent_user == "ou_alice"
+        # Default template mentions the approval command with user's id.
+        assert "ou_alice" in sent_text
+        assert "yuxu pair approve" in sent_text
+        assert "feishu" in sent_text
+
+        # Pending now marked as notified
+        pending = reg.list_pending("feishu")
+        assert len(pending) == 1
+        assert pending[0].notified_at is not None
+    finally:
+        await gm.stop()
+
+
+async def test_gateway_pending_reply_uses_custom_template(tmp_path):
+    from yuxu.bundled.gateway.handler import GatewayManager as GM
+    from yuxu.bundled.gateway.adapters.base import PlatformAdapter as _PA
+    from yuxu.bundled.gateway.session import SendResult as _SR
+
+    class Rec(_PA):
+        platform = "feishu"
+
+        def __init__(self):
+            super().__init__()
+            self.outbox = []
+
+        async def connect(self): pass
+        async def disconnect(self): pass
+
+        async def send(self, source, text, *, reply_to_message_id=None):
+            self.outbox.append(text)
+            return _SR(ok=True)
+
+    bus = Bus()
+    reg = PairingRegistry(tmp_path / "p.yaml")
+    gm = GM(bus, pairing=reg, pairing_required_platforms={"feishu"},
+             pending_reply_template="⚠ {user_id} awaits approval on {platform}.")
+    adapter = Rec()
+    gm.register_adapter(adapter)
+    await gm.start()
+    try:
+        await gm._on_inbound(InboundMessage(
+            source=SessionSource(platform="feishu", chat_id="c", user_id="ou_z"),
+            text="x",
+        ))
+        await asyncio.sleep(0)
+        assert adapter.outbox == ["⚠ ou_z awaits approval on feishu."]
+    finally:
+        await gm.stop()
+
+
+async def test_gateway_pending_reply_no_adapter_no_crash(tmp_path):
+    """If the platform has no adapter wired (edge case), we still don't crash."""
+    from yuxu.bundled.gateway.handler import GatewayManager as GM
+    bus = Bus()
+    reg = PairingRegistry(tmp_path / "p.yaml")
+    gm = GM(bus, pairing=reg, pairing_required_platforms={"feishu"})
+    # NO adapter registered for feishu
+    await gm._on_inbound(InboundMessage(
+        source=SessionSource(platform="feishu", chat_id="c", user_id="ou_x"),
+        text="hi",
+    ))
+    # Pending was still recorded; no exception
+    assert len(reg.list_pending("feishu")) == 1
+
+
 async def test_gateway_pairing_anonymous_inbound_blocked(tmp_path):
     bus = Bus()
     reg = PairingRegistry(tmp_path / "p.yaml")

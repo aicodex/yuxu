@@ -113,8 +113,16 @@ yuxu feishu inject-event --text "hello" --user-id ou_alice --chat-id oc_x \
   --project /tmp/yuxu_demo
 ```
 
-**Expect first time**: no card in the serve terminal. The user is unknown,
-the gateway holds the message and emits `gateway.pairing_requested`.
+**Expect first time**:
+- No echo card in serve terminal (user isn't allowed)
+- Gateway **auto-replies to Alice** via the Feishu adapter with something like:
+  > 👋 你好，我还没被授权和你聊天。请把下面这行命令发给管理员：
+  >
+  > `yuxu pair approve feishu ou_alice`
+  >
+  > （你的 id: ou_alice）
+- `gateway.pairing_requested` event fans out (visible to future notification agent)
+
 Now on the admin side:
 
 ```bash

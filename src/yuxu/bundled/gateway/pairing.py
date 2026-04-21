@@ -52,6 +52,7 @@ class PendingEntry:
     first_seen: str = field(default_factory=_now_iso)
     first_message: str = ""
     chat_id: Optional[str] = None
+    notified_at: Optional[str] = None   # last time we replied "still pending"
 
     def as_dict(self) -> dict:
         return {
@@ -59,6 +60,7 @@ class PendingEntry:
             "first_seen": self.first_seen,
             "first_message": self.first_message,
             "chat_id": self.chat_id,
+            "notified_at": self.notified_at,
         }
 
 
@@ -126,6 +128,7 @@ class PairingRegistry:
                     first_seen=str(raw.get("first_seen") or _now_iso()),
                     first_message=str(raw.get("first_message") or ""),
                     chat_id=raw.get("chat_id"),
+                    notified_at=raw.get("notified_at"),
                 )
                 self._pending.setdefault(platform, {})[e.user_id] = e
 
@@ -214,6 +217,12 @@ class PairingRegistry:
             self.save()
             return True
         return False
+
+    def mark_notified(self, platform: str, user_id: str) -> None:
+        entry = self._pending.get(platform, {}).get(user_id)
+        if entry is not None:
+            entry.notified_at = _now_iso()
+            self.save()
 
     def allow(self, platform: str, user_id: str, *, note: str = "") -> AllowedEntry:
         """Pre-allow a user without them ever having been pending.
