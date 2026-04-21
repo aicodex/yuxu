@@ -208,6 +208,71 @@ async def test_handle_raises_after_close():
         h.set_content("too late")
 
 
+async def test_dedup_skips_identical_snapshots():
+    ad = RecordingAdapter()
+    h = DraftHandle(adapter=ad, source=_src(), throttle_seconds=0.0)
+    await h.open()
+    h.set_content("same")
+    await h.flush()           # sends
+    h.set_content("same")     # no change
+    await h.flush()           # should skip
+    h.set_content("same")
+    await h.flush()           # still skip
+    sends = [c for c in ad.calls if c[0] == "send"]
+    edits = [c for c in ad.calls if c[0] == "edit"]
+    assert len(sends) == 1 and len(edits) == 0
+
+
+async def test_dedup_sees_any_field_change():
+    ad = RecordingAdapter()
+    h = DraftHandle(adapter=ad, source=_src(), throttle_seconds=0.0)
+    await h.open()
+    h.set_content("a"); await h.flush()   # send
+    h.set_thinking("x"); await h.flush()  # thinking changed → edit
+    h.set_footer_meta([("K", "V")]); await h.flush()  # footer changed → edit
+    h.set_quote("alice", "hi"); await h.flush()  # quote changed → edit
+    edits = [c for c in ad.calls if c[0] == "edit"]
+    assert len(edits) == 3
+
+
+async def test_finalize_always_flushes_even_if_unchanged():
+    ad = RecordingAdapter()
+    h = DraftHandle(adapter=ad, source=_src(), throttle_seconds=0.0)
+    await h.open()
+    h.set_content("stable")
+    await h.flush()  # send
+    await h.close()  # finalize — even though content unchanged, goes out
+    finals = [c for c in ad.calls if c[0] == "edit" and c[1]["finalize"]]
+    assert len(finals) == 1
+
+
+async def test_on_close_callback_fires():
+    ad = RecordingAdapter()
+    closed: list = []
+    h = DraftHandle(adapter=ad, source=_src(),
+                    on_close=lambda h: closed.append(h.id))
+    await h.open()
+    h.set_content("x")
+    await h.close()
+    assert closed == [h.id]
+
+
+async def test_manager_drops_handle_after_close():
+    bus = __import__("yuxu").core.Bus()
+    gm = GatewayManager(bus)
+    adapter = RecordingAdapter()
+    gm.register_adapter(adapter)
+    await gm.start()
+    try:
+        handle = gm.open_draft(source=_src(), throttle_seconds=5.0)
+        await handle.open()
+        assert handle.id in gm.drafts
+        await handle.close()
+        assert handle.id not in gm.drafts   # GC'd via on_close
+    finally:
+        await gm.stop()
+
+
 async def test_handle_append_accumulates():
     ad = RecordingAdapter()
     h = DraftHandle(adapter=ad, source=_src(), throttle_seconds=5.0)

@@ -155,12 +155,19 @@ class GatewayManager:
             quote_text=quote_text,
             footer_meta=list(footer_meta) if footer_meta else [],
         )
-        kwargs: dict = {"adapter": adapter, "source": resolved, "draft": draft}
+        kwargs: dict = {
+            "adapter": adapter, "source": resolved, "draft": draft,
+            "on_close": self._drop_draft,
+        }
         if throttle_seconds is not None:
             kwargs["throttle_seconds"] = throttle_seconds
         handle = DraftHandle(**kwargs)
         self.drafts[handle.id] = handle
         return handle
+
+    def _drop_draft(self, handle: DraftHandle) -> None:
+        """Called by DraftHandle.close() to GC long-lived handles."""
+        self.drafts.pop(handle.id, None)
 
     def get_draft(self, draft_id: str) -> Optional[DraftHandle]:
         return self.drafts.get(draft_id)

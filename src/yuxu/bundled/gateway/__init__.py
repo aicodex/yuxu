@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import os
 
-from .adapters import ConsoleAdapter, TelegramAdapter
+from .adapters import ConsoleAdapter, FeishuAdapter, TelegramAdapter
 from .handler import GatewayManager
 
 NAME = "gateway"
@@ -46,6 +46,18 @@ def _build_adapters() -> list:
                 os.environ.get("TELEGRAM_ALLOWED_USER_IDS"),
             ),
             api_base=os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org"),
+        ))
+    # feishu: opt-in via app_id + app_secret (outbound only for now)
+    fs_app_id = os.environ.get("FEISHU_APP_ID", "").strip()
+    fs_app_secret = os.environ.get("FEISHU_APP_SECRET", "").strip()
+    if fs_app_id and fs_app_secret:
+        adapters.append(FeishuAdapter(
+            app_id=fs_app_id,
+            app_secret=fs_app_secret,
+            api_base=os.environ.get("FEISHU_API_BASE", "https://open.feishu.cn"),
+            default_receive_id_type=os.environ.get(
+                "FEISHU_RECEIVE_ID_TYPE", "chat_id",
+            ),
         ))
     return adapters
 

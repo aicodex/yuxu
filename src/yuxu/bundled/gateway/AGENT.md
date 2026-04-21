@@ -22,6 +22,9 @@ ready_timeout: 10
 | `GATEWAY_CONSOLE_ENABLED` | `true/false`，默认 `true`。stdin/stdout 本地调试入口 |
 | `TELEGRAM_BOT_TOKEN` | 设了才启 telegram adapter，long-poll 模式 |
 | `TELEGRAM_ALLOWED_USER_IDS` | 可选，逗号分隔的 Telegram user_id 白名单 |
+| `FEISHU_APP_ID` + `FEISHU_APP_SECRET` | 两个都设才启 feishu adapter（**当前只支持出站**：发消息/发卡片/编辑卡片） |
+| `FEISHU_API_BASE` | 可选，默认 `https://open.feishu.cn`；国际版 Lark 用 `https://open.larksuite.com` |
+| `FEISHU_RECEIVE_ID_TYPE` | 可选，默认 `chat_id`；可选 `open_id` / `user_id` / `email` / `union_id` |
 
 ## 操作（通过 `bus.request("gateway", {...})`)
 

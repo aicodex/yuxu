@@ -121,7 +121,8 @@ class DraftHandle:
     def __init__(self, *, adapter: "PlatformAdapter", source: "SessionSource",
                  draft: Optional[DraftMessage] = None,
                  throttle_seconds: float = DEFAULT_THROTTLE_SECONDS,
-                 draft_id: Optional[str] = None) -> None:
+                 draft_id: Optional[str] = None,
+                 on_close: Optional[callable] = None) -> None:
         self.id = draft_id or uuid.uuid4().hex[:12]
         self.adapter = adapter
         self.source = source
@@ -133,6 +134,8 @@ class DraftHandle:
         self._last_flush_mono = 0.0
         self._pending_task: Optional[asyncio.Task] = None
         self._lock = asyncio.Lock()
+        self._last_state_key: Optional[tuple] = None
+        self._on_close = on_close
 
     # -- public update API -------------------------------------
 
@@ -220,6 +223,12 @@ class DraftHandle:
                 )
             except (asyncio.TimeoutError, Exception):
                 log.exception("draft: finalize flush failed for %s", self.id)
+        # Notify owner (e.g. GatewayManager.drafts registry) so it can GC.
+        if self._on_close is not None:
+            try:
+                self._on_close(self)
+            except Exception:
+                log.exception("draft: on_close callback raised for %s", self.id)
 
     # -- internal ----------------------------------------------
 
@@ -227,6 +236,17 @@ class DraftHandle:
         if not self._open:
             return
         snapshot = self.draft.copy()
+        state_key = (
+            snapshot.content, snapshot.thinking,
+            snapshot.quote_user, snapshot.quote_text,
+            tuple(snapshot.footer_meta),
+        )
+        # Skip redundant edits: unchanged state + not finalize = no-op.
+        # Finalize always flushes because some adapters (console) only emit
+        # on finalize, and because idempotent final send is a safety.
+        if not finalize and state_key == self._last_state_key:
+            return
+        self._last_state_key = state_key
         result = await self.adapter.render_draft(
             self.source, snapshot,
             message_id=self.message_id, finalize=finalize,
