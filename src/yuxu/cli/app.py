@@ -27,12 +27,26 @@ def _cmd_init(args: argparse.Namespace) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 1
     print(f"[yuxu] Initialized project at {p}")
+
+    # Interactive chat-platform setup (skippable via --skip-setup or no-TTY).
+    if not args.skip_setup and sys.stdin.isatty():
+        from .setup_wizard import run_setup_wizard
+        run_setup_wizard(p, interactive=True)
+
     print("[yuxu] Next steps:")
     print(f"  cd {p}")
     print("  # edit config/rate_limits.yaml to add your LLM API key")
     print("  yuxu new agent <name>      # scaffold a business agent")
     print("  yuxu serve                 # run the daemon")
     return 0
+
+
+def _cmd_setup(args: argparse.Namespace) -> int:
+    """Re-run the chat-platform setup wizard on an existing project."""
+    from .setup_wizard import run_setup_wizard
+    project = Path(args.project or ".").expanduser().resolve()
+    interactive = (not args.non_interactive) and sys.stdin.isatty()
+    return run_setup_wizard(project, interactive=interactive)
 
 
 def _cmd_new_agent(args: argparse.Namespace) -> int:
@@ -384,7 +398,21 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Project directory (default: cwd).")
     p_init.add_argument("--force", action="store_true",
                         help="Overwrite existing yuxu.json.")
+    p_init.add_argument("--skip-setup", action="store_true",
+                        help="Skip the interactive chat-platform wizard. "
+                             "Run `yuxu setup` later to configure.")
     p_init.set_defaults(func=_cmd_init)
+
+    # setup
+    p_setup = subs.add_parser(
+        "setup",
+        help="Interactive chat-platform wizard (feishu / telegram / skip).",
+    )
+    p_setup.add_argument("--project", default=None,
+                         help="Project dir (default: cwd).")
+    p_setup.add_argument("--non-interactive", action="store_true",
+                         help="Only print status; don't prompt.")
+    p_setup.set_defaults(func=_cmd_setup)
 
     # new
     p_new = subs.add_parser("new", help="Scaffold an agent / skill from a template.")

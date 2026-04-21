@@ -23,8 +23,8 @@ ready_timeout: 10
 | `GATEWAY_PAIRING_PLATFORMS` | 逗号分隔的平台名（如 `feishu,telegram`），这些平台走**配对审批**：未知 user_id 首次发消息时暂留到 pending，管理员 `yuxu pair approve` 后才放行 |
 | `GATEWAY_PAIRING_PATH` | 可选，默认 `config/secrets/pairings.yaml` |
 | `GATEWAY_PAIRING_PENDING_MESSAGE` | 可选，自定义"未批准"回复模板（支持 `{platform}` / `{user_id}` / `{chat_id}` 占位） |
-| `TELEGRAM_BOT_TOKEN` | 设了才启 telegram adapter，默认 long-poll 模式 |
-| `TELEGRAM_ALLOWED_USER_IDS` | 可选，逗号分隔的 Telegram user_id 白名单 |
+| `TELEGRAM_BOT_TOKEN` | 设了才启 telegram adapter，默认 long-poll 模式（也可写入 `config/secrets/telegram.yaml`，env > yaml）|
+| `TELEGRAM_ALLOWED_USER_IDS` | 可选，逗号分隔的 Telegram user_id 白名单（也可写入 telegram.yaml 下的 list）|
 | `TELEGRAM_WEBHOOK_HOST` + `TELEGRAM_WEBHOOK_PORT` | 设了这两个即进入 **webhook 模式**（与 long-poll 互斥） |
 | `TELEGRAM_WEBHOOK_PATH` | 可选，默认 `/telegram/webhook` |
 | `TELEGRAM_WEBHOOK_PUBLIC_URL` | webhook 模式用：告诉 Telegram 该往哪儿推（**必须 HTTPS**，走反代）。不设则只起本地 server，不自动 setWebhook |

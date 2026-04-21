@@ -41,37 +41,23 @@ def _build_adapters() -> list:
     console_flag = os.environ.get("GATEWAY_CONSOLE_ENABLED", "true").lower()
     if console_flag in ("1", "true", "yes", "on"):
         adapters.append(ConsoleAdapter())
-    # telegram: opt-in via bot token
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-    if token:
+    # telegram: env vars win, else fall back to config/secrets/telegram.yaml
+    # (written by `yuxu setup`).
+    tg = _load_telegram_config()
+    if tg["bot_token"]:
         tg_kwargs: dict = {
-            "bot_token": token,
+            "bot_token": tg["bot_token"],
             "allowed_user_ids": _parse_allowed_user_ids(
-                os.environ.get("TELEGRAM_ALLOWED_USER_IDS"),
+                tg["allowed_user_ids"],
             ),
-            "api_base": os.environ.get("TELEGRAM_API_BASE",
-                                       "https://api.telegram.org"),
+            "api_base": tg["api_base"],
         }
-        # Optional webhook mode (otherwise long-poll).
-        wh_host = os.environ.get("TELEGRAM_WEBHOOK_HOST", "").strip()
-        wh_port_str = os.environ.get("TELEGRAM_WEBHOOK_PORT", "").strip()
-        if wh_host and wh_port_str:
-            try:
-                wh_port = int(wh_port_str)
-            except ValueError:
-                wh_port = None
-            if wh_port is not None:
-                tg_kwargs["webhook_host"] = wh_host
-                tg_kwargs["webhook_port"] = wh_port
-                tg_kwargs["webhook_path"] = os.environ.get(
-                    "TELEGRAM_WEBHOOK_PATH", "/telegram/webhook",
-                )
-                tg_kwargs["webhook_secret_token"] = os.environ.get(
-                    "TELEGRAM_WEBHOOK_SECRET_TOKEN", "",
-                ) or None
-                tg_kwargs["webhook_public_url"] = os.environ.get(
-                    "TELEGRAM_WEBHOOK_PUBLIC_URL", "",
-                ) or None
+        if tg["webhook_host"] and tg["webhook_port"] is not None:
+            tg_kwargs["webhook_host"] = tg["webhook_host"]
+            tg_kwargs["webhook_port"] = tg["webhook_port"]
+            tg_kwargs["webhook_path"] = tg["webhook_path"]
+            tg_kwargs["webhook_secret_token"] = tg["webhook_secret_token"] or None
+            tg_kwargs["webhook_public_url"] = tg["webhook_public_url"] or None
         adapters.append(TelegramAdapter(**tg_kwargs))
     # feishu: env vars win, else fall back to config/secrets/feishu.yaml
     # (written by `yuxu feishu register`).
@@ -90,6 +76,76 @@ def _build_adapters() -> list:
             bot_open_id=fs["bot_open_id"] or None,
         ))
     return adapters
+
+
+def _load_telegram_config() -> dict:
+    """Merge env vars (win) with config/secrets/telegram.yaml (fallback).
+
+    Returns a dict with:
+        bot_token, allowed_user_ids (raw csv str or None), api_base,
+        webhook_host, webhook_port (int|None), webhook_path,
+        webhook_secret_token, webhook_public_url
+    """
+    from pathlib import Path as _P
+
+    def _e(k, default=""):
+        return os.environ.get(k, "").strip() or default
+
+    data: dict = {}
+    cfg_path = _P("config/secrets/telegram.yaml")
+    if cfg_path.exists():
+        try:
+            import yaml as _yaml
+            data = _yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            log.exception("gateway: failed to read %s", cfg_path)
+            data = {}
+
+    def _merge(env_key: str, yaml_key: str, default: str = "") -> str:
+        return _e(env_key) or str(data.get(yaml_key) or "").strip() or default
+
+    bot_token = _merge("TELEGRAM_BOT_TOKEN", "bot_token")
+
+    # allowed_user_ids can be csv string in env, or list[int] in yaml.
+    env_allowed = _e("TELEGRAM_ALLOWED_USER_IDS")
+    if env_allowed:
+        allowed_raw: Optional[str] = env_allowed
+    else:
+        yaml_allowed = data.get("allowed_user_ids")
+        if isinstance(yaml_allowed, (list, tuple)):
+            allowed_raw = ",".join(str(x) for x in yaml_allowed)
+        elif isinstance(yaml_allowed, (int, str)) and str(yaml_allowed).strip():
+            allowed_raw = str(yaml_allowed).strip()
+        else:
+            allowed_raw = None
+
+    api_base = _merge("TELEGRAM_API_BASE", "api_base",
+                      "https://api.telegram.org")
+
+    webhook_host = _merge("TELEGRAM_WEBHOOK_HOST", "webhook_host")
+    port_str = _merge("TELEGRAM_WEBHOOK_PORT", "webhook_port")
+    webhook_port: Optional[int]
+    if not port_str:
+        webhook_port = None
+    else:
+        try:
+            webhook_port = int(port_str)
+        except ValueError:
+            webhook_port = None
+
+    return {
+        "bot_token": bot_token,
+        "allowed_user_ids": allowed_raw,
+        "api_base": api_base,
+        "webhook_host": webhook_host,
+        "webhook_port": webhook_port,
+        "webhook_path": _merge("TELEGRAM_WEBHOOK_PATH", "webhook_path",
+                                "/telegram/webhook"),
+        "webhook_secret_token": _merge("TELEGRAM_WEBHOOK_SECRET_TOKEN",
+                                        "webhook_secret_token"),
+        "webhook_public_url": _merge("TELEGRAM_WEBHOOK_PUBLIC_URL",
+                                      "webhook_public_url"),
+    }
 
 
 def _load_feishu_config() -> dict:
