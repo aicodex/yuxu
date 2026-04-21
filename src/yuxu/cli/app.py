@@ -1,12 +1,9 @@
-"""`yuxu` CLI entrypoint.
+"""`yuxu` CLI — thin wrapper around the `project_manager` bundled agent.
 
-Commands:
-    yuxu init [DIR]       scaffold a project directory (default: cwd)
-    yuxu serve [DIR]      run the framework in a project directory (default: cwd)
-    yuxu status           list known projects + yuxu home info
-    yuxu version          print yuxu version
-
-On every invocation, ensures `~/.yuxu/` exists (first-run bootstrap).
+Most of the heavy lifting lives in `yuxu.bundled.project_manager.handler`;
+this module just parses argv, calls the right static method, and prints.
+Same logic is reachable via `bus.request("project_manager", ...)` at
+runtime (for future shell / chat-based creation flows).
 """
 from __future__ import annotations
 
@@ -14,19 +11,67 @@ import argparse
 import sys
 from pathlib import Path
 
+from ..bundled.project_manager.handler import ProjectManager
 from .bootstrap import ensure_home, home_dir
-from .project_init import init_project, print_init_summary
 from .serve import run_serve
 
 
+# -- command impls ----------------------------------------------
+
+
 def _cmd_init(args: argparse.Namespace) -> int:
-    target = Path(args.dir or ".").resolve()
     try:
-        project = init_project(target, force=args.force)
+        p = ProjectManager.create_project(args.dir or ".", force=args.force)
     except FileExistsError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
-    print_init_summary(project)
+    print(f"[yuxu] Initialized project at {p}")
+    print("[yuxu] Next steps:")
+    print(f"  cd {p}")
+    print("  # edit config/rate_limits.yaml to add your LLM API key")
+    print("  yuxu new agent <name>      # scaffold a business agent")
+    print("  yuxu serve                 # run the daemon")
+    return 0
+
+
+def _cmd_new_agent(args: argparse.Namespace) -> int:
+    project_dir = Path(args.project or ".").expanduser().resolve()
+    try:
+        p = ProjectManager.create_agent(project_dir, args.name, template=args.template)
+    except (FileExistsError, FileNotFoundError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    print(f"[yuxu] Created agent at {p}")
+    print(f"[yuxu] Edit {p}/AGENT.md + {p}/handler.py, then `yuxu serve` picks it up.")
+    return 0
+
+
+def _cmd_list_projects(args: argparse.Namespace) -> int:
+    projects = ProjectManager.list_projects()
+    if not projects:
+        print("(no projects registered; run `yuxu init <dir>` to create one)")
+        return 0
+    for p in projects:
+        flag = "✓" if p.get("exists") else "✗"
+        name = p.get("name") or "?"
+        ver = p.get("yuxu_version") or "?"
+        print(f"{flag} {name:<30} [yuxu {ver:<8}] {p['path']}")
+    return 0
+
+
+def _cmd_list_agents(args: argparse.Namespace) -> int:
+    project_dir = Path(args.project or ".").expanduser().resolve()
+    try:
+        agents = ProjectManager.list_agents(project_dir)
+    except FileNotFoundError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    if not agents:
+        print("(no agents in this project)")
+        return 0
+    for a in agents:
+        tag = "[system]" if a["source"] == "bundled" else "[user]  "
+        print(f"{tag} {a['name']:<25} {a['path']}")
     return 0
 
 
@@ -45,19 +90,13 @@ def _cmd_status(args: argparse.Namespace) -> int:
     home = home_dir()
     print(f"yuxu home: {home}")
     if not home.exists():
-        print("  (not initialized; will be created on first CLI invocation)")
+        print("  (not initialized; any CLI command will create it)")
         return 0
-    proj_file = home / "projects.yaml"
-    if proj_file.exists():
-        data = yaml.safe_load(proj_file.read_text(encoding="utf-8")) or {}
-        projects = data.get("projects") or []
-        print(f"known projects ({len(projects)}):")
-        for p in projects:
-            pp = Path(p)
-            alive = "✓" if (pp / "yuxu.json").exists() else "✗ (missing yuxu.json)"
-            print(f"  {alive} {p}")
-    else:
-        print("no projects.yaml")
+    projects = ProjectManager.list_projects()
+    print(f"known projects ({len(projects)}):")
+    for p in projects:
+        flag = "✓" if p.get("exists") else "✗"
+        print(f"  {flag} {p['path']}")
     return 0
 
 
@@ -67,13 +106,17 @@ def _cmd_version(args: argparse.Namespace) -> int:
     return 0
 
 
+# -- parser -----------------------------------------------------
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="yuxu",
         description="Yuxu (玉虚) — long-running agent creation and supervision framework.",
     )
-    subs = p.add_subparsers(dest="cmd", required=False)
+    subs = p.add_subparsers(dest="cmd")
 
+    # init
     p_init = subs.add_parser("init", help="Scaffold a new project directory.")
     p_init.add_argument("dir", nargs="?", default=None,
                         help="Project directory (default: cwd).")
@@ -81,6 +124,27 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Overwrite existing yuxu.json.")
     p_init.set_defaults(func=_cmd_init)
 
+    # new
+    p_new = subs.add_parser("new", help="Scaffold an agent / skill from a template.")
+    new_subs = p_new.add_subparsers(dest="new_cmd", required=True)
+    p_new_agent = new_subs.add_parser("agent", help="Create a new agent.")
+    p_new_agent.add_argument("name", help="Agent name (= folder name).")
+    p_new_agent.add_argument("--project", default=None,
+                             help="Project dir (default: cwd).")
+    p_new_agent.add_argument("--template", default="default",
+                             help="Template to use (default: 'default').")
+    p_new_agent.set_defaults(func=_cmd_new_agent)
+
+    # list
+    p_list = subs.add_parser("list", help="List projects or agents.")
+    list_subs = p_list.add_subparsers(dest="list_cmd", required=True)
+    p_list_p = list_subs.add_parser("projects", help="Projects registered in ~/.yuxu.")
+    p_list_p.set_defaults(func=_cmd_list_projects)
+    p_list_a = list_subs.add_parser("agents", help="Agents in a project (bundled + user).")
+    p_list_a.add_argument("--project", default=None, help="Project dir (default: cwd).")
+    p_list_a.set_defaults(func=_cmd_list_agents)
+
+    # serve
     p_serve = subs.add_parser("serve", help="Run the daemon.")
     p_serve.add_argument("dir", nargs="?", default=None,
                          help="Project directory (default: cwd).")
@@ -90,9 +154,11 @@ def build_parser() -> argparse.ArgumentParser:
                          choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     p_serve.set_defaults(func=_cmd_serve)
 
+    # status
     p_status = subs.add_parser("status", help="Show yuxu home + known projects.")
     p_status.set_defaults(func=_cmd_status)
 
+    # version
     p_ver = subs.add_parser("version", help="Print yuxu version.")
     p_ver.set_defaults(func=_cmd_version)
 
