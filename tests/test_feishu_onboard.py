@@ -291,11 +291,11 @@ def test_gateway_feishu_config_fallback_reads_yaml(tmp_path, monkeypatch):
     monkeypatch.delenv("FEISHU_API_BASE", raising=False)
 
     from yuxu.bundled.gateway import _load_feishu_config
-    app_id, app_secret, api_base, rit = _load_feishu_config()
-    assert app_id == "cli_from_file"
-    assert app_secret == "sec_from_file"
-    assert api_base == "https://open.larksuite.com"
-    assert rit == "chat_id"
+    cfg = _load_feishu_config()
+    assert cfg["app_id"] == "cli_from_file"
+    assert cfg["app_secret"] == "sec_from_file"
+    assert cfg["api_base"] == "https://open.larksuite.com"
+    assert cfg["receive_id_type"] == "chat_id"
 
 
 def test_gateway_feishu_env_wins_over_file(tmp_path, monkeypatch):
@@ -309,10 +309,10 @@ def test_gateway_feishu_env_wins_over_file(tmp_path, monkeypatch):
     monkeypatch.setenv("FEISHU_API_BASE", "https://custom/v1")
 
     from yuxu.bundled.gateway import _load_feishu_config
-    app_id, app_secret, api_base, _ = _load_feishu_config()
-    assert app_id == "env_id"
-    assert app_secret == "env_sec"
-    assert api_base == "https://custom/v1"
+    cfg = _load_feishu_config()
+    assert cfg["app_id"] == "env_id"
+    assert cfg["app_secret"] == "env_sec"
+    assert cfg["api_base"] == "https://custom/v1"
 
 
 def test_gateway_feishu_config_absent_returns_empty(tmp_path, monkeypatch):
@@ -321,8 +321,8 @@ def test_gateway_feishu_config_absent_returns_empty(tmp_path, monkeypatch):
     monkeypatch.delenv("FEISHU_APP_SECRET", raising=False)
 
     from yuxu.bundled.gateway import _load_feishu_config
-    app_id, app_secret, api_base, _ = _load_feishu_config()
-    assert app_id == ""
-    assert app_secret == ""
+    cfg = _load_feishu_config()
+    assert cfg["app_id"] == ""
+    assert cfg["app_secret"] == ""
     # api_base still has a default
-    assert api_base == "https://open.feishu.cn"
+    assert cfg["api_base"] == "https://open.feishu.cn"

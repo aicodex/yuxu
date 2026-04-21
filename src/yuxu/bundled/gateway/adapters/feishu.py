@@ -32,8 +32,9 @@ from typing import Optional
 import httpx
 
 from ..draft import DraftMessage, combine_draft_markdown
-from ..session import SendResult, SessionSource
+from ..session import InboundMessage, SendResult, SessionSource
 from .base import PlatformAdapter
+from .feishu_events import event_type_of, parse_message_event
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +50,13 @@ class FeishuAdapter(PlatformAdapter):
     def __init__(self, app_id: str, app_secret: str, *,
                  api_base: str = DEFAULT_API_BASE,
                  default_receive_id_type: str = "chat_id",
+                 # Inbound webhook (optional; outbound still works without these)
+                 webhook_host: Optional[str] = None,
+                 webhook_port: Optional[int] = None,
+                 webhook_path: str = "/feishu/webhook",
+                 verification_token: Optional[str] = None,
+                 encrypt_key: Optional[str] = None,
+                 bot_open_id: Optional[str] = None,
                  http_client: Optional[httpx.AsyncClient] = None) -> None:
         super().__init__()
         if not app_id or not app_secret:
@@ -64,6 +72,15 @@ class FeishuAdapter(PlatformAdapter):
         self._refresh_task: Optional[asyncio.Task] = None
         self._stopping = False
 
+        # Inbound side — lazily wired
+        self._webhook = None
+        self._webhook_host = webhook_host
+        self._webhook_port = webhook_port
+        self._webhook_path = webhook_path
+        self._verification_token = verification_token or ""
+        self._encrypt_key = encrypt_key or ""
+        self._bot_open_id = bot_open_id or ""
+
     # ---- lifecycle --------------------------------------------
 
     async def connect(self) -> None:
@@ -73,9 +90,27 @@ class FeishuAdapter(PlatformAdapter):
         self._refresh_task = asyncio.create_task(
             self._refresh_loop(), name="gateway.feishu.refresh",
         )
+        if self._webhook_host and self._webhook_port is not None:
+            # port=0 is a valid value (aiohttp picks a free port); only None means "disabled".
+            from .feishu_webhook import FeishuWebhook
+            self._webhook = FeishuWebhook(
+                host=self._webhook_host,
+                port=int(self._webhook_port),
+                path=self._webhook_path,
+                verification_token=self._verification_token,
+                encrypt_key=self._encrypt_key,
+                on_event=self._on_webhook_event,
+            )
+            await self._webhook.start()
 
     async def disconnect(self) -> None:
         self._stopping = True
+        if self._webhook is not None:
+            try:
+                await self._webhook.stop()
+            except Exception:
+                log.exception("feishu: webhook stop raised")
+            self._webhook = None
         if self._refresh_task is not None and not self._refresh_task.done():
             self._refresh_task.cancel()
             try:
@@ -148,6 +183,51 @@ class FeishuAdapter(PlatformAdapter):
         if message_id is None:
             return await self._send_raw(source, "interactive", content)
         return await self._patch_message(message_id, content)
+
+    # ---- inbound event dispatch -------------------------------
+
+    async def _on_webhook_event(self, event: dict) -> None:
+        """Called for every decrypted, verified event from the webhook.
+
+        We normalize im.message.receive_v1 into InboundMessage and hand to
+        GatewayManager via the base `_deliver` path. Other event types
+        (reaction, menu, etc.) are future work — logged and dropped.
+        """
+        etype = event_type_of(event)
+        if etype != "im.message.receive_v1":
+            log.debug("feishu: ignoring event type=%s", etype)
+            return
+
+        parsed = parse_message_event(event)
+        if parsed is None:
+            return
+
+        # Group-chat mention gating: if bot_open_id is configured AND chat is
+        # a group, require bot to be @mentioned. DMs are always delivered.
+        if (parsed.chat_type == "group" and self._bot_open_id
+                and self._bot_open_id not in parsed.mentions):
+            return
+
+        inbound = InboundMessage(
+            source=SessionSource(
+                platform=self.platform,
+                chat_id=parsed.chat_id,
+                user_id=parsed.sender_open_id,
+                thread_id=None,
+                chat_type="dm" if parsed.chat_type == "p2p" else "group",
+            ),
+            text=parsed.text,
+            reply_to_message_id=parsed.reply_to_message_id,
+            media_urls=[],   # media_keys require authed download; TODO
+            raw={
+                "event": event,
+                "message_type": parsed.message_type,
+                "message_id": parsed.message_id,
+                "media_keys": parsed.media_keys,
+                "mentions": parsed.mentions,
+            },
+        )
+        await self._deliver(inbound)
 
     # ---- HTTP internals ---------------------------------------
 
