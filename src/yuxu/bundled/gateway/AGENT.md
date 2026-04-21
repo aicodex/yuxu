@@ -25,13 +25,41 @@ ready_timeout: 10
 
 ## 操作（通过 `bus.request("gateway", {...})`)
 
+### 简单发送
+
 | op | payload | 返回 |
 |---|---|---|
 | `send` | `{session_key, text, reply_to?}` | `{ok, message_id?}` |
 | `sessions` | `{}` | `{ok, sessions: [{session_key, source, created_at}]}` |
 
-（未来）：`op=choice`（select UI）、`op=edit`（消息更新 / streaming）、
-`op=typing_start/stop` —— 现在不做，等业务驱动需求再加。
+### 结构化 draft（OpenClaw 风格，quote + 💭thinking + content + footer 卡片）
+
+| op | payload | 返回 |
+|---|---|---|
+| `open_draft` | `{session_key, quote?: {user, text}, footer_meta?: [[k,v],...], thinking?, content?}` | `{ok, draft_id, message_id}` |
+| `update_draft` | `{draft_id, thinking? / thinking_append?, content? / content_append?, footer_meta?, flush_now?}` | `{ok, message_id}` |
+| `close_draft` | `{draft_id}` | `{ok, message_id}` |
+
+Python agent 直接用更顺手：
+```python
+gw = ctx.get_agent("gateway")
+async with gw.open_draft(session_key=..., quote_user="alice", quote_text="你好",
+                         footer_meta=[("Agent", ctx.name)]) as draft:
+    # 例：LLM 流到一半，把思考和正文分别追加
+    draft.append_thinking("The user greets me...")
+    await draft.flush()
+    draft.append_content("你好！")
+    await draft.flush()
+# 离开 with 时自动 close（最后一次 finalize 编辑）
+```
+
+节流：`DraftHandle` 内置 250ms 节流 + 结尾收尾。多快的 chunk 下至多每 250ms 调一次
+adapter.edit（配合 `maybe_flush()`）。
+
+### 未来
+
+- `op=ask_choice`（select UI）：v1.1（已锁定，见 project_agos_vision）
+- `op=typing_start/stop`：需要时再加（drafts 已覆盖"正在思考"的可见反馈）
 
 ## 发布的事件
 

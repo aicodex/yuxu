@@ -28,6 +28,7 @@ DEFAULT_POLL_TIMEOUT = 25
 
 class TelegramAdapter(PlatformAdapter):
     platform = "telegram"
+    supports_edit = True
 
     def __init__(self, bot_token: str, *,
                  allowed_user_ids: Optional[set[int]] = None,
@@ -70,8 +71,11 @@ class TelegramAdapter(PlatformAdapter):
     # ---- outbound ----
 
     async def send(self, source: SessionSource, text: str, *,
-                   reply_to_message_id: Optional[str] = None) -> SendResult:
+                   reply_to_message_id: Optional[str] = None,
+                   parse_mode: Optional[str] = None) -> SendResult:
         body: dict = {"chat_id": source.chat_id, "text": text}
+        if parse_mode:
+            body["parse_mode"] = parse_mode
         if reply_to_message_id is not None:
             body["reply_to_message_id"] = int(reply_to_message_id)
         try:
@@ -83,6 +87,39 @@ class TelegramAdapter(PlatformAdapter):
         msg_id = data.get("result", {}).get("message_id")
         return SendResult(ok=True,
                           message_id=str(msg_id) if msg_id is not None else None)
+
+    async def edit(self, source: SessionSource, message_id: str, text: str, *,
+                   finalize: bool = False,
+                   parse_mode: Optional[str] = None) -> SendResult:
+        body: dict = {
+            "chat_id": source.chat_id,
+            "message_id": int(message_id),
+            "text": text,
+        }
+        if parse_mode:
+            body["parse_mode"] = parse_mode
+        try:
+            data = await self._post("editMessageText", body)
+        except Exception as e:
+            return SendResult(ok=False, error=str(e))
+        if not data.get("ok"):
+            desc = str(data.get("description") or "")
+            # Benign: same-content edits get "message is not modified".
+            if "not modified" in desc:
+                return SendResult(ok=True, message_id=message_id)
+            return SendResult(ok=False, error=desc)
+        return SendResult(ok=True, message_id=message_id)
+
+    async def render_draft(self, source: SessionSource, draft, *,
+                           message_id: Optional[str],
+                           finalize: bool) -> SendResult:
+        if draft.is_empty():
+            return SendResult(ok=True, message_id=message_id)
+        html = _render_draft_telegram_html(draft)
+        if message_id is None:
+            return await self.send(source, html, parse_mode="HTML")
+        return await self.edit(source, message_id, html, finalize=finalize,
+                               parse_mode="HTML")
 
     # ---- internal ----
 
@@ -162,3 +199,37 @@ def _telegram_chat_type(t: str) -> str:
     if t == "channel":
         return "channel"
     return t
+
+
+def _html_escape(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _render_draft_telegram_html(draft) -> str:
+    """Render a DraftMessage to Telegram-flavored HTML.
+
+    Telegram Bot API (>= 7.0) supports <blockquote>, <b>, <i>, <code>, <pre>,
+    <a href>, <s>, <u>, <tg-spoiler>. We only use the first four.
+    """
+    parts: list[str] = []
+
+    if draft.quote_user and draft.quote_text:
+        header = f"回复 {_html_escape(draft.quote_user)}: {_html_escape(draft.quote_text.splitlines()[0] if draft.quote_text else '')}"
+        rest = "\n".join(_html_escape(line) for line in draft.quote_text.splitlines()[1:])
+        body = header + ("\n" + rest if rest else "")
+        parts.append(f"<blockquote>{body}</blockquote>")
+
+    if draft.thinking:
+        parts.append("💭 <b>Thinking</b>")
+        parts.append(f"<blockquote>{_html_escape(draft.thinking)}</blockquote>")
+
+    if draft.content:
+        parts.append(_html_escape(draft.content))
+
+    if draft.footer_meta:
+        parts.append("")
+        parts.append("――――――――――――")
+        meta = " | ".join(f"{k}: {v}" for k, v in draft.footer_meta)
+        parts.append(f"<i>{_html_escape(meta)}</i>")
+
+    return "\n".join(parts)

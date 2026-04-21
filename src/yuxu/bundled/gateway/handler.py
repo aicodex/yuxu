@@ -13,6 +13,7 @@ import logging
 from typing import Optional
 
 from .adapters.base import PlatformAdapter
+from .draft import DraftHandle, DraftMessage
 from .session import InboundMessage, SendResult, SessionEntry, SessionSource
 
 log = logging.getLogger(__name__)
@@ -27,6 +28,7 @@ class GatewayManager:
         self.bus = bus
         self.adapters: dict[str, PlatformAdapter] = {}
         self.sessions: dict[str, SessionEntry] = {}
+        self.drafts: dict[str, DraftHandle] = {}
         self._started = False
 
     # -- adapter wiring --------------------------------------------
@@ -126,6 +128,43 @@ class GatewayManager:
         entry = self.sessions.get(key)
         return entry.source if entry is not None else None
 
+    # -- structured drafts (quote + thinking + content + footer) ---
+
+    def open_draft(self, *, session_key: Optional[str] = None,
+                   source: Optional[SessionSource] = None,
+                   quote_user: Optional[str] = None,
+                   quote_text: Optional[str] = None,
+                   footer_meta: Optional[list[tuple[str, str]]] = None,
+                   throttle_seconds: Optional[float] = None) -> DraftHandle:
+        """Create a DraftHandle. Python-native API (bus ops below wrap this).
+
+        The returned handle is an async context manager:
+            async with gw.open_draft(session_key=...) as draft:
+                draft.set_thinking("...")
+                await draft.flush()
+                ...
+        """
+        resolved = source or self._resolve_source({"session_key": session_key})
+        if resolved is None:
+            raise KeyError("unknown session_key and no explicit source")
+        adapter = self.adapters.get(resolved.platform)
+        if adapter is None:
+            raise LookupError(f"no adapter for platform={resolved.platform!r}")
+        draft = DraftMessage(
+            quote_user=quote_user,
+            quote_text=quote_text,
+            footer_meta=list(footer_meta) if footer_meta else [],
+        )
+        kwargs: dict = {"adapter": adapter, "source": resolved, "draft": draft}
+        if throttle_seconds is not None:
+            kwargs["throttle_seconds"] = throttle_seconds
+        handle = DraftHandle(**kwargs)
+        self.drafts[handle.id] = handle
+        return handle
+
+    def get_draft(self, draft_id: str) -> Optional[DraftHandle]:
+        return self.drafts.get(draft_id)
+
     # -- bus ops ----------------------------------------------------
 
     async def handle(self, msg) -> dict:
@@ -144,8 +183,69 @@ class GatewayManager:
                     "ok": True,
                     "sessions": [e.as_dict() for e in self.sessions.values()],
                 }
+            if op == "open_draft":
+                return await self._op_open_draft(payload)
+            if op == "update_draft":
+                return await self._op_update_draft(payload)
+            if op == "close_draft":
+                return await self._op_close_draft(payload)
             return {"ok": False, "error": f"unknown op: {op!r}"}
         except KeyError as e:
             return {"ok": False, "error": f"missing field: {e.args[0]}"}
+        except LookupError as e:
+            return {"ok": False, "error": str(e)}
         except (TypeError, ValueError) as e:
             return {"ok": False, "error": str(e)}
+
+    async def _op_open_draft(self, payload: dict) -> dict:
+        quote = payload.get("quote") or {}
+        footer = payload.get("footer_meta") or []
+        footer_tuples = [tuple(x) if isinstance(x, list) else x for x in footer]
+        handle = self.open_draft(
+            session_key=payload.get("session_key"),
+            source=self._resolve_source(payload)
+            if "source" in payload else None,
+            quote_user=quote.get("user"),
+            quote_text=quote.get("text"),
+            footer_meta=footer_tuples,
+            throttle_seconds=payload.get("throttle_seconds"),
+        )
+        # Apply any initial content/thinking before the first send.
+        if payload.get("thinking"):
+            handle.set_thinking(payload["thinking"])
+        if payload.get("content"):
+            handle.set_content(payload["content"])
+        await handle.open()
+        return {
+            "ok": True, "draft_id": handle.id,
+            "message_id": handle.message_id,
+        }
+
+    async def _op_update_draft(self, payload: dict) -> dict:
+        handle = self.drafts.get(payload.get("draft_id", ""))
+        if handle is None:
+            return {"ok": False, "error": "unknown draft_id"}
+        if (v := payload.get("thinking")) is not None:
+            handle.set_thinking(v)
+        if (v := payload.get("thinking_append")) is not None:
+            handle.append_thinking(v)
+        if (v := payload.get("content")) is not None:
+            handle.set_content(v)
+        if (v := payload.get("content_append")) is not None:
+            handle.append_content(v)
+        if (v := payload.get("footer_meta")) is not None:
+            handle.set_footer_meta(
+                [tuple(x) if isinstance(x, list) else x for x in v]
+            )
+        if payload.get("flush_now", False):
+            await handle.flush()
+        else:
+            await handle.maybe_flush()
+        return {"ok": True, "message_id": handle.message_id}
+
+    async def _op_close_draft(self, payload: dict) -> dict:
+        handle = self.drafts.pop(payload.get("draft_id", ""), None)
+        if handle is None:
+            return {"ok": False, "error": "unknown draft_id"}
+        await handle.close()
+        return {"ok": True, "message_id": handle.message_id}

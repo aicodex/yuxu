@@ -14,6 +14,7 @@ import logging
 import sys
 from typing import Optional
 
+from ..draft import DraftMessage
 from ..session import InboundMessage, SendResult, SessionSource
 from .base import PlatformAdapter
 
@@ -24,6 +25,7 @@ DEFAULT_USER_ID = "local"
 
 class ConsoleAdapter(PlatformAdapter):
     platform = "console"
+    supports_edit = False   # terminal can't edit past output; finalize-only
 
     def __init__(self, user_id: str = DEFAULT_USER_ID, *,
                  read_stdin: bool = True) -> None:
@@ -74,6 +76,51 @@ class ConsoleAdapter(PlatformAdapter):
         self.outbox.append({"source": source.as_dict(), "text": text,
                             "reply_to": reply_to_message_id})
         msg_id = f"console-{len(self.outbox)}"
+        return SendResult(ok=True, message_id=msg_id)
+
+    async def render_draft(self, source: SessionSource, draft: DraftMessage, *,
+                           message_id: Optional[str],
+                           finalize: bool) -> SendResult:
+        # Terminal: swallow intermediate frames. On finalize, print the
+        # whole draft as a single block with terminal-friendly dividers.
+        if not finalize:
+            return SendResult(ok=True, message_id=message_id)
+
+        lines: list[str] = []
+        lines.append("━" * 40)
+        if draft.quote_user and draft.quote_text:
+            for i, qline in enumerate(draft.quote_text.splitlines() or [""]):
+                prefix = f"回复 {draft.quote_user}: " if i == 0 else "  "
+                lines.append(prefix + qline)
+            lines.append("")
+        if draft.thinking:
+            lines.append("💭 Thinking")
+            for tline in draft.thinking.splitlines():
+                lines.append("  " + tline)
+            lines.append("")
+        if draft.content:
+            lines.append(draft.content)
+        if draft.footer_meta:
+            lines.append("")
+            lines.append("―" * 40)
+            lines.append(" | ".join(f"{k}: {v}" for k, v in draft.footer_meta))
+        lines.append("━" * 40)
+        block = "\n".join(lines) + "\n"
+        try:
+            sys.stdout.write(block)
+            sys.stdout.flush()
+        except Exception as e:
+            return SendResult(ok=False, error=str(e))
+        self.outbox.append({
+            "source": source.as_dict(),
+            "draft": {
+                "content": draft.content, "thinking": draft.thinking,
+                "quote_user": draft.quote_user, "quote_text": draft.quote_text,
+                "footer_meta": list(draft.footer_meta),
+            },
+            "finalize": True,
+        })
+        msg_id = message_id or f"console-draft-{len(self.outbox)}"
         return SendResult(ok=True, message_id=msg_id)
 
     # ---- test / programmatic hook ----

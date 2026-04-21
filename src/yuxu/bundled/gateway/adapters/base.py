@@ -6,13 +6,20 @@ GatewayManager wired in.
 
 Outbound flow: GatewayManager calls `send(source, text, ...)` when any
 agent publishes to `gateway.reply` or requests `send`.
+
+Rich drafts: adapters may override `render_draft()` for card-style
+rendering (quote + thinking + content + footer). Default implementation
+falls back to flat `send()` with combined markdown text.
 """
 from __future__ import annotations
 
 import abc
-from typing import Awaitable, Callable, Optional
+from typing import TYPE_CHECKING, Awaitable, Callable, Optional
 
 from ..session import InboundMessage, SendResult, SessionSource
+
+if TYPE_CHECKING:
+    from ..draft import DraftMessage
 
 InboundCallback = Callable[[InboundMessage], Awaitable[None]]
 
@@ -22,6 +29,11 @@ class PlatformAdapter(abc.ABC):
 
     #: Short identifier used in SessionSource.platform (must be unique per adapter kind).
     platform: str = "unknown"
+
+    #: Whether this adapter can edit an already-sent message. When True,
+    #: streaming drafts update in place; when False, the first render_draft
+    #: is a no-op and the final render at close() sends one consolidated message.
+    supports_edit: bool = False
 
     def __init__(self, on_inbound: Optional[InboundCallback] = None) -> None:
         self._on_inbound: Optional[InboundCallback] = on_inbound
@@ -66,3 +78,31 @@ class PlatformAdapter(abc.ABC):
                    finalize: bool = False) -> SendResult:
         """Optional streaming-edit support. Default falls back to a new send."""
         return await self.send(source, text)
+
+    async def render_draft(self, source: SessionSource, draft: "DraftMessage", *,
+                           message_id: Optional[str],
+                           finalize: bool) -> SendResult:
+        """Render a structured draft (quote + thinking + content + footer).
+
+        Default behavior:
+            - supports_edit=True: send first render, then edit() on subsequent
+            - supports_edit=False: only emit on finalize=True (one consolidated send)
+
+        Platform adapters may override for native-card rendering (Feishu card,
+        Slack blocks, ...). The default renderer composes markdown via
+        `combine_draft_markdown` so MarkdownV2 / HTML-capable platforms look right.
+        """
+        from ..draft import combine_draft_markdown  # avoid circular import
+
+        if draft.is_empty() and not finalize:
+            return SendResult(ok=True, message_id=message_id)
+
+        if not self.supports_edit and not finalize:
+            # platforms that can't edit suppress intermediate flushes;
+            # final text goes once at close().
+            return SendResult(ok=True, message_id=message_id)
+
+        text = combine_draft_markdown(draft)
+        if message_id is None:
+            return await self.send(source, text)
+        return await self.edit(source, message_id, text, finalize=finalize)
