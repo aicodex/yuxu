@@ -34,6 +34,12 @@ class TelegramAdapter(PlatformAdapter):
                  allowed_user_ids: Optional[set[int]] = None,
                  api_base: str = DEFAULT_API_BASE,
                  poll_timeout: int = DEFAULT_POLL_TIMEOUT,
+                 # Webhook mode (mutually exclusive with long-poll):
+                 webhook_host: Optional[str] = None,
+                 webhook_port: Optional[int] = None,
+                 webhook_path: str = "/telegram/webhook",
+                 webhook_secret_token: Optional[str] = None,
+                 webhook_public_url: Optional[str] = None,
                  http_client: Optional[httpx.AsyncClient] = None) -> None:
         super().__init__()
         if not bot_token:
@@ -48,16 +54,57 @@ class TelegramAdapter(PlatformAdapter):
         self._poll_task: Optional[asyncio.Task] = None
         self._stopping = False
 
+        # Webhook mode state
+        self._webhook = None
+        self._webhook_host = webhook_host
+        self._webhook_port = webhook_port
+        self._webhook_path = webhook_path
+        self._webhook_secret = webhook_secret_token or ""
+        self._webhook_public_url = webhook_public_url or ""
+        self._webhook_mode = bool(webhook_host and webhook_port is not None)
+
     # ---- lifecycle ----
 
     async def connect(self) -> None:
         self._stopping = False
         self._client = self._client or httpx.AsyncClient()
-        self._poll_task = asyncio.create_task(self._poll_loop(),
-                                              name="gateway.telegram.poll")
+        if self._webhook_mode:
+            from .telegram_webhook import TelegramWebhook
+            self._webhook = TelegramWebhook(
+                host=self._webhook_host,
+                port=int(self._webhook_port),
+                path=self._webhook_path,
+                secret_token=self._webhook_secret,
+                on_update=self._dispatch_update,
+            )
+            await self._webhook.start()
+            if self._webhook_public_url:
+                try:
+                    await self._set_webhook()
+                except Exception:
+                    log.exception("telegram: setWebhook failed; server is up "
+                                  "but Telegram won't push until registered")
+            else:
+                log.warning("telegram: webhook_public_url unset; skipping "
+                            "setWebhook. Register externally or set "
+                            "TELEGRAM_WEBHOOK_PUBLIC_URL.")
+        else:
+            self._poll_task = asyncio.create_task(self._poll_loop(),
+                                                  name="gateway.telegram.poll")
 
     async def disconnect(self) -> None:
         self._stopping = True
+        if self._webhook is not None:
+            if self._webhook_public_url:
+                try:
+                    await self._delete_webhook()
+                except Exception:
+                    log.exception("telegram: deleteWebhook failed")
+            try:
+                await self._webhook.stop()
+            except Exception:
+                log.exception("telegram: webhook stop raised")
+            self._webhook = None
         if self._poll_task is not None and not self._poll_task.done():
             self._poll_task.cancel()
             try:
@@ -67,6 +114,23 @@ class TelegramAdapter(PlatformAdapter):
         if self._client is not None and self._owned_client:
             await self._client.aclose()
         self._client = None
+
+    # ---- webhook management ----------------------------------
+
+    async def _set_webhook(self) -> None:
+        body: dict = {"url": self._webhook_public_url}
+        if self._webhook_secret:
+            body["secret_token"] = self._webhook_secret
+        data = await self._post("setWebhook", body)
+        if not data.get("ok"):
+            raise RuntimeError(f"setWebhook failed: {data.get('description')}")
+        log.info("telegram: setWebhook → %s", self._webhook_public_url)
+
+    async def _delete_webhook(self) -> None:
+        try:
+            await self._post("deleteWebhook", {"drop_pending_updates": False})
+        except Exception:
+            log.exception("telegram: deleteWebhook raised")
 
     # ---- outbound ----
 

@@ -41,13 +41,35 @@ def _build_adapters() -> list:
     # telegram: opt-in via bot token
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if token:
-        adapters.append(TelegramAdapter(
-            bot_token=token,
-            allowed_user_ids=_parse_allowed_user_ids(
+        tg_kwargs: dict = {
+            "bot_token": token,
+            "allowed_user_ids": _parse_allowed_user_ids(
                 os.environ.get("TELEGRAM_ALLOWED_USER_IDS"),
             ),
-            api_base=os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org"),
-        ))
+            "api_base": os.environ.get("TELEGRAM_API_BASE",
+                                       "https://api.telegram.org"),
+        }
+        # Optional webhook mode (otherwise long-poll).
+        wh_host = os.environ.get("TELEGRAM_WEBHOOK_HOST", "").strip()
+        wh_port_str = os.environ.get("TELEGRAM_WEBHOOK_PORT", "").strip()
+        if wh_host and wh_port_str:
+            try:
+                wh_port = int(wh_port_str)
+            except ValueError:
+                wh_port = None
+            if wh_port is not None:
+                tg_kwargs["webhook_host"] = wh_host
+                tg_kwargs["webhook_port"] = wh_port
+                tg_kwargs["webhook_path"] = os.environ.get(
+                    "TELEGRAM_WEBHOOK_PATH", "/telegram/webhook",
+                )
+                tg_kwargs["webhook_secret_token"] = os.environ.get(
+                    "TELEGRAM_WEBHOOK_SECRET_TOKEN", "",
+                ) or None
+                tg_kwargs["webhook_public_url"] = os.environ.get(
+                    "TELEGRAM_WEBHOOK_PUBLIC_URL", "",
+                ) or None
+        adapters.append(TelegramAdapter(**tg_kwargs))
     # feishu: env vars win, else fall back to config/secrets/feishu.yaml
     # (written by `yuxu feishu register`).
     fs = _load_feishu_config()

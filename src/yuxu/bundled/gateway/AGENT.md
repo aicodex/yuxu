@@ -20,8 +20,12 @@ ready_timeout: 10
 | 变量 | 作用 |
 |---|---|
 | `GATEWAY_CONSOLE_ENABLED` | `true/false`，默认 `true`。stdin/stdout 本地调试入口 |
-| `TELEGRAM_BOT_TOKEN` | 设了才启 telegram adapter，long-poll 模式 |
+| `TELEGRAM_BOT_TOKEN` | 设了才启 telegram adapter，默认 long-poll 模式 |
 | `TELEGRAM_ALLOWED_USER_IDS` | 可选，逗号分隔的 Telegram user_id 白名单 |
+| `TELEGRAM_WEBHOOK_HOST` + `TELEGRAM_WEBHOOK_PORT` | 设了这两个即进入 **webhook 模式**（与 long-poll 互斥） |
+| `TELEGRAM_WEBHOOK_PATH` | 可选，默认 `/telegram/webhook` |
+| `TELEGRAM_WEBHOOK_PUBLIC_URL` | webhook 模式用：告诉 Telegram 该往哪儿推（**必须 HTTPS**，走反代）。不设则只起本地 server，不自动 setWebhook |
+| `TELEGRAM_WEBHOOK_SECRET_TOKEN` | webhook 模式可选：Telegram 会在每次请求的 `X-Telegram-Bot-Api-Secret-Token` 头里回传，不匹配 403 |
 | `FEISHU_APP_ID` + `FEISHU_APP_SECRET` | 两个都设才启 feishu adapter |
 | `FEISHU_API_BASE` | 可选，默认 `https://open.feishu.cn`；国际版 Lark 用 `https://open.larksuite.com` |
 | `FEISHU_RECEIVE_ID_TYPE` | 可选，默认 `chat_id`；可选 `open_id` / `user_id` / `email` / `union_id` |
