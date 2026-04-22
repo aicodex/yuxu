@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import Any, Callable, Optional
 
 import httpx
@@ -51,14 +52,21 @@ class LLMServiceError(Exception):
 
 class LLMService:
     DEFAULT_TIMEOUT = 60.0
+    COMPLETION_TOPIC = "llm_service.request_completed"
 
     def __init__(self, rate_limiter: Callable, *,
                  default_timeout: Optional[float] = None,
-                 client: Optional[httpx.AsyncClient] = None) -> None:
+                 client: Optional[httpx.AsyncClient] = None,
+                 bus: Any = None) -> None:
         self.rate_limiter = rate_limiter  # (pool, tokens=1) -> async ctx manager
         self.default_timeout = default_timeout or self.DEFAULT_TIMEOUT
         self._client = client
         self._owned_client = client is None
+        # Optional bus for observability. When set, handle() publishes
+        # `llm_service.request_completed` on every successful call so
+        # trackers (minimax_budget, resource_guardian, ...) can attribute
+        # usage per agent without hooking chat() directly.
+        self.bus = bus
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -105,11 +113,13 @@ class LLMService:
                 "Content-Type": "application/json",
             }
             client = self._get_client()
+            t0 = time.perf_counter()
             try:
                 resp = await client.post(url, json=body, headers=headers,
                                          timeout=timeout or self.default_timeout)
             except httpx.RequestError as e:
                 raise LLMServiceError(f"request error: {e}") from e
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
             if resp.status_code >= 400:
                 text = resp.text
                 raise LLMServiceError(f"HTTP {resp.status_code}: {text[:300]}")
@@ -122,6 +132,18 @@ class LLMService:
                 normalized["content"] = _strip_thinking_blocks(
                     normalized.get("content")
                 )
+            # Enrich with client-measured timing. output_tps is a LOWER BOUND
+            # since elapsed includes network + prompt processing (non-streaming
+            # can't separate TTFT from stream time). True TPS needs streaming.
+            normalized["elapsed_ms"] = round(elapsed_ms, 2)
+            usage = normalized.get("usage") or {}
+            completion_tokens = int(usage.get("completion_tokens") or 0)
+            if elapsed_ms > 0 and completion_tokens > 0:
+                normalized["output_tps"] = round(
+                    completion_tokens / (elapsed_ms / 1000.0), 2,
+                )
+            else:
+                normalized["output_tps"] = None
             return normalized
 
     def _normalize(self, api_resp: dict) -> dict:
@@ -184,8 +206,25 @@ class LLMService:
                 timeout=payload.get("timeout"),
                 strip_thinking_blocks=payload.get("strip_thinking_blocks", False),
             )
-            return {"ok": True, **result}
         except LLMServiceError as e:
             return {"ok": False, "error": str(e)}
         except KeyError as e:
             return {"ok": False, "error": f"unknown pool: {e.args[0]}"}
+
+        # Fire-and-forget observability event. Best-effort: any failure in the
+        # publish path must not break the actual LLM reply.
+        if self.bus is not None:
+            try:
+                await self.bus.publish(self.COMPLETION_TOPIC, {
+                    "agent": getattr(msg, "sender", None) or "unknown",
+                    "pool": payload["pool"],
+                    "model": payload["model"],
+                    "usage": result.get("usage") or {},
+                    "stop_reason": result.get("stop_reason"),
+                    "elapsed_ms": result.get("elapsed_ms"),
+                    "output_tps": result.get("output_tps"),
+                })
+            except Exception:
+                log.exception("llm_service: failed to publish %s",
+                              self.COMPLETION_TOPIC)
+        return {"ok": True, **result}

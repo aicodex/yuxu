@@ -1,5 +1,8 @@
 ---
 name: create_agent
+version: "1.0.0"
+author: yuxu
+license: MIT
 description: Scaffold a new user agent inside a yuxu project, copying a template into agents/<name>/ and substituting the agent name placeholder.
 triggers: [create agent, new agent, scaffold agent, add agent]
 parameters:

@@ -31,7 +31,7 @@ class _Adapter(PlatformAdapter):
     async def connect(self) -> None: pass
     async def disconnect(self) -> None: pass
 
-    async def send(self, source, text, *, reply_to_message_id=None) -> SendResult:
+    async def send(self, source, text, *, reply_to_message_id=None, parse_mode=None) -> SendResult:
         self.sent.append(text)
         return SendResult(ok=True, message_id="m1")
 

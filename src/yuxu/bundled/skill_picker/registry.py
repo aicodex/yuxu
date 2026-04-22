@@ -150,12 +150,24 @@ class SkillSpec:
     depends_on: list[str] = field(default_factory=list)
     rate_limit_pool: Optional[str] = None
     edit_warning: bool = False
+    # Cross-ecosystem compatibility fields — not used by yuxu's own execution
+    # path but preserved so a future converter agent can round-trip skills
+    # from OpenClaw / Claude Code and yuxu agents can surface metadata.
+    version: Optional[str] = None
+    author: Optional[str] = None
+    license: Optional[str] = None
+    tags: list[str] = field(default_factory=list)
+    homepage: Optional[str] = None
+    handler_filename: str = "handler.py"   # override via frontmatter `handler`
+    allowed_tools: list[str] = field(default_factory=list)  # CC compat
+    model: Optional[str] = None            # CC compat (sonnet/haiku hint)
+    skill_context: Optional[str] = None    # CC compat: "inline" | "fork"
     frontmatter: dict = field(default_factory=dict)
     enabled: bool = False
 
     @property
     def has_handler(self) -> bool:
-        return (self.path / "handler.py").exists()
+        return (self.path / self.handler_filename).exists()
 
     def read_body(self) -> str:
         md = self.path / "SKILL.md"
@@ -205,6 +217,15 @@ class SkillRegistry:
         description = str(fm.get("description") or "").strip()
         if not description:
             log.warning("skills: %s/%s has empty description", sc.scope, skill_dir.name)
+        # Cross-ecosystem field reads: accept both snake_case and kebab-case
+        # (CC uses kebab for `allowed-tools`; OpenClaw/yuxu snake). The later
+        # form wins if both appear.
+        def _get(k_snake: str, k_kebab: Optional[str] = None,
+                 default=None):
+            if k_kebab and k_kebab in fm:
+                return fm[k_kebab]
+            return fm.get(k_snake, default)
+
         return SkillSpec(
             name=skill_dir.name,
             path=skill_dir,
@@ -216,6 +237,15 @@ class SkillRegistry:
             depends_on=list(fm.get("depends_on") or []),
             rate_limit_pool=fm.get("rate_limit_pool"),
             edit_warning=bool(fm.get("edit_warning", False)),
+            version=fm.get("version"),
+            author=fm.get("author"),
+            license=fm.get("license"),
+            tags=list(fm.get("tags") or []),
+            homepage=fm.get("homepage"),
+            handler_filename=str(fm.get("handler") or "handler.py"),
+            allowed_tools=list(_get("allowed_tools", "allowed-tools") or []),
+            model=fm.get("model"),
+            skill_context=fm.get("context"),
             frontmatter=fm,
         )
 
@@ -261,6 +291,8 @@ class SkillRegistry:
                 "triggers": list(s.triggers),
                 "has_handler": s.has_handler,
                 "enabled": s.enabled,
+                "version": s.version,
+                "tags": list(s.tags),
             }
             for _, s in sorted(by_name.values(), key=lambda x: x[1].name)
         ]
@@ -298,6 +330,15 @@ class SkillRegistry:
             "depends_on": list(spec.depends_on),
             "rate_limit_pool": spec.rate_limit_pool,
             "edit_warning": spec.edit_warning,
+            "version": spec.version,
+            "author": spec.author,
+            "license": spec.license,
+            "tags": list(spec.tags),
+            "homepage": spec.homepage,
+            "handler_filename": spec.handler_filename,
+            "allowed_tools": list(spec.allowed_tools),
+            "model": spec.model,
+            "context": spec.skill_context,
             "path": str(spec.path),
             "has_handler": spec.has_handler,
             "body": spec.read_body(),
@@ -341,7 +382,11 @@ class SkillRegistry:
     # -- introspection ----------------------------------------------
 
     def list_all(self) -> list[dict]:
-        """Admin view: every installed skill regardless of scope/enabled."""
+        """Admin view: every installed skill regardless of scope/enabled.
+
+        Includes `path`, `handler_filename`, `frontmatter` so runtime
+        components (e.g. skill_executor) can import / render without making
+        a second round-trip per skill via `load`."""
         out = []
         for (scope, owner, name), spec in sorted(self.skills.items()):
             out.append({
@@ -351,6 +396,10 @@ class SkillRegistry:
                 "enabled": spec.enabled,
                 "description": spec.description,
                 "has_handler": spec.has_handler,
+                "path": str(spec.path),
+                "handler_filename": spec.handler_filename,
+                "version": spec.version,
+                "frontmatter": dict(spec.frontmatter),
             })
         return out
 

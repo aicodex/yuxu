@@ -190,4 +190,6 @@ async def execute(input: dict, ctx) -> dict:
         "body": body,
         "warnings": warnings,
         "usage": resp.get("usage"),
+        "elapsed_ms": resp.get("elapsed_ms"),
+        "output_tps": resp.get("output_tps"),
     }

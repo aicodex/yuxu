@@ -27,11 +27,13 @@ CANCEL_TOKENS = {"/stop", "/cancel"}
 DEFAULT_PAIRING_POLL_SEC = 1.0
 
 DEFAULT_PENDING_TEMPLATE = (
-    "👋 你好，我还没被授权和你聊天。\n"
-    "请把下面这行命令发给管理员，让他批准：\n\n"
-    "    yuxu pair approve {platform} {user_id}\n\n"
-    "（你的 id: {user_id}）"
+    "👋 Hi — I'm not yet authorized to chat with you.\n\n"
+    "<b>Your id</b>: <code>{user_id}</code>\n\n"
+    "Send the admin the command below (long-press / tap the copy icon):\n"
+    "<pre>yuxu pair approve {platform} {user_id}</pre>\n"
+    "Once approved, just keep messaging here — no restart needed."
 )
+DEFAULT_PENDING_PARSE_MODE = "HTML"
 
 
 class GatewayManager:
@@ -207,8 +209,11 @@ class GatewayManager:
                 platform=msg.source.platform, user_id=user_id,
                 chat_id=msg.source.chat_id,
             )
+        log.info("gateway: pending-reply to %s/%s (first 60 chars): %r",
+                 msg.source.platform, user_id, text[:60])
         try:
-            await adapter.send(msg.source, text)
+            await adapter.send(msg.source, text,
+                                parse_mode=DEFAULT_PENDING_PARSE_MODE)
         except Exception:
             log.exception("gateway: pending-reply send failed for %s/%s",
                           msg.source.platform, user_id)

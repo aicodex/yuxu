@@ -100,6 +100,7 @@ class LlmDriver:
         dispatch = tool_dispatch or {}
         total_prompt = 0
         total_completion = 0
+        total_elapsed_ms = 0.0
         final_content: Optional[str] = None
         stop_reason = "max_iter"
         error_msg: Optional[str] = None
@@ -139,6 +140,7 @@ class LlmDriver:
             usage = resp.get("usage") or {}
             total_prompt += usage.get("prompt_tokens") or 0
             total_completion += usage.get("completion_tokens") or 0
+            total_elapsed_ms += float(resp.get("elapsed_ms") or 0.0)
 
             messages.append(_assistant_message(resp))
 
@@ -176,12 +178,20 @@ class LlmDriver:
                     "content": content,
                 })
 
+        # Aggregate throughput across iterations. elapsed_ms sums only the
+        # llm_service call time (excludes tool dispatch + local work), so
+        # output_tps reflects model throughput, not wall clock.
+        output_tps: Optional[float] = None
+        if total_elapsed_ms > 0 and total_completion > 0:
+            output_tps = round(total_completion / (total_elapsed_ms / 1000.0), 2)
         return {
             "ok": stop_reason == "complete",
             "content": final_content,
             "iterations": iterations_done,
             "stop_reason": stop_reason,
             "usage": {"prompt_tokens": total_prompt, "completion_tokens": total_completion},
+            "elapsed_ms": round(total_elapsed_ms, 2),
+            "output_tps": output_tps,
             "error": error_msg,
         }
 

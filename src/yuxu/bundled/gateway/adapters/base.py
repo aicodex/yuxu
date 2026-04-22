@@ -62,8 +62,14 @@ class PlatformAdapter(abc.ABC):
 
     @abc.abstractmethod
     async def send(self, source: SessionSource, text: str, *,
-                   reply_to_message_id: Optional[str] = None) -> SendResult:
-        """Send `text` to `source.chat_id` on this platform."""
+                   reply_to_message_id: Optional[str] = None,
+                   parse_mode: Optional[str] = None) -> SendResult:
+        """Send `text` to `source.chat_id` on this platform.
+
+        `parse_mode` is a rendering hint (e.g. "HTML", "MarkdownV2"). Adapters
+        that don't map it (console, feishu 文本 mode) MUST accept the kwarg
+        but may ignore it — keeps callers oblivious to per-platform styling.
+        """
 
     # ---- optional, default to no-op ---------------------------
 

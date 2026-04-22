@@ -378,6 +378,51 @@ async def test_slash_command_triggers_create_and_replies(tmp_path):
     assert reply["text"].startswith("✅")
 
 
+async def test_slash_command_uses_draft_path_with_footer_meta(tmp_path):
+    """Happy draft path: gateway returns draft_id → harness calls
+    open_draft + close_draft, no plain op:send, footer carries stats."""
+    bus = Bus()
+    ctx = _make_ctx(tmp_path, bus)
+    _wire_llm_driver(bus, classify=_classify_payload(),
+                     generate_text=_GOOD_AGENT_MD)
+    ops_seen: list[dict] = []
+
+    async def fake_gateway(msg):
+        p = dict(msg.payload) if isinstance(msg.payload, dict) else {}
+        ops_seen.append(p)
+        if p.get("op") == "open_draft":
+            return {"ok": True, "draft_id": "D-hn", "message_id": "M-hn"}
+        return {"ok": True}
+
+    bus.register("gateway", fake_gateway)
+    h = HarnessProMax(ctx)
+    await h.install()
+
+    await bus.publish("gateway.command_invoked", {
+        "command": COMMAND,
+        "args": "morning weather summary",
+        "session_key": "sess-1",
+    })
+    for _ in range(40):
+        await asyncio.sleep(0)
+        if any(p.get("op") == "close_draft" for p in ops_seen):
+            break
+
+    opens = [p for p in ops_seen if p.get("op") == "open_draft"]
+    closes = [p for p in ops_seen if p.get("op") == "close_draft"]
+    sends = [p for p in ops_seen if p.get("op") == "send"]
+    assert opens and closes
+    assert sends == []
+    open_payload = opens[0]
+    assert "weather_bot" in open_payload["content"]
+    assert open_payload["quote"].get("text", "").startswith("/new ")
+    fkeys = {row[0] for row in open_payload["footer_meta"]}
+    # agent-specific footer entries
+    assert "agent" in fkeys
+    assert "run_mode" in fkeys
+    assert "driver" in fkeys
+
+
 async def test_slash_command_empty_args_prints_usage(tmp_path):
     bus = Bus()
     ctx = _make_ctx(tmp_path, bus)

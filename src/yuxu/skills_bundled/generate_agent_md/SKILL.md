@@ -1,5 +1,8 @@
 ---
 name: generate_agent_md
+version: "1.0.0"
+author: yuxu
+license: MIT
 description: Generate the AGENT.md text (frontmatter + body) for a new yuxu agent given a description and a classification (output of classify_intent). Returns raw text plus parsed frontmatter so the caller can validate before writing to disk.
 triggers: [generate AGENT.md, write agent markdown, scaffold agent body]
 parameters:

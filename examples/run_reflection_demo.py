@@ -175,6 +175,26 @@ async def boot_and_run() -> int:
         print(f"    title: {d.get('title')}")
 
     print(f"\napproval_ids: {result.get('approval_ids')}")
+
+    stats = result.get("llm_stats") or {}
+    if stats:
+        print(f"\n=== LLM stats (aggregated) ===")
+        print(f"  calls:            {stats.get('n_calls')}")
+        print(f"  total elapsed:    {stats.get('elapsed_ms', 0) / 1000:.2f}s")
+        print(f"  prompt tokens:    {stats.get('prompt_tokens')}")
+        print(f"  completion tokens:{stats.get('completion_tokens')}")
+        print(f"  output tok/s:     {stats.get('output_tps')}")
+
+        # Demonstrate the NEW draft-path reply by splitting into the
+        # structured (content, footer_meta) gateway would receive.
+        content, footer = agent._format_reply_parts(result)
+        print(f"\n=== gateway.open_draft.content ===")
+        print(content)
+        print(f"\n=== gateway.open_draft.footer_meta ===")
+        for k, v in footer:
+            print(f"  {k}: {v}")
+        print(f"\n=== what Telegram / Feishu renders (inline italic form) ===")
+        print(agent._format_reply(result))
     if result.get("warnings"):
         print("\nwarnings:")
         for w in result["warnings"]:

@@ -1,5 +1,8 @@
 ---
 name: create_project
+version: "1.0.0"
+author: yuxu
+license: MIT
 description: Scaffold a new yuxu project at the given directory (yuxu.json, agents/, skills/, _system/, config/, data/, .gitignore, manifest).
 triggers: [create project, new project, init project, scaffold project]
 parameters:

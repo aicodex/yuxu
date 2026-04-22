@@ -65,11 +65,13 @@ class Bus:
         msg = Message(to=to, event=event, payload=payload, sender=sender)
         asyncio.create_task(self._dispatch_direct(msg))
 
-    async def request(self, to: str, query: Any, timeout: float = 30.0) -> Any:
+    async def request(self, to: str, query: Any, timeout: float = 30.0,
+                      sender: Optional[str] = None) -> Any:
         req_id = uuid.uuid4().hex
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[req_id] = fut
-        msg = Message(to=to, event="request", payload=query, request_id=req_id)
+        msg = Message(to=to, event="request", payload=query,
+                      request_id=req_id, sender=sender)
         asyncio.create_task(self._dispatch_direct(msg))
         try:
             return await asyncio.wait_for(fut, timeout=timeout)

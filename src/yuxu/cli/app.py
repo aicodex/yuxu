@@ -100,7 +100,106 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         print(f"error: no yuxu.json at {target}. Run `yuxu init {target}` first.",
               file=sys.stderr)
         return 1
-    run_serve(target, extra_agents=args.agent or None, log_level=args.log_level)
+    run_serve(target, extra_agents=args.agent or None,
+              log_level=args.log_level,
+              dev_mode=bool(getattr(args, "dev", False)))
+    return 0
+
+
+def _cmd_sync(args: argparse.Namespace) -> int:
+    """Refresh <project>/_system/ from the installed yuxu package.
+
+    Needed because `yuxu init` takes a one-shot snapshot of bundled agents.
+    After `pip install -U yuxu` or during dev iteration, run `yuxu sync`
+    to bring `_system/` up to date. `agents/` and `data/` are untouched."""
+    from ..skills_bundled._shared import copy_bundled_into
+    from .. import __version__ as installed_ver
+
+    target = Path(args.project or ".").expanduser().resolve()
+    if not (target / "yuxu.json").exists():
+        print(f"error: {target} is not a yuxu project (no yuxu.json).",
+              file=sys.stderr)
+        return 1
+    system_dir = target / "_system"
+    version_file = target / ".yuxu" / "version"
+    old_ver = version_file.read_text(encoding="utf-8").strip() \
+        if version_file.exists() else "(unknown)"
+    old_agents = ({d.name for d in system_dir.iterdir() if d.is_dir()}
+                  if system_dir.exists() else set())
+
+    manifest = copy_bundled_into(system_dir)
+    new_agents = {e["name"] for e in manifest}
+
+    version_file.parent.mkdir(parents=True, exist_ok=True)
+    version_file.write_text(installed_ver + "\n", encoding="utf-8")
+
+    added = sorted(new_agents - old_agents)
+    removed = sorted(old_agents - new_agents)
+    print(f"[yuxu sync] {target}")
+    print(f"  version: {old_ver} → {installed_ver}")
+    print(f"  bundled agents: {len(new_agents)} total "
+          f"({len(added)} added, {len(removed)} removed, "
+          f"{len(new_agents & old_agents)} refreshed)")
+    if added:
+        print(f"  added:   {', '.join(added)}")
+    if removed:
+        print(f"  removed: {', '.join(removed)}")
+    return 0
+
+
+def _cmd_ps(args: argparse.Namespace) -> int:
+    """List yuxu serves on this machine.
+
+    Reads `~/.yuxu/runtime/*.json` written by each live serve, validates the
+    recorded pid, prunes stale entries, prints a table."""
+    import json as _json
+    import os as _os
+    from datetime import datetime
+
+    runtime_dir = home_dir() / "runtime"
+    if not runtime_dir.exists():
+        print("(no ~/.yuxu/runtime/; no yuxu serve has run yet)")
+        return 0
+    entries: list[dict] = []
+    for p in sorted(runtime_dir.glob("*.json")):
+        try:
+            data = _json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        pid = data.get("pid")
+        alive = False
+        if isinstance(pid, int):
+            try:
+                _os.kill(pid, 0)
+                alive = True
+            except ProcessLookupError:
+                alive = False
+            except PermissionError:
+                alive = True   # pid exists but we can't signal it
+        if not alive and not args.include_stale:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+            continue
+        entries.append({**data, "_alive": alive})
+
+    if not entries:
+        print("(no live yuxu serves)")
+        return 0
+
+    print(f"{'PID':>7}  {'ALIVE':<5}  {'STARTED':<19}  PROJECT")
+    for e in entries:
+        pid = e.get("pid", "?")
+        alive_s = "✓" if e.get("_alive") else "stale"
+        ts = e.get("started_at", "")
+        try:
+            ts = datetime.fromisoformat(ts.replace("Z", "+00:00")) \
+                .astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+        proj = e.get("project_dir", "?")
+        print(f"{str(pid):>7}  {alive_s:<5}  {ts:<19}  {proj}")
     return 0
 
 
@@ -454,7 +553,30 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Additional agent to start after persistent ones. Repeatable.")
     p_serve.add_argument("--log-level", default="INFO",
                          choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    p_serve.add_argument("--dev", action="store_true",
+                         help="Dev mode: scan the installed yuxu/bundled/ "
+                              "directly (skip project _system/ snapshot). "
+                              "Edits to bundled source take effect on restart.")
     p_serve.set_defaults(func=_cmd_serve)
+
+    # sync
+    p_sync = subs.add_parser(
+        "sync",
+        help="Refresh <project>/_system/ from installed yuxu package. "
+             "Run after `pip install -U yuxu` or dev edits to bundled agents.",
+    )
+    p_sync.add_argument("--project", default=None,
+                         help="Project dir (default: cwd).")
+    p_sync.set_defaults(func=_cmd_sync)
+
+    # ps
+    p_ps = subs.add_parser(
+        "ps",
+        help="List yuxu serves running on this machine (from ~/.yuxu/runtime/).",
+    )
+    p_ps.add_argument("--include-stale", action="store_true",
+                       help="Show entries whose pid is dead (usually pruned).")
+    p_ps.set_defaults(func=_cmd_ps)
 
     # run
     p_run = subs.add_parser(

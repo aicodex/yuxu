@@ -380,7 +380,7 @@ async def test_handle_missing_need(tmp_path):
 # -- slash command integration ----------------------------------
 
 
-async def test_slash_command_triggers_and_replies(tmp_path):
+async def test_format_reply_produces_content_and_stats_footer(tmp_path):
     bus = Bus()
     ctx = _make_ctx(tmp_path, bus)
     src = tmp_path / "s.md"; src.write_text("x")
@@ -393,34 +393,128 @@ async def test_slash_command_triggers_and_replies(tmp_path):
                      ranker_payload={"chosen": [
                          {"framing_id": "pattern_extractor", "edit_index": 0,
                           "score": 0.5, "reason": "."}]})
-    sent = []
+    a = ReflectionAgent(ctx)
+    result = await a.reflect(need="terse style", sources=[str(src)])
+    content, footer = a._format_reply_parts(result)
+    assert content.startswith("✅") and "draft(s) staged" in content
+    # footer has structured metrics
+    fkeys = {k for k, _ in footer}
+    assert "sources" in fkeys
+    assert "drafts" in fkeys
+    assert "approvals" in fkeys
+    # string form inlines footer as italic
+    text = a._format_reply(result)
+    assert text.endswith("_")
+    assert "sources: 1" in text or "sources: " in text
+
+
+async def test_slash_command_uses_draft_path_with_footer_meta(tmp_path):
+    """`/reflect <need>` must call gateway `open_draft` with content +
+    footer_meta (not plain `op:send`), then `close_draft`."""
+    bus = Bus()
+    ctx = _make_ctx(tmp_path, bus)
+    src = tmp_path / "s.md"; src.write_text("x")
+    _wire_llm_driver(bus,
+                     extractor_payloads=[
+                         {"edits": [_basic_edit()], "summary": "."},
+                         {"edits": [], "summary": "."},
+                         {"edits": [], "summary": "."},
+                     ],
+                     ranker_payload={"chosen": [
+                         {"framing_id": "pattern_extractor", "edit_index": 0,
+                          "score": 0.5, "reason": "."}]})
+    ops_seen: list[dict] = []
 
     async def fake_gateway(msg):
         p = dict(msg.payload) if isinstance(msg.payload, dict) else {}
-        if p.get("op") == "send":
-            sent.append(p)
+        op = p.get("op")
+        ops_seen.append(p)
+        if op == "register_command":
+            return {"ok": True}
+        if op == "open_draft":
+            return {"ok": True, "draft_id": "DRAFT-1", "message_id": "M-1"}
+        if op == "close_draft":
+            return {"ok": True, "message_id": "M-1"}
         return {"ok": True}
 
     bus.register("gateway", fake_gateway)
     a = ReflectionAgent(ctx)
     await a.install()
 
-    # Need to override default sources path; can't via slash command yet.
-    # So call reflect directly to verify reply formatting works:
+    # Drive the slash command path
+    # (we mirror _on_command's behaviour with a direct reply call since the
+    # slash path can't reach our sources by default)
     result = await a.reflect(need="terse style", sources=[str(src)])
-    text = a._format_reply(result)
-    assert text.startswith("✅") and "draft(s) staged" in text
+    await a._reply("sess-1", result, quote_text="/reflect terse style")
+
+    opens = [p for p in ops_seen if p.get("op") == "open_draft"]
+    closes = [p for p in ops_seen if p.get("op") == "close_draft"]
+    sends = [p for p in ops_seen if p.get("op") == "send"]
+
+    assert len(opens) == 1 and len(closes) == 1
+    # Critical: no plain `send` in the happy path — gateway got the structured call
+    assert sends == []
+    open_payload = opens[0]
+    # content has the reply body
+    assert "draft(s) staged" in open_payload["content"]
+    # footer_meta carries structured metrics
+    footer = open_payload["footer_meta"]
+    fkeys = {row[0] for row in footer}
+    assert "sources" in fkeys
+    assert "drafts" in fkeys
+    # quote captured the user's original /reflect invocation
+    assert open_payload["quote"].get("text") == "/reflect terse style"
 
 
-async def test_slash_command_empty_args_prints_usage(tmp_path):
+async def test_reply_falls_back_to_send_when_open_draft_fails(tmp_path):
+    """If gateway's open_draft returns {ok: False} (e.g. unknown session),
+    reflection_agent falls back to plain `op:send` so the user still sees
+    the reply with an inline italic footer."""
     bus = Bus()
     ctx = _make_ctx(tmp_path, bus)
-    sent = []
+    src = tmp_path / "s.md"; src.write_text("x")
+    _wire_llm_driver(bus,
+                     extractor_payloads=[
+                         {"edits": [_basic_edit()], "summary": "."},
+                         {"edits": [], "summary": "."},
+                         {"edits": [], "summary": "."},
+                     ],
+                     ranker_payload={"chosen": [
+                         {"framing_id": "pattern_extractor", "edit_index": 0,
+                          "score": 0.5, "reason": "."}]})
+    sends: list[dict] = []
 
     async def fake_gateway(msg):
         p = dict(msg.payload) if isinstance(msg.payload, dict) else {}
-        if p.get("op") == "send":
-            sent.append(p)
+        op = p.get("op")
+        if op == "open_draft":
+            return {"ok": False, "error": "unknown session"}
+        if op == "send":
+            sends.append(p)
+            return {"ok": True}
+        return {"ok": True}
+
+    bus.register("gateway", fake_gateway)
+    a = ReflectionAgent(ctx)
+    result = await a.reflect(need="terse style", sources=[str(src)])
+    await a._reply("sess-1", result)
+
+    assert len(sends) == 1
+    assert "draft(s) staged" in sends[0]["text"]
+
+
+async def test_slash_command_empty_args_still_goes_through_draft(tmp_path):
+    """Even the usage-hint reply uses the draft path (same UX affordance
+    as normal replies — quoted + footer-able on Telegram)."""
+    bus = Bus()
+    ctx = _make_ctx(tmp_path, bus)
+    ops_seen: list[dict] = []
+
+    async def fake_gateway(msg):
+        p = dict(msg.payload) if isinstance(msg.payload, dict) else {}
+        ops_seen.append(p)
+        if p.get("op") == "open_draft":
+            return {"ok": True, "draft_id": "D1", "message_id": "M1"}
         return {"ok": True}
 
     bus.register("gateway", fake_gateway)
@@ -428,11 +522,13 @@ async def test_slash_command_empty_args_prints_usage(tmp_path):
     await a.install()
     await bus.publish("gateway.command_invoked",
                        {"command": COMMAND, "args": "", "session_key": "k"})
-    for _ in range(10):
+    for _ in range(15):
         await asyncio.sleep(0)
-        if sent:
+        if any(p.get("op") == "open_draft" for p in ops_seen):
             break
-    assert sent and sent[0]["text"].startswith("Usage:")
+    opens = [p for p in ops_seen if p.get("op") == "open_draft"]
+    assert opens, "expected open_draft even for usage hint"
+    assert "Usage:" in opens[0]["content"]
 
 
 # -- framings inventory -----------------------------------------

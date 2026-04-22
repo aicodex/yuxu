@@ -203,7 +203,7 @@ async def test_gateway_pending_sends_reply_to_unknown_user(tmp_path):
         async def connect(self): pass
         async def disconnect(self): pass
 
-        async def send(self, source, text, *, reply_to_message_id=None):
+        async def send(self, source, text, *, reply_to_message_id=None, parse_mode=None):
             self.outbox.append((source.user_id, text))
             return _SR(ok=True, message_id="m1")
 
@@ -252,7 +252,7 @@ async def test_gateway_pending_reply_uses_custom_template(tmp_path):
         async def connect(self): pass
         async def disconnect(self): pass
 
-        async def send(self, source, text, *, reply_to_message_id=None):
+        async def send(self, source, text, *, reply_to_message_id=None, parse_mode=None):
             self.outbox.append(text)
             return _SR(ok=True)
 

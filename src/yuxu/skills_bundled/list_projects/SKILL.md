@@ -1,5 +1,8 @@
 ---
 name: list_projects
+version: "1.0.0"
+author: yuxu
+license: MIT
 description: List yuxu projects registered in ~/.yuxu/projects.yaml with name, version, and existence flag.
 triggers: [list projects, show projects, my projects]
 parameters:

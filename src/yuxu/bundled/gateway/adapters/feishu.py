@@ -162,7 +162,10 @@ class FeishuAdapter(PlatformAdapter):
     # ---- outbound ---------------------------------------------
 
     async def send(self, source: SessionSource, text: str, *,
-                   reply_to_message_id: Optional[str] = None) -> SendResult:
+                   reply_to_message_id: Optional[str] = None,
+                   parse_mode: Optional[str] = None) -> SendResult:
+        # parse_mode ignored — feishu text mode is plain. HTML / markdown
+        # paths would use `send_draft` with a DraftMessage instead.
         content = json.dumps({"text": text}, ensure_ascii=False)
         if reply_to_message_id:
             return await self._reply(reply_to_message_id, "text", content)

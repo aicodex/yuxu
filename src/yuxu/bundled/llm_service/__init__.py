@@ -16,7 +16,7 @@ async def start(ctx) -> None:
             "Ensure rate_limit_service is declared in depends_on and started."
         )
     global _service
-    _service = LLMService(rate_limiter=rls.acquire)
+    _service = LLMService(rate_limiter=rls.acquire, bus=ctx.bus)
     ctx.bus.register(NAME, _service.handle)
     await ctx.ready()
 

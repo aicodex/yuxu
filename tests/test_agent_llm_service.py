@@ -210,6 +210,78 @@ async def test_handle_ok_response():
         await svc.close()
 
 
+async def test_handle_publishes_request_completed_when_bus_set():
+    """When bus is provided, handle() fires `llm_service.request_completed`
+    with agent (from msg.sender), pool, model, usage."""
+    from yuxu.core.bus import Bus
+
+    def route(req):
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"total_tokens": 42, "prompt_tokens": 30,
+                      "completion_tokens": 12},
+        })
+    bus = Bus()
+    rl, _ = _make_rate_limiter([{"id": "k", "api_key": "x",
+                                   "base_url": "http://a/v1"}])
+    svc = LLMService(rl, bus=bus,
+                     client=httpx.AsyncClient(transport=_mock_transport(route)))
+
+    got: list[dict] = []
+
+    async def sub(event):
+        if isinstance(event, dict):
+            payload = event.get("payload")
+            if isinstance(payload, dict):
+                got.append(payload)
+
+    bus.subscribe(LLMService.COMPLETION_TOPIC, sub)
+
+    class _MsgWithSender:
+        def __init__(self, payload, sender):
+            self.payload = payload
+            self.sender = sender
+
+    try:
+        r = await svc.handle(_MsgWithSender(
+            {"pool": "minimax", "model": "m1", "messages": []},
+            sender="my_agent",
+        ))
+        assert r["ok"] is True
+        # Give the async publish task a moment
+        import asyncio as _a
+        for _ in range(10):
+            await _a.sleep(0)
+            if got:
+                break
+        assert got, "expected llm_service.request_completed event"
+        ev = got[0]
+        assert ev["agent"] == "my_agent"
+        assert ev["pool"] == "minimax"
+        assert ev["model"] == "m1"
+        assert ev["usage"]["total_tokens"] == 42
+    finally:
+        await svc.close()
+
+
+async def test_handle_does_not_publish_when_bus_unset():
+    """Backward compat: constructed without bus, no publish, no breakage."""
+    def route(req):
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+        })
+    rl, _ = _make_rate_limiter([{"id": "k", "api_key": "x",
+                                   "base_url": "http://a/v1"}])
+    svc = LLMService(rl,
+                     client=httpx.AsyncClient(transport=_mock_transport(route)))
+    try:
+        r = await svc.handle(_Msg({"pool": "minimax", "model": "m",
+                                    "messages": []}))
+        assert r["ok"] is True
+    finally:
+        await svc.close()
+
+
 async def test_handle_missing_fields():
     rl, _ = _make_rate_limiter([{"id": "k", "api_key": "x", "base_url": "http://a/v1"}])
     svc = LLMService(rl)
@@ -223,6 +295,44 @@ async def test_handle_unknown_op():
     svc = LLMService(rl)
     r = await svc.handle(_Msg({"op": "foo"}))
     assert r["ok"] is False
+
+
+async def test_chat_adds_elapsed_ms_and_output_tps():
+    def route(req):
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "hi"},
+                          "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 50,
+                      "total_tokens": 60},
+        })
+    rl, _ = _make_rate_limiter([{"id": "k", "api_key": "x",
+                                   "base_url": "http://a/v1"}])
+    svc = LLMService(rl, client=httpx.AsyncClient(transport=_mock_transport(route)))
+    try:
+        r = await svc.chat(pool="minimax", model="m", messages=[])
+        assert r["elapsed_ms"] >= 0
+        assert isinstance(r["output_tps"], float)
+        assert r["output_tps"] > 0
+    finally:
+        await svc.close()
+
+
+async def test_chat_output_tps_none_when_zero_completion():
+    def route(req):
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": ""},
+                          "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 0,
+                      "total_tokens": 5},
+        })
+    rl, _ = _make_rate_limiter([{"id": "k", "api_key": "x",
+                                   "base_url": "http://a/v1"}])
+    svc = LLMService(rl, client=httpx.AsyncClient(transport=_mock_transport(route)))
+    try:
+        r = await svc.chat(pool="minimax", model="m", messages=[])
+        assert r["output_tps"] is None
+    finally:
+        await svc.close()
 
 
 async def test_chat_strip_thinking_blocks_removes_think_section():

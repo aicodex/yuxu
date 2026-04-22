@@ -1,5 +1,8 @@
 ---
 name: list_agents
+version: "1.0.0"
+author: yuxu
+license: MIT
 description: List agents inside a yuxu project — bundled (under _system/) and user (under agents/) — in scan_order.
 triggers: [list agents, show agents, agents in project]
 parameters:

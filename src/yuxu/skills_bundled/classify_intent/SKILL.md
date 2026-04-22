@@ -1,5 +1,8 @@
 ---
 name: classify_intent
+version: "1.0.0"
+author: yuxu
+license: MIT
 description: Given a natural-language request to build a new yuxu agent, classify it — pick a template, suggest a folder name, propose run_mode, and list likely depends_on. Output is structured JSON consumed by generate_agent_md / agent-creator flows.
 triggers: [classify intent, what kind of agent, new agent type, agent template]
 parameters:

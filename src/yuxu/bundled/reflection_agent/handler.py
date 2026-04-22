@@ -247,11 +247,16 @@ class ReflectionAgent:
         session_key = payload.get("session_key", "")
         need = (payload.get("args") or "").strip()
         if not need:
-            await self._reply(session_key,
-                              f"Usage: `{COMMAND} <need>`\n\n{COMMAND_HELP}")
+            usage = {"ok": False, "stage": "usage",
+                     "error": f"Usage: `{COMMAND} <need>`\n\n{COMMAND_HELP}",
+                     "warnings": []}
+            await self._reply(session_key, usage)
             return
         result = await self.reflect(need=need)
-        await self._reply(session_key, self._format_reply(result))
+        # Quote the user's /reflect invocation so the reply shows what
+        # request the drafts / stats correspond to.
+        await self._reply(session_key, result,
+                          quote_text=f"{COMMAND} {need}")
 
     # -- core flow -------------------------------------------------
 
@@ -367,12 +372,36 @@ class ReflectionAgent:
         # Phase 4: enqueue approvals (best-effort)
         approval_ids = await self._enqueue_approvals(drafts, run_id, need)
 
+        # Aggregate LLM timing across all hypotheses + ranker for display
+        total_elapsed_ms = 0.0
+        total_completion = 0
+        total_prompt = 0
+        for h in hypotheses:
+            total_elapsed_ms += float(h.get("elapsed_ms") or 0)
+            u = h.get("usage") or {}
+            total_prompt += int(u.get("prompt_tokens") or 0)
+            total_completion += int(u.get("completion_tokens") or 0)
+        total_elapsed_ms += float(rank_resp.get("elapsed_ms") or 0)
+        ru = rank_resp.get("usage") or {}
+        total_prompt += int(ru.get("prompt_tokens") or 0)
+        total_completion += int(ru.get("completion_tokens") or 0)
+        overall_tps = (total_completion / (total_elapsed_ms / 1000.0)
+                       if total_elapsed_ms > 0 and total_completion > 0 else None)
+
         return {"ok": True, "run_id": run_id, "hypotheses": hypotheses,
                 "chosen": chosen, "rejected_summary": rejected_summary,
                 "drafts": drafts, "approval_ids": approval_ids,
                 "warnings": warnings,
                 "memory_root": str(memory_root_path),
-                "n_sources": len(loaded)}
+                "n_sources": len(loaded),
+                "llm_stats": {
+                    "elapsed_ms": round(total_elapsed_ms, 2),
+                    "completion_tokens": total_completion,
+                    "prompt_tokens": total_prompt,
+                    "output_tps": round(overall_tps, 2) if overall_tps else None,
+                    "n_calls": sum(1 for h in hypotheses if h.get("ok"))
+                                + (1 if rank_resp.get("ok") else 0),
+                }}
 
     # -- LLM steps -------------------------------------------------
 
@@ -418,7 +447,9 @@ class ReflectionAgent:
             cleaned.append(e)
         return {"ok": True, "edits": cleaned,
                 "summary": obj.get("summary", ""),
-                "usage": resp.get("usage")}
+                "usage": resp.get("usage"),
+                "elapsed_ms": resp.get("elapsed_ms"),
+                "output_tps": resp.get("output_tps")}
 
     async def _rank(self, *, need: str, hypotheses: list[dict],
                     pool: str, model: str, max_chosen: int) -> dict:
@@ -462,7 +493,9 @@ class ReflectionAgent:
         if not isinstance(chosen, list):
             return {"ok": False, "error": "chosen is not a list"}
         return {"ok": True, "chosen": chosen,
-                "rejected_summary": obj.get("rejected_summary", "")}
+                "rejected_summary": obj.get("rejected_summary", ""),
+                "elapsed_ms": resp.get("elapsed_ms"),
+                "usage": resp.get("usage")}
 
     # -- staging & approval ----------------------------------------
 
@@ -565,19 +598,30 @@ class ReflectionAgent:
 
     # -- reply formatting -----------------------------------------
 
-    def _format_reply(self, result: dict) -> str:
+    def _format_reply_parts(self, result: dict) -> tuple[str, list[tuple[str, str]]]:
+        """Split the reply into (content_markdown, footer_meta)."""
+        from yuxu.bundled.gateway.reply_helpers import format_llm_stats_footer
+
+        # Usage hints are NOT failures; display the raw message.
+        if result.get("stage") == "usage":
+            return result.get("error") or "", []
+
+        footer = format_llm_stats_footer(result.get("llm_stats"))
+
         if not result.get("ok"):
             stage = result.get("stage", "?")
             err = result.get("error", "(no error)")
             warns = result.get("warnings") or []
-            warn_block = ("\n\nWarnings:\n" + "\n".join(f"- {w}" for w in warns)
+            warn_block = ("\n\n**Warnings:**\n" + "\n".join(f"- {w}" for w in warns)
                           if warns else "")
-            return f"❌ /reflect failed at `{stage}`: {err}{warn_block}"
+            content = f"❌ /reflect failed at `{stage}`: {err}{warn_block}"
+            footer.insert(0, ("status", "failed"))
+            return content, footer
+
         drafts = result.get("drafts") or []
         approvals = result.get("approval_ids") or []
         warns = result.get("warnings") or []
-        lines = [f"✅ /reflect run `{result['run_id']}` "
-                 f"({result.get('n_sources', 0)} sources)"]
+        lines = [f"✅ /reflect run `{result['run_id']}`"]
         if not drafts:
             lines.append("\nNo memory edits proposed.")
         else:
@@ -587,22 +631,29 @@ class ReflectionAgent:
                 score_s = f" ({score:.2f})" if isinstance(score, (int, float)) else ""
                 lines.append(f"- `{d['action']}` → `{d['target']}` "
                              f"— {d.get('title', '')}{score_s}")
-                lines.append(f"  draft: `{d['path']}`")
-        if approvals:
-            lines.append(f"\n{len(approvals)} approval item(s) "
-                         f"queued: {approvals}")
-        else:
-            lines.append("\n(approval_queue unreachable — drafts on disk only)")
         if warns:
-            lines.append("\nWarnings:\n" + "\n".join(f"- {w}" for w in warns))
-        return "\n".join(lines)
+            lines.append("\n**Warnings:**\n" + "\n".join(f"- {w}" for w in warns))
 
-    async def _reply(self, session_key: str, text: str) -> None:
-        if not session_key:
-            return
-        try:
-            await self.ctx.bus.request("gateway", {
-                "op": "send", "session_key": session_key, "text": text,
-            }, timeout=5.0)
-        except Exception:
-            log.exception("reflection_agent: reply failed")
+        footer.insert(0, ("sources", str(result.get("n_sources", 0))))
+        footer.insert(1, ("drafts", str(len(drafts))))
+        footer.insert(2, ("approvals",
+                           f"{len(approvals)} queued" if approvals else "disk-only"))
+        return "\n".join(lines), footer
+
+    def _format_reply(self, result: dict) -> str:
+        """String form — used by tests / fallback / console preview."""
+        from yuxu.bundled.gateway.reply_helpers import compose_fallback_text
+        content, footer = self._format_reply_parts(result)
+        return compose_fallback_text(content, footer)
+
+    async def _reply(self, session_key: str, result: dict,
+                     *, quote_user: Optional[str] = None,
+                     quote_text: Optional[str] = None) -> None:
+        from yuxu.bundled.gateway.reply_helpers import reply_via_gateway
+        content, footer = self._format_reply_parts(result)
+        await reply_via_gateway(
+            self.ctx.bus, session_key,
+            content=content, footer_meta=footer,
+            quote_user=quote_user, quote_text=quote_text,
+            agent_name="reflection_agent",
+        )

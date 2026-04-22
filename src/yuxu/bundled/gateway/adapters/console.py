@@ -65,7 +65,9 @@ class ConsoleAdapter(PlatformAdapter):
     # ---- outbound ----
 
     async def send(self, source: SessionSource, text: str, *,
-                   reply_to_message_id: Optional[str] = None) -> SendResult:
+                   reply_to_message_id: Optional[str] = None,
+                   parse_mode: Optional[str] = None) -> SendResult:
+        # parse_mode ignored — console always plain text
         line = f"[console → {source.chat_id}] {text}\n"
         try:
             sys.stdout.write(line)

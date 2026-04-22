@@ -41,7 +41,7 @@ class RecordingAdapter(PlatformAdapter):
     async def disconnect(self) -> None:
         self.disconnected = True
 
-    async def send(self, source, text, *, reply_to_message_id=None) -> SendResult:
+    async def send(self, source, text, *, reply_to_message_id=None, parse_mode=None) -> SendResult:
         self.outbox.append((source, text, reply_to_message_id))
         return self.next_send_result
 

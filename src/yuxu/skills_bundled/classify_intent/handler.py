@@ -144,4 +144,7 @@ async def execute(input: dict, ctx) -> dict:
         return {"ok": False, "error": f"validation: {why}", "raw": raw,
                 "parsed": obj}
 
-    return {"ok": True, "classification": obj, "usage": resp.get("usage")}
+    return {"ok": True, "classification": obj,
+            "usage": resp.get("usage"),
+            "elapsed_ms": resp.get("elapsed_ms"),
+            "output_tps": resp.get("output_tps")}

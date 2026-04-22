@@ -309,6 +309,57 @@ async def test_handle_unknown_op():
     assert "unknown op" in r["error"]
 
 
+async def test_run_turn_aggregates_elapsed_ms_and_computes_tps():
+    """Driver should sum elapsed_ms across iterations and compute aggregate
+    output_tps = sum(completion_tokens) / (sum(elapsed_ms) / 1000)."""
+    bus = Bus()
+    _register_llm(bus, [
+        # iter 1: tool_use, 100 completion tokens, 1000 ms elapsed
+        {"ok": True, "content": "thinking",
+         "tool_calls": [{"id": "c1", "name": "noop", "input": {}}],
+         "stop_reason": "tool_use",
+         "usage": {"prompt_tokens": 50, "completion_tokens": 100},
+         "elapsed_ms": 1000.0, "output_tps": 100.0},
+        # iter 2: complete, 200 completion tokens, 2000 ms elapsed
+        {"ok": True, "content": "done", "tool_calls": [],
+         "stop_reason": "end_turn",
+         "usage": {"prompt_tokens": 50, "completion_tokens": 200},
+         "elapsed_ms": 2000.0, "output_tps": 100.0},
+    ])
+
+    async def noop(msg):
+        return {"output": "ok"}
+
+    bus.register("noop", noop)
+    driver = LlmDriver(bus)
+    r = await driver.run_turn(
+        system_prompt="s", messages=[{"role": "user", "content": "go"}],
+        pool="p", model="m",
+        tools=[{"name": "noop", "parameters": {}}],
+    )
+    assert r["ok"] is True
+    assert r["elapsed_ms"] == pytest.approx(3000.0)
+    # 300 total completion tokens / 3.0s = 100 tps
+    assert r["output_tps"] == pytest.approx(100.0)
+
+
+async def test_run_turn_output_tps_none_when_no_completion_tokens():
+    bus = Bus()
+    _register_llm(bus, [
+        {"ok": True, "content": "", "tool_calls": [],
+         "stop_reason": "end_turn",
+         "usage": {"prompt_tokens": 5, "completion_tokens": 0},
+         "elapsed_ms": 200.0},
+    ])
+    driver = LlmDriver(bus)
+    r = await driver.run_turn(
+        system_prompt="s", messages=[{"role": "user", "content": "x"}],
+        pool="p", model="m",
+    )
+    assert r["elapsed_ms"] == pytest.approx(200.0)
+    assert r["output_tps"] is None
+
+
 async def test_strip_thinking_blocks_passes_through_to_llm_service():
     bus = Bus()
     seen = _register_llm_capture(bus, {
