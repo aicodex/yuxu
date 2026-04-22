@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from yuxu.core.bus import Bus
-from yuxu.skills_bundled.classify_intent.handler import (
+from yuxu.bundled.classify_intent.handler import (
     _extract_json,
     _validate,
     execute,

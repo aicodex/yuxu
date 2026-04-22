@@ -4,9 +4,10 @@ Listens for `/new <description>` slash commands on the gateway, drives the
 classify_intent → generate_agent_md → write-to-disk → loader.scan() →
 ensure_running flow, and replies via gateway.
 
-The two LLM-mediated skills are imported as Python modules (skill_picker
-doesn't yet dispatch skill execution over the bus). This is fine for a
-bundled agent — we know the skills ship in the same package.
+The two LLM-mediated skills are imported as Python modules (same package).
+They're also reachable over the bus as `bus.request("classify_intent", ...)`
+via the unified Loader; direct imports are the fast path for a bundled
+agent that knows its dependencies.
 """
 from __future__ import annotations
 
@@ -14,8 +15,8 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from yuxu.skills_bundled.classify_intent.handler import execute as classify_intent
-from yuxu.skills_bundled.generate_agent_md.handler import execute as generate_agent_md
+from yuxu.bundled.classify_intent.handler import execute as classify_intent
+from yuxu.bundled.generate_agent_md.handler import execute as generate_agent_md
 
 log = logging.getLogger(__name__)
 

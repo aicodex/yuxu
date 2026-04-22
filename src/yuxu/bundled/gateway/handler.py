@@ -43,8 +43,10 @@ class GatewayManager:
                  pairing: Optional[PairingRegistry] = None,
                  pairing_required_platforms: Optional[set[str]] = None,
                  pending_reply_template: Optional[str] = None,
-                 pairing_poll_seconds: float = DEFAULT_PAIRING_POLL_SEC) -> None:
+                 pairing_poll_seconds: float = DEFAULT_PAIRING_POLL_SEC,
+                 loader=None) -> None:
         self.bus = bus
+        self.loader = loader
         self.adapters: dict[str, PlatformAdapter] = {}
         self.sessions: dict[str, SessionEntry] = {}
         self.drafts: dict[str, DraftHandle] = {}
@@ -344,6 +346,8 @@ class GatewayManager:
                 return self._op_unregister_command(payload)
             if op == "list_commands":
                 return {"ok": True, "commands": dict(self.commands)}
+            if op == "list_menu":
+                return self._op_list_menu(payload)
             if op == "pair_list":
                 return self._op_pair_list(payload)
             if op == "pair_approve":
@@ -431,6 +435,30 @@ class GatewayManager:
         command = str(payload.get("command", "")).strip()
         self.commands.pop(command, None)
         return {"ok": True}
+
+    # -- menu (surface-tagged agents + skills) ---------------------
+
+    def _op_list_menu(self, payload: dict) -> dict:
+        """Return units (agents + skills) whose frontmatter declares the
+        requested surface. Used by gateway to render `/menu`-style UI.
+        """
+        if self.loader is None:
+            return {"ok": False, "error": "loader not available"}
+        surface = payload.get("surface") or "menu"
+        kind = payload.get("kind")
+        items = self.loader.filter(surface=surface, kind=kind)
+        return {
+            "ok": True,
+            "surface": surface,
+            "items": [{
+                "name": s.name,
+                "kind": s.kind,
+                "scope": s.scope,
+                "description": s.frontmatter.get("description", ""),
+                "triggers": s.frontmatter.get("triggers") or [],
+                "surface": s.frontmatter.get("surface") or [],
+            } for s in items],
+        }
 
     # -- pairing ops ------------------------------------------------
 

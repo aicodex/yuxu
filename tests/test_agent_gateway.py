@@ -440,3 +440,78 @@ async def test_gateway_starts_via_loader(bundled_dir, monkeypatch):
     # no adapters configured
     assert gm.adapters == {}
     await loader.stop("gateway")
+
+
+# -- list_menu (unified loader) --------------------------------
+
+
+async def test_list_menu_returns_surface_tagged_units(tmp_path):
+    import textwrap
+    import yaml as _yaml
+
+    # Two skills: one surfaces to menu, one doesn't
+    a = tmp_path / "menu_skill"
+    a.mkdir()
+    (a / "SKILL.md").write_text(
+        "---\n" + _yaml.safe_dump({
+            "description": "exposed in menu",
+            "surface": ["command", "menu"],
+            "triggers": ["do-thing"],
+        }) + "---\n"
+    )
+    (a / "handler.py").write_text(
+        "async def execute(input, ctx): return {'ok': True}\n"
+    )
+    b = tmp_path / "hidden_skill"
+    b.mkdir()
+    (b / "SKILL.md").write_text(
+        "---\n" + _yaml.safe_dump({"description": "hidden"}) + "---\n"
+    )
+    (b / "handler.py").write_text(
+        "async def execute(input, ctx): return {'ok': True}\n"
+    )
+
+    bus = Bus()
+    loader = Loader(bus, dirs=[str(tmp_path)])
+    await loader.scan()
+    gm = GatewayManager(bus, loader=loader)
+    r = await gm.handle(type("M", (), {"payload": {"op": "list_menu"}})())
+    assert r["ok"] is True
+    assert {i["name"] for i in r["items"]} == {"menu_skill"}
+    item = r["items"][0]
+    assert item["kind"] == "skill"
+    assert item["triggers"] == ["do-thing"]
+
+
+async def test_list_menu_filters_by_kind(tmp_path):
+    import yaml as _yaml
+    # One skill + one agent, both with surface=[menu]
+    s = tmp_path / "a_skill"
+    s.mkdir()
+    (s / "SKILL.md").write_text(
+        "---\n" + _yaml.safe_dump({"surface": ["menu"]}) + "---\n")
+    (s / "handler.py").write_text(
+        "async def execute(input, ctx): return {}\n")
+    a = tmp_path / "an_agent"
+    a.mkdir()
+    (a / "AGENT.md").write_text(
+        "---\n" + _yaml.safe_dump({"surface": ["menu"], "driver": "llm"}) + "---\n")
+
+    bus = Bus()
+    loader = Loader(bus, dirs=[str(tmp_path)])
+    await loader.scan()
+    gm = GatewayManager(bus, loader=loader)
+    only_skills = await gm.handle(type("M", (), {
+        "payload": {"op": "list_menu", "kind": "skill"}})())
+    assert {i["name"] for i in only_skills["items"]} == {"a_skill"}
+    only_agents = await gm.handle(type("M", (), {
+        "payload": {"op": "list_menu", "kind": "agent"}})())
+    assert {i["name"] for i in only_agents["items"]} == {"an_agent"}
+
+
+async def test_list_menu_missing_loader_errors():
+    bus = Bus()
+    gm = GatewayManager(bus, loader=None)
+    r = await gm.handle(type("M", (), {"payload": {"op": "list_menu"}})())
+    assert r["ok"] is False
+    assert "loader" in r["error"]

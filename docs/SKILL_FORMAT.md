@@ -1,16 +1,20 @@
 # Yuxu Skill Format + Cross-Ecosystem Compatibility
 
-Yuxu skills live in one of three scope roots (`src/yuxu/skills_bundled/`,
-`<project>/skills/`, `<agent_dir>/skills/`) as **folders** containing:
+Yuxu skills live in one of three scope roots (`src/yuxu/bundled/`,
+`<project>/agents/` or `<project>/skills/`, `<agent_dir>/skills/`) as
+**folders** containing:
 
 ```
 {skill_name}/
 ├── SKILL.md      # YAML frontmatter + markdown body
-└── handler.py    # optional; async def execute(input: dict, ctx) -> dict
+└── handler.py    # async def execute(input: dict, ctx) -> dict
+# note: NO __init__.py — that's the marker distinguishing skills from agents
 ```
 
-The `SkillRegistry` in `bundled/skill_picker/registry.py` scans these roots,
-reads the frontmatter, and surfaces everything via `catalog` / `load` ops.
+The unified `Loader` (`core/loader.py`) scans every scope root, classifies
+each folder by the presence of `__init__.py` (agent) vs. handler.py + no
+`__init__.py` (skill), and dispatches both kinds via `bus.request("{name}", ...)`.
+No separate skill registry.
 
 ## Frontmatter Fields
 
@@ -43,13 +47,13 @@ registry will preserve every byte of metadata for round-trip fidelity.
 
 | Behavior | Yuxu today | Plan |
 |---|---|---|
-| `triggers` used by `skill_picker.catalog(triggers_any=...)` | ✓ | — |
-| `parameters` surfaced to LLM as tool schema | partially (read, not dispatched) | skill executor agent (TBD) |
-| `depends_on` resolved via Loader ensure_running | — | skill executor |
+| `triggers` surfaced via `loader.filter(surface=...)` | ✓ (in `spec.frontmatter`) | intent_router skill |
+| `parameters` surfaced to LLM as tool schema | partially (read, not dispatched) | llm_driver tool-binding |
+| `depends_on` resolved via Loader `ensure_running` | ✓ (recursive) | — |
 | `allowed_tools` enforced at bus dispatch | — | v0.2 security gating |
-| `model` / `context` honored by LLM call wrapper | — | when skill executor runs LLM-only skills |
-| `version` displayed in catalog | ✓ | — |
-| Handler file (anything other than `handler.py`) | via `handler:` field | — |
+| `model` / `context` honored by LLM call wrapper | `context: inline` → gateway.inline_expander | fork mode later |
+| `surface: [menu, command]` exposes unit to gateway UI | ✓ (`loader.filter(surface=...)`) | — |
+| Handler file (anything other than `handler.py`) | via `handler:` frontmatter | — |
 
 ## Handler Conventions (for Python-backed skills)
 
@@ -89,11 +93,13 @@ Yuxu's guarantees for foreign skills:
 ## Where compatibility ends
 
 Yuxu does NOT:
-- Execute CC skills' `!command` preambles (that's a CC Bun runtime feature).
+- Execute CC skills' `!command` preambles **at bus dispatch time**. Inline
+  preambles (both `!\`cmd\`` and ` ```! ... ``` ` fenced form) are expanded
+  only when a skill is rendered via `gateway.inline_expander.expand_inline_skill`
+  (i.e. `context: inline` skills used as LLM prompt templates).
 - Load OpenClaw skills' non-`handler.py` Python code automatically. The
-  `handler:` frontmatter override points registry to the file, but a skill
-  executor agent still has to import + call it with yuxu's `execute(input, ctx)`
-  signature.
+  `handler:` frontmatter override points Loader to the file, but the module
+  must still expose an `execute(input, ctx)` function matching yuxu's signature.
 - Honor `allowed_tools` as a permission enforcement today — it's metadata only.
 
 A future `skill_converter` agent should:

@@ -30,7 +30,7 @@ return a strict JSON object with these keys:
 - run_mode: one of one_shot / persistent / scheduled / triggered / spawned
 - depends_on: list of yuxu agents this new agent will need (use [] if none).
   Common bundled options: llm_driver, llm_service, rate_limit_service,
-  checkpoint_store, scheduler, gateway, approval_queue, skill_picker.
+  checkpoint_store, scheduler, gateway, approval_queue, approval_applier.
 - driver: one of python / llm / hybrid (python = pure code; llm = LLM-only;
   hybrid = code + LLM)
 - reasoning: 1-2 sentences justifying the choices

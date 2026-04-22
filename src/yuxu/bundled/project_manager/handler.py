@@ -2,8 +2,8 @@
 
 Purely dynamic ops (start/stop/restart/get_state). All scaffolding logic
 (create_project / create_agent / list_projects / list_agents) lives in the
-`yuxu.skills_bundled.*` skills — invoke those from the CLI directly, or via
-the LLM through skill_picker once skill execution is wired up.
+`yuxu.bundled.*` skills — invoke those from the CLI directly, or via the
+LLM through `bus.request("{name}", ...)` (unified Loader handles dispatch).
 """
 from __future__ import annotations
 

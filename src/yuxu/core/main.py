@@ -34,7 +34,14 @@ async def boot(dirs: list[str] | None = None,
     # Validate graph up-front; fail fast if cycles or missing deps.
     loader.build_dep_graph()
     if autostart_persistent:
-        for spec in loader.filter(run_mode="persistent"):
+        # Register all skills (passive bus handlers — no task, cheap)
+        for spec in loader.filter(kind="skill"):
+            try:
+                await loader.ensure_running(spec.name)
+            except Exception:
+                log.exception("boot: failed to register skill %s", spec.name)
+        # Start persistent agents (long-lived tasks)
+        for spec in loader.filter(kind="agent", run_mode="persistent"):
             try:
                 await loader.ensure_running(spec.name)
             except Exception:

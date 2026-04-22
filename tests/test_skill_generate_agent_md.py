@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from yuxu.core.bus import Bus
-from yuxu.skills_bundled.generate_agent_md.handler import (
+from yuxu.bundled.generate_agent_md.handler import (
     _build_system_prompt,
     _check_consistency,
     _strip_outer_fence,

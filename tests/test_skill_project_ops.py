@@ -2,7 +2,7 @@
 project_manager: create_project / create_agent / list_projects / list_agents.
 
 Tests both the sync library entry (used by the CLI) and the async `execute`
-skill-protocol entry, plus a SkillRegistry discovery sanity check."""
+skill-protocol entry, plus a Loader discovery sanity check."""
 from __future__ import annotations
 
 import json
@@ -11,24 +11,19 @@ from pathlib import Path
 import pytest
 import yaml
 
-from yuxu.bundled.skill_picker.registry import (
-    SkillRegistry,
-    SkillScope,
-    installed_skills_bundled_root,
-)
-from yuxu.skills_bundled.create_agent.handler import (
+from yuxu.bundled.create_agent.handler import (
     create_agent,
     execute as create_agent_execute,
 )
-from yuxu.skills_bundled.create_project.handler import (
+from yuxu.bundled.create_project.handler import (
     create_project,
     execute as create_project_execute,
 )
-from yuxu.skills_bundled.list_agents.handler import (
+from yuxu.bundled.list_agents.handler import (
     execute as list_agents_execute,
     list_agents,
 )
-from yuxu.skills_bundled.list_projects.handler import (
+from yuxu.bundled.list_projects.handler import (
     execute as list_projects_execute,
     list_projects,
 )
@@ -64,7 +59,7 @@ def test_create_project_extracts_all_bundled(tmp_path, yuxu_home):
     names = sorted(d.name for d in system.iterdir() if d.is_dir())
     for expected in ("checkpoint_store", "rate_limit_service", "llm_service",
                      "llm_driver", "project_supervisor", "recovery_agent",
-                     "resource_guardian", "skill_picker", "project_manager"):
+                     "resource_guardian", "project_manager"):
         assert expected in names, f"{expected} not extracted"
 
 
@@ -73,7 +68,10 @@ def test_create_project_manifest(tmp_path, yuxu_home):
     manifest = json.loads((p / ".yuxu" / "manifest.json").read_text())
     names = {item["name"] for item in manifest["bundled"]}
     assert "checkpoint_store" in names
-    assert all(item.get("agent_md_sha12") for item in manifest["bundled"])
+    assert all(item.get("md_sha12") for item in manifest["bundled"])
+    kinds = {item["name"]: item["kind"] for item in manifest["bundled"]}
+    assert kinds["checkpoint_store"] == "agent"
+    assert kinds["classify_intent"] == "skill"
 
 
 def test_create_project_refuses_existing_without_force(tmp_path, yuxu_home):
@@ -235,38 +233,37 @@ async def test_list_agents_execute_ok(tmp_path, yuxu_home):
     assert any(a["name"] == "llm_service" for a in r["agents"])
 
 
-# -- registry discovery -----------------------------------------
+# -- loader discovery -------------------------------------------
 
 
-def test_skill_registry_discovers_all_four_bundled_skills(tmp_path):
-    """The four scaffolding skills must show up under global scope when
-    SkillRegistry scans the installed skills_bundled root."""
-    enable = tmp_path / "skills_enabled.yaml"
-    enable.write_text(yaml.safe_dump({"enabled": [
-        "create_project", "create_agent", "list_projects", "list_agents",
-    ]}))
-    reg = SkillRegistry()
-    reg.scan([SkillScope.global_scope(
-        skills_root=installed_skills_bundled_root(),
-        enable_file=enable,
-    )])
-    names = {n for (_scope, _owner, n) in reg.skills}
+@pytest.mark.asyncio
+async def test_loader_discovers_all_four_bundled_skills():
+    """The four scaffolding skills must show up under kind=skill when Loader
+    scans the installed bundled root."""
+    import yuxu as _y
+    from yuxu.core.bus import Bus
+    from yuxu.core.loader import Loader
+
+    bundled_root = Path(_y.__file__).parent / "bundled"
+    bus = Bus()
+    loader = Loader(bus, [str(bundled_root)])
+    await loader.scan()
+    skills = {s.name for s in loader.filter(kind="skill")}
     for expected in ("create_project", "create_agent", "list_projects", "list_agents"):
-        assert expected in names, f"{expected} not in registry: {sorted(names)}"
-    catalog = reg.catalog(only_enabled=True)
-    cat_names = {c["name"] for c in catalog}
-    assert {"create_project", "create_agent", "list_projects", "list_agents"} <= cat_names
+        assert expected in skills, f"{expected} not in skills: {sorted(skills)}"
 
 
-def test_skill_registry_skips_underscored_helpers(tmp_path):
-    """`_shared.py` at the scope root must not be picked up as a skill."""
-    enable = tmp_path / "skills_enabled.yaml"
-    enable.write_text(yaml.safe_dump({"enabled": []}))
-    reg = SkillRegistry()
-    reg.scan([SkillScope.global_scope(
-        skills_root=installed_skills_bundled_root(),
-        enable_file=enable,
-    )])
-    names = {n for (_scope, _owner, n) in reg.skills}
+@pytest.mark.asyncio
+async def test_loader_skips_underscored_helpers():
+    """`_shared.py` at the bundled root must not be picked up as a skill."""
+    import yuxu as _y
+    from yuxu.core.bus import Bus
+    from yuxu.core.loader import Loader
+
+    bundled_root = Path(_y.__file__).parent / "bundled"
+    bus = Bus()
+    loader = Loader(bus, [str(bundled_root)])
+    await loader.scan()
+    names = set(loader.specs)
     assert "_shared" not in names
     assert "_shared.py" not in names

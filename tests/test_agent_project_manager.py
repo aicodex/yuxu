@@ -1,6 +1,6 @@
 """ProjectManager — runtime supervisor surface for the loader.
 
-After the skill extraction (project_manager → skills_bundled.{create_project,
+After the skill extraction (project_manager → bundled.{create_project,
 create_agent, list_projects, list_agents}), this agent only owns the dynamic
 ops (start/stop/restart/get_state). Static scaffolding lives in skill tests.
 """

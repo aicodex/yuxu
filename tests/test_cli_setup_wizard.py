@@ -8,7 +8,7 @@ import yaml
 
 from yuxu.bundled.gateway.pairing import DEFAULT_PAIRING_PATH, PairingRegistry
 from yuxu.cli.setup_wizard import run_setup_wizard
-from yuxu.skills_bundled.create_project.handler import create_project
+from yuxu.bundled.create_project.handler import create_project
 
 
 def _make_project(tmp_path: Path) -> Path:

@@ -1,6 +1,6 @@
-# Unified Agent Model (proposal, pre-merge)
+# Unified Agent Model
 
-> **Status**: design draft, refined 2026-04-22 after user input.
+> **Status**: **implemented** 2026-04-22.
 > **Guiding principle** (user's framing):
 >   - **逻辑分开**: skill and agent are two distinct concepts
 >   - **代码合并**: one Loader, one registry, one dispatch
@@ -9,6 +9,13 @@
 > **Motivation**: OpenClaw / Claude Code skill shape is close to our agent
 > shape; sharing the code layer makes porting mechanical, while the
 > logical/behavioral split preserves a crisp mental model.
+>
+> **What shipped**: Loader classifies by `__init__.py` presence; skills live
+> under `bundled/` alongside agents; `bus.request("{name}", payload)` for
+> both; `gateway.list_menu` op + `loader.filter(kind=, surface=)`; inline
+> expansion helpers migrated to `bundled/gateway/inline_expander.py`. The
+> old `skill_picker` / `skill_executor` agents and the `skills_bundled/`
+> directory were deleted.
 
 ## The core distinction: 主观能动性 (agency)
 

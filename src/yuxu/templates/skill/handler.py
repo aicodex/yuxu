@@ -1,12 +1,13 @@
 """Skill 执行器。按约定暴露 async def execute(input: dict, ctx) -> Any。
 
-ctx 约定（由 skill_picker / llm_driver 传入）：
+ctx 是 `yuxu.core.context.AgentContext`（由 Loader 懒构造并传入）：
   - ctx.bus                   消息总线
   - ctx.logger                日志
-  - ctx.rate_limit(pool)      限流 context manager（走 rate_limit_service）
-  - ctx.checkpoint             checkpoint_store 简写接口（可选）
+  - ctx.agent_dir             本 skill 文件夹路径
+  - ctx.frontmatter           SKILL.md frontmatter dict
 
-ctx 的具体形状由 skill_picker 定；MVP 允许 ctx=bus 就够用。
+`bus.request("{name}", payload)` 由调用者发起，Loader 自动将 payload 作为
+`input` 传给本函数；返回值经 bus 回送给调用者。
 """
 from __future__ import annotations
 

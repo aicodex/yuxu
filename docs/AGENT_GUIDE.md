@@ -4,6 +4,24 @@
 > need. This is the **recipe book**. For the formal framework contract,
 > see [CORE_INTERFACE.md](CORE_INTERFACE.md); for skills, [SKILL_FORMAT.md](SKILL_FORMAT.md).
 
+## Agent vs. skill — pick before you scaffold
+
+The unified Loader handles both, so you call them the same way
+(`bus.request("{name}", ...)`). The difference is **agency**:
+
+| | **agent** | **skill** |
+|---|---|---|
+| Has `__init__.py` exporting `start(ctx)`? | **yes** | **no** (just `handler.py`) |
+| Can subscribe to events / run background tasks | yes | no |
+| Holds state between calls (memory, caches) | yes | no — fresh each call |
+| Can initiate action without being called | yes (persistent/scheduled) | no — reactive only |
+| Typical example | `gateway`, `scheduler`, `reflection_agent` | `classify_intent`, `create_project` |
+
+Rule of thumb: **if you need to remember anything between calls, or run when
+nobody's calling you, write an agent. Otherwise write a skill.** Both live
+under the same scope roots; the absence of `__init__.py` is what tells the
+Loader you're a skill.
+
 ## TL;DR — the smallest working agent
 
 A yuxu project has two roots Loader scans: `_system/` (bundled, don't touch)
@@ -309,20 +327,31 @@ r = await ctx.bus.request("scheduler", {"op": "list"}, timeout=2.0)
 # → {ok, schedules: [...], total_fires: int}
 ```
 
-### skill_picker — catalog + load skills on demand
+### Calling a skill — just `bus.request("{name}", ...)` (unified model)
+
+Skills are discovered by Loader at scan time (folder with `handler.py` and
+no `__init__.py`), registered directly on the bus. Call them like any
+agent:
 
 ```python
-# See what skills are visible to your agent
-r = await ctx.bus.request("skill_picker", {
-    "op": "catalog", "for_agent": ctx.name, "only_enabled": True,
-}, timeout=2.0)
-# → {ok, skills: [{name, description, triggers, has_handler, version, tags, ...}]}
+r = await ctx.bus.request("classify_intent", {
+    "description": "morning news summarizer",
+    "agent_templates": ["llm_only", "python", "hybrid"],
+}, timeout=10.0)
+# → {ok, agent_type, suggested_name, run_mode, depends_on, driver, reasoning}
+```
 
-# Load a specific skill's full body + frontmatter
-r = await ctx.bus.request("skill_picker", {
-    "op": "load", "name": "classify_intent", "for_agent": ctx.name,
-}, timeout=2.0)
-# → {ok, name, description, body, parameters, ...}
+To list all skills (or any unit surfaced to a menu):
+
+```python
+# Via Loader directly
+skills = ctx.loader.filter(kind="skill")
+menu_items = ctx.loader.filter(surface="menu")  # kind-agnostic
+
+# Via gateway (e.g. for a /menu command)
+r = await ctx.bus.request("gateway",
+    {"op": "list_menu", "surface": "menu"}, timeout=2.0)
+# → {ok, items: [{name, kind, scope, description, triggers, surface}, ...]}
 ```
 
 ### project_manager — supervise sibling agents at runtime

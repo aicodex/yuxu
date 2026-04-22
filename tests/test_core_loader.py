@@ -362,3 +362,115 @@ async def test_get_dep_graph_and_state(tmp_path):
     assert g == {"a": ["b"], "b": []}
     st = loader.get_state()
     assert st == {"a": "unloaded", "b": "unloaded"}
+
+
+# -- skill kind (unified-agent-model) -------------------------------------
+
+def _write_skill(root: Path, name: str, *, fm: dict | None = None,
+                 handler_src: str = "", handler_filename: str = "handler.py",
+                 body: str = "") -> Path:
+    d = root / name
+    d.mkdir(parents=True)
+    import yaml as _yaml
+    fm_text = _yaml.safe_dump(fm or {}, sort_keys=False).strip()
+    (d / "SKILL.md").write_text(f"---\n{fm_text}\n---\n{body}\n")
+    (d / handler_filename).write_text(textwrap.dedent(handler_src))
+    return d
+
+
+async def test_scan_classifies_skill_by_no_init(tmp_path):
+    _write_skill(tmp_path, "summarize", fm={"description": "a skill"},
+                 handler_src="async def execute(input, ctx): return {'ok': True}")
+    _write_agent(tmp_path, "worker", fm={"run_mode": "persistent"}, init_src="")
+    bus = Bus()
+    loader = Loader(bus, [str(tmp_path)])
+    await loader.scan()
+    assert loader.specs["summarize"].kind == "skill"
+    assert loader.specs["summarize"].run_mode == "triggered"
+    assert loader.specs["summarize"].entry == "execute"
+    assert loader.specs["worker"].kind == "agent"
+
+
+async def test_ensure_running_skill_registers_bus_handler(tmp_path):
+    handler = """
+        async def execute(input, ctx):
+            return {"echo": input.get("msg", "")}
+    """
+    _write_skill(tmp_path, "echo_skill", fm={"description": "echo"},
+                 handler_src=handler)
+    bus = Bus()
+    loader = Loader(bus, [str(tmp_path)])
+    await loader.scan()
+    status = await loader.ensure_running("echo_skill")
+    assert status == "ready"
+    reply = await bus.request("echo_skill", {"msg": "hi"}, timeout=1.0)
+    assert reply == {"echo": "hi"}
+
+
+async def test_skill_sync_execute_is_awaited(tmp_path):
+    handler = """
+        def execute(input, ctx):
+            return {"sum": input.get("a", 0) + input.get("b", 0)}
+    """
+    _write_skill(tmp_path, "adder", handler_src=handler)
+    bus = Bus()
+    loader = Loader(bus, [str(tmp_path)])
+    await loader.scan()
+    await loader.ensure_running("adder")
+    reply = await bus.request("adder", {"a": 2, "b": 3}, timeout=1.0)
+    assert reply == {"sum": 5}
+
+
+async def test_skill_handler_override_via_frontmatter(tmp_path):
+    # OpenClaw pattern: `handler: self_improving.py`
+    handler = """
+        async def execute(input, ctx):
+            return {"kind": "alt"}
+    """
+    _write_skill(tmp_path, "custom", fm={"handler": "alt.py"},
+                 handler_src=handler, handler_filename="alt.py")
+    bus = Bus()
+    loader = Loader(bus, [str(tmp_path)])
+    await loader.scan()
+    spec = loader.specs["custom"]
+    assert spec.handler_path == "alt.py"
+    assert spec.has_handler is True
+    await loader.ensure_running("custom")
+    reply = await bus.request("custom", {}, timeout=1.0)
+    assert reply == {"kind": "alt"}
+
+
+async def test_skill_missing_execute_fails(tmp_path):
+    _write_skill(tmp_path, "broken", handler_src="# no execute")
+    bus = Bus()
+    loader = Loader(bus, [str(tmp_path)])
+    await loader.scan()
+    with pytest.raises(AttributeError, match="execute"):
+        await loader.ensure_running("broken")
+    assert bus.query_status("broken") == "failed"
+
+
+async def test_filter_by_kind(tmp_path):
+    _write_agent(tmp_path, "agent_a", fm={"run_mode": "persistent"}, init_src="")
+    _write_skill(tmp_path, "skill_a",
+                 handler_src="async def execute(input, ctx): return {}")
+    bus = Bus()
+    loader = Loader(bus, [str(tmp_path)])
+    await loader.scan()
+    agents = loader.filter(kind="agent")
+    skills = loader.filter(kind="skill")
+    assert {s.name for s in agents} == {"agent_a"}
+    assert {s.name for s in skills} == {"skill_a"}
+
+
+async def test_filter_by_surface(tmp_path):
+    _write_skill(tmp_path, "menu_skill",
+                 fm={"surface": ["command", "menu"]},
+                 handler_src="async def execute(input, ctx): return {}")
+    _write_skill(tmp_path, "hidden_skill",
+                 handler_src="async def execute(input, ctx): return {}")
+    bus = Bus()
+    loader = Loader(bus, [str(tmp_path)])
+    await loader.scan()
+    assert {s.name for s in loader.filter(surface="menu")} == {"menu_skill"}
+    assert {s.name for s in loader.filter(surface="command")} == {"menu_skill"}

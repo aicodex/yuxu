@@ -1,8 +1,8 @@
 """Cross-skill helpers for project / agent scaffolding.
 
-Lives at the skills_bundled root so each scaffolding skill can import the
-same template constants and registry helpers without re-implementing them.
-SkillRegistry.scan() skips files (and underscore-prefixed names) at the
+Lives at the bundled/ root so each scaffolding skill can import the
+same template constants and manifest helpers without re-implementing them.
+Loader.scan() skips files (and underscore-prefixed names) at the
 scope root, so this module is invisible to the catalog.
 """
 from __future__ import annotations
@@ -98,9 +98,17 @@ def copy_bundled_into(into: Path) -> list[dict]:
             shutil.rmtree(dest)
         shutil.copytree(entry, dest, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         agent_md = dest / "AGENT.md"
-        sha = hashlib.sha256(agent_md.read_bytes()).hexdigest()[:12] \
-            if agent_md.exists() else None
-        manifest.append({"name": entry.name, "agent_md_sha12": sha})
+        skill_md = dest / "SKILL.md"
+        has_init = (dest / "__init__.py").exists()
+        if has_init:
+            kind, md_file = "agent", agent_md
+        elif skill_md.exists():
+            kind, md_file = "skill", skill_md
+        else:
+            kind, md_file = "agent", agent_md  # LLM-only agent
+        sha = hashlib.sha256(md_file.read_bytes()).hexdigest()[:12] \
+            if md_file.exists() else None
+        manifest.append({"name": entry.name, "kind": kind, "md_sha12": sha})
     return manifest
 
 

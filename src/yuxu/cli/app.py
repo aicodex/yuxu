@@ -12,10 +12,10 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from ..skills_bundled.create_agent.handler import create_agent as _skill_create_agent
-from ..skills_bundled.create_project.handler import create_project as _skill_create_project
-from ..skills_bundled.list_agents.handler import list_agents as _skill_list_agents
-from ..skills_bundled.list_projects.handler import list_projects as _skill_list_projects
+from ..bundled.create_agent.handler import create_agent as _skill_create_agent
+from ..bundled.create_project.handler import create_project as _skill_create_project
+from ..bundled.list_agents.handler import list_agents as _skill_list_agents
+from ..bundled.list_projects.handler import list_projects as _skill_list_projects
 from .bootstrap import ensure_home, home_dir
 from .run import run_one_shot
 from .serve import run_serve
@@ -112,7 +112,7 @@ def _cmd_sync(args: argparse.Namespace) -> int:
     Needed because `yuxu init` takes a one-shot snapshot of bundled agents.
     After `pip install -U yuxu` or during dev iteration, run `yuxu sync`
     to bring `_system/` up to date. `agents/` and `data/` are untouched."""
-    from ..skills_bundled._shared import copy_bundled_into
+    from ..bundled._shared import copy_bundled_into
     from .. import __version__ as installed_ver
 
     target = Path(args.project or ".").expanduser().resolve()

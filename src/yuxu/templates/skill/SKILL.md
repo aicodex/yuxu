@@ -10,8 +10,8 @@ description: Fetch current price for a stock symbol from MiniQMT.
 
 # === 可选 ===
 
-# 作用域。scan 时由 SkillRegistry 自动注入，这里写只作为自检/覆盖用
-# scope: global | project | agent
+# 作用域。scan 时由 Loader 自动注入，这里写只作为自检/覆盖用
+# scope: system | project | user
 
 # 触发线索：关键词 / 意图片段，用于 catalog 筛选或 LLM 触发判断
 # triggers:
@@ -46,13 +46,14 @@ description: Fetch current price for a stock symbol from MiniQMT.
 
 ## 安装 / 启用
 
-**安装** = 把这个文件夹放进对应作用域的 skills 根：
-- 全局：`src/skills_bundled/my_skill/`
-- 项目：`data/projects/{project}/skills/my_skill/`
-- Agent：`{agent_dir}/skills/my_skill/`
+**安装** = 把这个文件夹放进 Loader 扫描路径之一：
+- 系统（yuxu 自带）：`src/yuxu/bundled/my_skill/`
+- 项目：`<project>/agents/my_skill/` 或 `<project>/skills/my_skill/`
+- Agent 绑定：`<agent_dir>/skills/my_skill/`（由持有者 agent 扫）
 
-**启用** = 在同级的 `skills_enabled.yaml` 里列上 name（或通过 `SkillRegistry.enable(...)` 写入）。
-装了但没启用的 skill **不会进 catalog / context**。
+skill 的**凭证是缺失 `__init__.py`**（有 `handler.py` + `SKILL.md`）。Loader
+扫到这种结构就按 skill 处理：懒导入 + 注册 bus handler `{name}`。装了即
+可用，**无需单独的 enable 文件**。
 
 ## 何时使用
 

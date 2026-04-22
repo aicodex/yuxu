@@ -37,6 +37,7 @@ log = logging.getLogger(__name__)
 
 VALID_DRIVERS = {"llm", "python", "hybrid"}
 VALID_RUN_MODES = {"persistent", "scheduled", "triggered", "one_shot", "spawned"}
+VALID_KINDS = {"agent", "skill"}
 
 
 @dataclass
@@ -45,6 +46,7 @@ class AgentSpec:
     path: Path
     frontmatter: dict
     body: str = ""
+    kind: str = "agent"
     driver: str = "python"
     run_mode: str = "one_shot"
     depends_on: list[str] = field(default_factory=list)
@@ -56,6 +58,7 @@ class AgentSpec:
     edit_warning: bool = False
     has_init: bool = False
     has_agent_md: bool = False
+    has_skill_md: bool = False
     has_handler: bool = False
 
 
@@ -89,38 +92,72 @@ class Loader:
     def _load_spec(self, agent_dir: Path) -> Optional[AgentSpec]:
         init = agent_dir / "__init__.py"
         agent_md = agent_dir / "AGENT.md"
-        handler = agent_dir / "handler.py"
-        if not (init.exists() or agent_md.exists()):
+        skill_md = agent_dir / "SKILL.md"
+        default_handler = agent_dir / "handler.py"
+
+        # Kind classification by folder shape (Python semantics):
+        #   __init__.py present  → agent (has a lifecycle to run)
+        #   no __init__.py, has handler.py (or SKILL.md) → skill (passive)
+        #   no __init__.py, only AGENT.md            → LLM-only agent
+        if init.exists():
+            kind = "agent"
+        elif default_handler.exists() or skill_md.exists():
+            kind = "skill"
+        elif agent_md.exists():
+            kind = "agent"  # LLM-only agent
+        else:
             return None
+
+        # Pick metadata file: skills prefer SKILL.md, agents use AGENT.md.
+        if kind == "skill":
+            md_file = skill_md if skill_md.exists() else (agent_md if agent_md.exists() else None)
+        else:
+            md_file = agent_md if agent_md.exists() else None
+
         fm: dict = {}
         body = ""
-        if agent_md.exists():
-            fm, body = parse_frontmatter(agent_md.read_text(encoding="utf-8"))
-        driver = fm.get("driver") or ("python" if init.exists() else "llm")
+        if md_file is not None:
+            fm, body = parse_frontmatter(md_file.read_text(encoding="utf-8"))
+
+        # Resolve handler filename (OpenClaw/CC frontmatter `handler:` override)
+        handler_filename = fm.get("handler") or "handler.py"
+        handler_file = agent_dir / handler_filename
+        has_handler = handler_file.exists()
+
+        driver = fm.get("driver") or ("python" if kind == "agent" and init.exists() else "llm")
         if driver not in VALID_DRIVERS:
-            log.warning("loader: %s has invalid driver=%s, defaulting to python", agent_dir.name, driver)
+            log.warning("loader: %s has invalid driver=%s, defaulting to python",
+                        agent_dir.name, driver)
             driver = "python"
-        run_mode = fm.get("run_mode", "one_shot")
+
+        # run_mode default: skills are reactive by nature
+        run_mode_default = "triggered" if kind == "skill" else "one_shot"
+        run_mode = fm.get("run_mode", run_mode_default)
         if run_mode not in VALID_RUN_MODES:
-            log.warning("loader: %s has invalid run_mode=%s, defaulting to one_shot", agent_dir.name, run_mode)
-            run_mode = "one_shot"
+            log.warning("loader: %s has invalid run_mode=%s, defaulting to %s",
+                        agent_dir.name, run_mode, run_mode_default)
+            run_mode = run_mode_default
+
+        entry_default = "execute" if kind == "skill" else "start"
         return AgentSpec(
             name=agent_dir.name,
             path=agent_dir,
             frontmatter=fm,
             body=body,
+            kind=kind,
             driver=driver,
             run_mode=run_mode,
             depends_on=list(fm.get("depends_on") or []),
             optional_deps=list(fm.get("optional_deps") or []),
             scope=fm.get("scope", "user"),
-            handler_path=fm.get("handler"),
-            entry=fm.get("entry", "start"),
+            handler_path=handler_filename,
+            entry=fm.get("entry", entry_default),
             ready_timeout=float(fm.get("ready_timeout", 30.0)),
             edit_warning=bool(fm.get("edit_warning", False)),
             has_init=init.exists(),
             has_agent_md=agent_md.exists(),
-            has_handler=handler.exists(),
+            has_skill_md=skill_md.exists(),
+            has_handler=has_handler,
         )
 
     # -- dep graph ---------------------------------------------------
@@ -155,12 +192,17 @@ class Loader:
     def get_dep_graph(self) -> dict[str, list[str]]:
         return {n: list(s.depends_on) for n, s in self.specs.items()}
 
-    def filter(self, run_mode: Optional[str] = None, scope: Optional[str] = None) -> list[AgentSpec]:
+    def filter(self, run_mode: Optional[str] = None, scope: Optional[str] = None,
+               kind: Optional[str] = None, surface: Optional[str] = None) -> list[AgentSpec]:
         out = list(self.specs.values())
         if run_mode is not None:
             out = [s for s in out if s.run_mode == run_mode]
         if scope is not None:
             out = [s for s in out if s.scope == scope]
+        if kind is not None:
+            out = [s for s in out if s.kind == kind]
+        if surface is not None:
+            out = [s for s in out if surface in (s.frontmatter.get("surface") or [])]
         return out
 
     # -- lifecycle ---------------------------------------------------
@@ -182,6 +224,10 @@ class Loader:
     async def _start(self, spec: AgentSpec) -> None:
         await self.bus.publish_status(spec.name, "loading")
         try:
+            if spec.kind == "skill":
+                await self._start_skill(spec)
+                return
+
             if not spec.has_init:
                 # LLM-only agent: kernel just marks it ready; llm_driver handles it.
                 await self.bus.publish_status(spec.name, "ready")
@@ -260,6 +306,50 @@ class Loader:
         sys.modules[mod_name] = mod
         s.loader.exec_module(mod)
         return mod
+
+    def _import_skill_module(self, spec: AgentSpec, handler_file: Path):
+        mod_name = f"_skills.{spec.name}"
+        s = importlib.util.spec_from_file_location(
+            mod_name, handler_file, submodule_search_locations=[str(spec.path)]
+        )
+        if s is None or s.loader is None:
+            raise ImportError(f"cannot import {handler_file}")
+        mod = importlib.util.module_from_spec(s)
+        sys.modules[mod_name] = mod
+        s.loader.exec_module(mod)
+        return mod
+
+    async def _start_skill(self, spec: AgentSpec) -> None:
+        """Register a skill's handler on the bus; no task spawned.
+
+        Skill is passive: it has no lifecycle, just a function that runs when
+        called via bus.request(spec.name, payload). We lazy-import the handler
+        module and register a bus handler that wraps execute(input, ctx).
+        """
+        handler_file = spec.path / (spec.handler_path or "handler.py")
+        if not handler_file.exists():
+            raise FileNotFoundError(
+                f"skill {spec.name}: handler file {handler_file.name} not found"
+            )
+        mod = self._import_skill_module(spec, handler_file)
+        self.modules[spec.name] = mod
+        execute_fn = getattr(mod, spec.entry, None)
+        if execute_fn is None:
+            raise AttributeError(
+                f"skill {spec.name}: handler {handler_file.name} has no {spec.entry}()"
+            )
+
+        ctx = self._build_context(spec)
+
+        async def _bus_handler(msg):
+            payload = msg.payload if msg.payload is not None else {}
+            result = execute_fn(payload, ctx)
+            if asyncio.iscoroutine(result):
+                result = await result
+            return result
+
+        self.bus.register(spec.name, _bus_handler)
+        await self.bus.publish_status(spec.name, "ready")
 
     def _on_task_done(self, name: str, task: asyncio.Task) -> None:
         if task.cancelled():

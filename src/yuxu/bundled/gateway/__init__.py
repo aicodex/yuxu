@@ -243,6 +243,7 @@ async def start(ctx) -> None:
         pairing_required_platforms=required,
         pending_reply_template=pending_tmpl,
         pairing_poll_seconds=max(0.0, poll_sec),
+        loader=ctx.loader,
     )
     for adapter in _build_adapters():
         try:

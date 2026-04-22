@@ -290,15 +290,18 @@ These look like framework, but are implemented as bundled agents — **do not im
 
 | Capability | Location |
 |---|---|
-| Checkpoint persistence | `src/agents_bundled/checkpoint_store/` |
-| Rate limiting | `src/agents_bundled/rate_limit_service/` |
-| LLM HTTP client | `src/agents_bundled/llm_service/` |
-| LLM turn loop | `src/agents_bundled/llm_driver/` |
-| Recovery scanning | `src/agents_bundled/recovery_agent/` |
-| Resource monitoring | `src/agents_bundled/resource_guardian/` |
-| Watchdog / restart policy | `src/agents_bundled/project_supervisor/` |
-| Skill discovery / catalog | `src/agents_bundled/skill_picker/` |
-| Approval / memory / scheduler / gateway | TBD (future bundled agents) |
+| Checkpoint persistence | `src/yuxu/bundled/checkpoint_store/` |
+| Rate limiting | `src/yuxu/bundled/rate_limit_service/` |
+| LLM HTTP client | `src/yuxu/bundled/llm_service/` |
+| LLM turn loop | `src/yuxu/bundled/llm_driver/` |
+| Recovery scanning | `src/yuxu/bundled/recovery_agent/` |
+| Resource monitoring | `src/yuxu/bundled/resource_guardian/` |
+| Watchdog / restart policy | `src/yuxu/bundled/project_supervisor/` |
+| Skill discovery / dispatch | Loader directly (unified agent model) |
+| Approval / memory / scheduler / gateway | `src/yuxu/bundled/{approval_queue, approval_applier, memory_curator, scheduler, gateway}/` |
+| Agent creator / reflection / curator | `src/yuxu/bundled/{harness_pro_max, reflection_agent, memory_curator}/` |
+| MiniMax budget tracking | `src/yuxu/bundled/minimax_budget/` |
+| Gateway inline expansion (`$ARGUMENTS`, `!cmd`) | `src/yuxu/bundled/gateway/inline_expander.py` |
 
 These can be swapped by the user (dropping a same-named folder in `config/agents/`) without touching core.
 
