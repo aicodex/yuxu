@@ -4,6 +4,7 @@ run_mode: persistent
 scope: system
 edit_warning: true
 depends_on: []
+optional_deps: [minimax_budget]
 ready_timeout: 10
 ---
 # scheduler
@@ -19,6 +20,22 @@ In-process 定时触发器。读 `config/schedules.yaml`，到点 `bus.send(targ
 
 **v0.2+**：cron 表达式、missed-fire 补发策略、on-demand `fire` op、reload 热加载。
 
+## v0.2 priority tier（可选，默认 `normal`）
+
+| priority | normal | soft cap | hard cap |
+|---|---|---|---|
+| `critical` | ✅ | ✅ | ✅ |
+| `normal` (默认) | ✅ | ✅ | ⏸ skipped |
+| `nice_to_have` | ✅ | ⏸ skipped | ⏸ skipped |
+
+scheduler 订阅 `minimax_budget.{interval,weekly}_{soft,hard}_cap` 事件：
+- soft_cap → throttle level 升到 `soft`
+- hard_cap → throttle level 升到 `hard`
+- level **只升不降**，直到 TTL 过期自动回落到 `normal`（默认 TTL = 1800s / 30 min）
+- 任何 cap 事件到达都**续 TTL**（持续吃紧状态下会一直 throttled）
+
+被 skip 的 fire 会发 `scheduler.skipped`，不占配额。
+
 ## Config 示例（`config/schedules.yaml`）
 
 ```yaml
@@ -27,11 +44,19 @@ In-process 定时触发器。读 `config/schedules.yaml`，到点 `bus.send(targ
   event: run
   payload: {}
   daily_at: "06:00"
+  priority: critical    # 业务刚需，cap 时也照跑
 
 - name: newsfeed_refresh
   target: newsfeed_demo
   event: refresh
   interval_sec: 900
+  priority: normal       # 默认可省
+
+- name: reflection_nightly
+  target: reflection_agent
+  event: run
+  daily_at: "03:00"
+  priority: nice_to_have # 预算紧时先停
 ```
 
 也接受 `{schedules: [...]}` 包装形式。
@@ -42,7 +67,8 @@ In-process 定时触发器。读 `config/schedules.yaml`，到点 `bus.send(targ
 
 | op | 返回 |
 |---|---|
-| `status` / `list` | `{ok, schedules: [{name, target, event, trigger, fires}], total_fires}` |
+| `status` / `list` | `{ok, schedules:[{name,target,event,trigger,priority,fires,skips}], total_fires, total_skips, throttle:{level, ttl_remaining_sec, expires_at, last_cap_topic}}` |
+| `override_throttle` | payload `{level: normal\|soft\|hard, ttl_sec?: float}` → 手动改 level（例如用户催促 `/override normal`） |
 
 读字段级内省。v0.1 不支持运行时增删 schedule，v0.2+ 再加。
 
@@ -50,7 +76,8 @@ In-process 定时触发器。读 `config/schedules.yaml`，到点 `bus.send(targ
 
 | topic | payload | 时机 |
 |---|---|---|
-| `scheduler.tick` | `{schedule, target, event, fired_at, count}` | 每次成功 `bus.send` |
+| `scheduler.tick` | `{schedule, target, event, fired_at, count, priority}` | 每次成功 `bus.send` |
+| `scheduler.skipped` | `{schedule, priority, throttle_level, reason, skipped_at, skip_count}` | 被 tier 挡下 |
 | `scheduler.error` | `{schedule, target?, error}` | 发送失败或任务 crash |
 
 ## 注意
