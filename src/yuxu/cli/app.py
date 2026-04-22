@@ -12,8 +12,12 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from ..bundled.project_manager.handler import ProjectManager
+from ..skills_bundled.create_agent.handler import create_agent as _skill_create_agent
+from ..skills_bundled.create_project.handler import create_project as _skill_create_project
+from ..skills_bundled.list_agents.handler import list_agents as _skill_list_agents
+from ..skills_bundled.list_projects.handler import list_projects as _skill_list_projects
 from .bootstrap import ensure_home, home_dir
+from .run import run_one_shot
 from .serve import run_serve
 
 
@@ -22,7 +26,7 @@ from .serve import run_serve
 
 def _cmd_init(args: argparse.Namespace) -> int:
     try:
-        p = ProjectManager.create_project(args.dir or ".", force=args.force)
+        p = _skill_create_project(args.dir or ".", force=args.force)
     except FileExistsError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -52,7 +56,7 @@ def _cmd_setup(args: argparse.Namespace) -> int:
 def _cmd_new_agent(args: argparse.Namespace) -> int:
     project_dir = Path(args.project or ".").expanduser().resolve()
     try:
-        p = ProjectManager.create_agent(project_dir, args.name, template=args.template)
+        p = _skill_create_agent(project_dir, args.name, template=args.template)
     except (FileExistsError, FileNotFoundError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -62,7 +66,7 @@ def _cmd_new_agent(args: argparse.Namespace) -> int:
 
 
 def _cmd_list_projects(args: argparse.Namespace) -> int:
-    projects = ProjectManager.list_projects()
+    projects = _skill_list_projects()
     if not projects:
         print("(no projects registered; run `yuxu init <dir>` to create one)")
         return 0
@@ -77,7 +81,7 @@ def _cmd_list_projects(args: argparse.Namespace) -> int:
 def _cmd_list_agents(args: argparse.Namespace) -> int:
     project_dir = Path(args.project or ".").expanduser().resolve()
     try:
-        agents = ProjectManager.list_agents(project_dir)
+        agents = _skill_list_agents(project_dir)
     except FileNotFoundError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -100,14 +104,22 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_run(args: argparse.Namespace) -> int:
+    target = Path(args.dir or ".").expanduser().resolve()
+    if not (target / "yuxu.json").exists():
+        print(f"error: no yuxu.json at {target}. Run `yuxu init {target}` first.",
+              file=sys.stderr)
+        return 1
+    return run_one_shot(target, args.agent, log_level=args.log_level)
+
+
 def _cmd_status(args: argparse.Namespace) -> int:
-    import yaml
     home = home_dir()
     print(f"yuxu home: {home}")
     if not home.exists():
         print("  (not initialized; any CLI command will create it)")
         return 0
-    projects = ProjectManager.list_projects()
+    projects = _skill_list_projects()
     print(f"known projects ({len(projects)}):")
     for p in projects:
         flag = "✓" if p.get("exists") else "✗"
@@ -443,6 +455,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--log-level", default="INFO",
                          choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     p_serve.set_defaults(func=_cmd_serve)
+
+    # run
+    p_run = subs.add_parser(
+        "run",
+        help="Boot ephemerally, run one non-persistent agent, exit. "
+             "For long-running daemons use `yuxu serve`.",
+    )
+    p_run.add_argument("agent", help="Agent name (must exist in this project).")
+    p_run.add_argument("--dir", default=None,
+                       help="Project directory (default: cwd).")
+    p_run.add_argument("--log-level", default="INFO",
+                       choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    p_run.set_defaults(func=_cmd_run)
 
     # status
     p_status = subs.add_parser("status", help="Show yuxu home + known projects.")

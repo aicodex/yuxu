@@ -154,6 +154,51 @@ async def test_handle_non_dict_payload(tmp_path):
     assert r["ok"] is False
 
 
+async def test_concurrent_writes_same_key_dont_corrupt(tmp_path):
+    """Two coroutines saving the same key should both finish successfully and
+    leave a valid JSON file behind, never raising FileNotFoundError on the
+    .tmp rename."""
+    import asyncio as _asyncio
+    s = CheckpointStore(tmp_path)
+    payloads = list(range(40))
+
+    async def writer(i):
+        return await s.handle(_FakeMsg(
+            {"op": "save", "namespace": "race", "key": "k", "data": i}
+        ))
+
+    results = await _asyncio.gather(*[writer(i) for i in payloads])
+    assert all(r["ok"] for r in results)
+
+    final = (tmp_path / "race" / "k.json").read_text(encoding="utf-8")
+    record = json.loads(final)
+    assert record["namespace"] == "race"
+    assert record["key"] == "k"
+    assert record["data"] in payloads
+    # No leftover .tmp files
+    assert list((tmp_path / "race").glob("*.json.tmp")) == []
+
+
+async def test_different_namespaces_dont_block_each_other(tmp_path):
+    """Locks are per-namespace; ops on different namespaces run in parallel."""
+    import asyncio as _asyncio
+    s = CheckpointStore(tmp_path)
+    # Hold the 'slow' namespace lock manually; a save into 'fast' must still
+    # finish quickly because it acquires a different lock instance.
+    slow_lock = s._get_ns_lock("slow")
+    await slow_lock.acquire()
+    try:
+        r = await _asyncio.wait_for(
+            s.handle(_FakeMsg(
+                {"op": "save", "namespace": "fast", "key": "k", "data": 1}
+            )),
+            timeout=1.0,
+        )
+        assert r["ok"] is True
+    finally:
+        slow_lock.release()
+
+
 # -- bus + loader integration ------------------------------------
 
 

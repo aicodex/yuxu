@@ -29,8 +29,11 @@ result = await bus.request("llm_driver", {
     "max_output_bytes": 50000,
     "tool_timeout": 60,
     "llm_timeout": 180,
+    "max_total_tokens": 200000,            # 可选：累计 prompt+completion 超限即停
+                                           # 默认 None=不限；触发时 stop_reason="token_budget"
     "temperature": 0.3,
     "json_mode": False,
+    "strip_thinking_blocks": True,         # 可选：透传给 llm_service
 }, timeout=300)
 ```
 
@@ -42,7 +45,7 @@ result = await bus.request("llm_driver", {
     "content": str | None,          # 最后一轮 assistant 文本
     "messages": [...],              # 追加了所有 assistant/tool 轮次的完整 messages
     "iterations": int,
-    "stop_reason": "complete" | "max_iter" | "error",
+    "stop_reason": "complete" | "max_iter" | "token_budget" | "error",
     "usage": {"prompt_tokens": int, "completion_tokens": int},
     "error": str | None,
 }

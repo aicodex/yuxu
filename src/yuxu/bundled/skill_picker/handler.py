@@ -9,21 +9,21 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from .registry import SkillRegistry, SkillScope
+from .registry import SkillRegistry, SkillScope, installed_skills_bundled_root
 
 log = logging.getLogger(__name__)
 
-DEFAULT_GLOBAL_ROOT = Path("src/skills_bundled")
 DEFAULT_GLOBAL_ENABLE = Path("config/skills_enabled.yaml")
 
 
 class SkillPicker:
     def __init__(self, bus, loader, *,
-                 global_root: Path | str = DEFAULT_GLOBAL_ROOT,
+                 global_root: Path | str | None = None,
                  global_enable_file: Path | str = DEFAULT_GLOBAL_ENABLE) -> None:
         self.bus = bus
         self.loader = loader
-        self.global_root = Path(global_root)
+        self.global_root = Path(global_root) if global_root is not None \
+            else installed_skills_bundled_root()
         self.global_enable_file = Path(global_enable_file)
         self.registry = SkillRegistry()
         # project scopes can be added on demand (projects aren't first-class yet)

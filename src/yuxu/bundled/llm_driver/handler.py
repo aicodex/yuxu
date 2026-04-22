@@ -18,6 +18,7 @@ DEFAULT_MAX_ITERATIONS = 32
 DEFAULT_MAX_OUTPUT_BYTES = 50_000
 DEFAULT_TOOL_TIMEOUT = 60.0
 DEFAULT_LLM_TIMEOUT = 180.0
+DEFAULT_MAX_TOTAL_TOKENS: Optional[int] = None  # off by default; caller opts in
 
 
 def _cap(s: str, max_bytes: int) -> str:
@@ -93,6 +94,8 @@ class LlmDriver:
         llm_timeout: float = DEFAULT_LLM_TIMEOUT,
         temperature: Optional[float] = None,
         json_mode: bool = False,
+        strip_thinking_blocks: bool = False,
+        max_total_tokens: Optional[int] = DEFAULT_MAX_TOTAL_TOKENS,
     ) -> dict:
         dispatch = tool_dispatch or {}
         total_prompt = 0
@@ -116,6 +119,8 @@ class LlmDriver:
                 llm_req["temperature"] = temperature
             if json_mode:
                 llm_req["json_mode"] = True
+            if strip_thinking_blocks:
+                llm_req["strip_thinking_blocks"] = True
 
             try:
                 resp = await self.bus.request("llm_service", llm_req, timeout=llm_timeout)
@@ -140,6 +145,14 @@ class LlmDriver:
             tool_calls = resp.get("tool_calls") or []
             if not tool_calls:
                 stop_reason = "complete"
+                break
+
+            if max_total_tokens is not None and (total_prompt + total_completion) >= max_total_tokens:
+                stop_reason = "token_budget"
+                error_msg = (
+                    f"token budget exceeded: {total_prompt + total_completion} "
+                    f"tokens >= {max_total_tokens}; aborting before next iteration"
+                )
                 break
 
             for tc in tool_calls:
@@ -195,6 +208,8 @@ class LlmDriver:
             llm_timeout=payload.get("llm_timeout", DEFAULT_LLM_TIMEOUT),
             temperature=payload.get("temperature"),
             json_mode=payload.get("json_mode", False),
+            strip_thinking_blocks=payload.get("strip_thinking_blocks", False),
+            max_total_tokens=payload.get("max_total_tokens", DEFAULT_MAX_TOTAL_TOKENS),
         )
         result["messages"] = messages
         return result

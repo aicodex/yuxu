@@ -8,11 +8,41 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, Callable, Optional
 
 import httpx
 
 log = logging.getLogger(__name__)
+
+# Match <think>...</think>, <thinking>...</thinking>, with optional attributes,
+# case-insensitive, dotall (spans newlines). Also greedy-tolerant: strips a
+# leading unclosed <think> opener as a last resort (some providers emit it
+# without a closing tag when truncated).
+_THINK_BLOCK_RE = re.compile(
+    r"<think(?:ing)?\b[^>]*>.*?</think(?:ing)?>",
+    re.DOTALL | re.IGNORECASE,
+)
+_THINK_OPEN_RE = re.compile(r"<think(?:ing)?\b[^>]*>", re.IGNORECASE)
+
+
+def _strip_thinking_blocks(content: Optional[str]) -> Optional[str]:
+    """Remove <think>…</think> / <thinking>…</thinking> spans from LLM output.
+
+    Some providers (notably MiniMax) leak thinking blocks even when the
+    system prompt forbids them. Strip them at the service boundary so
+    callers see clean content.
+    """
+    if not content:
+        return content
+    cleaned = _THINK_BLOCK_RE.sub("", content)
+    # If a stray opener remains (truncated mid-thinking), drop everything from
+    # that point to a following blank line, which is conservative but avoids
+    # leaking partial reasoning.
+    m = _THINK_OPEN_RE.search(cleaned)
+    if m:
+        cleaned = cleaned[: m.start()]
+    return cleaned.strip()
 
 
 class LLMServiceError(Exception):
@@ -41,7 +71,8 @@ class LLMService:
                    temperature: Optional[float] = None,
                    json_mode: bool = False,
                    extra_body: Optional[dict] = None,
-                   timeout: Optional[float] = None) -> dict:
+                   timeout: Optional[float] = None,
+                   strip_thinking_blocks: bool = False) -> dict:
         async with self.rate_limiter(pool) as ctx:
             if not isinstance(ctx, dict):
                 raise LLMServiceError(
@@ -86,7 +117,12 @@ class LLMService:
                 api_resp = resp.json()
             except json.JSONDecodeError as e:
                 raise LLMServiceError(f"non-JSON response: {e}") from e
-            return self._normalize(api_resp)
+            normalized = self._normalize(api_resp)
+            if strip_thinking_blocks:
+                normalized["content"] = _strip_thinking_blocks(
+                    normalized.get("content")
+                )
+            return normalized
 
     def _normalize(self, api_resp: dict) -> dict:
         choices = api_resp.get("choices") or []
@@ -146,6 +182,7 @@ class LLMService:
                 json_mode=payload.get("json_mode", False),
                 extra_body=payload.get("extra_body"),
                 timeout=payload.get("timeout"),
+                strip_thinking_blocks=payload.get("strip_thinking_blocks", False),
             )
             return {"ok": True, **result}
         except LLMServiceError as e:

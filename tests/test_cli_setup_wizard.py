@@ -7,12 +7,12 @@ import pytest
 import yaml
 
 from yuxu.bundled.gateway.pairing import DEFAULT_PAIRING_PATH, PairingRegistry
-from yuxu.bundled.project_manager.handler import ProjectManager
 from yuxu.cli.setup_wizard import run_setup_wizard
+from yuxu.skills_bundled.create_project.handler import create_project
 
 
 def _make_project(tmp_path: Path) -> Path:
-    return ProjectManager.create_project(tmp_path / "p")
+    return create_project(tmp_path / "p")
 
 
 class _Answers:

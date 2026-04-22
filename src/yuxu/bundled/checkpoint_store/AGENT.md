@@ -39,6 +39,8 @@ ready_timeout: 5
 ## 可靠性
 
 - 原子写入：写 `.tmp` 后 `os.replace()`，避免半写入文件
+- 并发：`handle()` 按 namespace 加 `asyncio.Lock`，同 namespace 内所有 op 串行，
+  防 `.tmp` 文件互踩 / load 撞到 mid-write 不一致状态。不同 namespace 并行
 - namespace / key 只允许不含路径分隔符 / `..` / 前导 `.`，防止越狱
 - 同步 IO：小 checkpoint 无需包装；大文件（MB 级）后续再 `asyncio.to_thread`
 

@@ -5,7 +5,11 @@ import json
 import httpx
 import pytest
 
-from yuxu.bundled.llm_service.handler import LLMService, LLMServiceError
+from yuxu.bundled.llm_service.handler import (
+    LLMService,
+    LLMServiceError,
+    _strip_thinking_blocks,
+)
 from yuxu.bundled.rate_limit_service.handler import RateLimitService
 from yuxu.core.bus import Bus
 from yuxu.core.loader import Loader
@@ -219,6 +223,89 @@ async def test_handle_unknown_op():
     svc = LLMService(rl)
     r = await svc.handle(_Msg({"op": "foo"}))
     assert r["ok"] is False
+
+
+async def test_chat_strip_thinking_blocks_removes_think_section():
+    def route(req):
+        return httpx.Response(200, json={
+            "choices": [{
+                "message": {"content": "<think>secret reasoning</think>final answer"},
+                "finish_reason": "stop",
+            }],
+        })
+    rl, _ = _make_rate_limiter([{"id": "k", "api_key": "x", "base_url": "http://a/v1"}])
+    svc = LLMService(rl, client=httpx.AsyncClient(transport=_mock_transport(route)))
+    try:
+        r = await svc.chat(pool="minimax", model="m", messages=[],
+                           strip_thinking_blocks=True)
+        assert r["content"] == "final answer"
+    finally:
+        await svc.close()
+
+
+async def test_chat_without_strip_keeps_think_section():
+    def route(req):
+        return httpx.Response(200, json={
+            "choices": [{
+                "message": {"content": "<think>x</think>y"},
+                "finish_reason": "stop",
+            }],
+        })
+    rl, _ = _make_rate_limiter([{"id": "k", "api_key": "x", "base_url": "http://a/v1"}])
+    svc = LLMService(rl, client=httpx.AsyncClient(transport=_mock_transport(route)))
+    try:
+        r = await svc.chat(pool="minimax", model="m", messages=[])
+        assert r["content"] == "<think>x</think>y"
+    finally:
+        await svc.close()
+
+
+async def test_handle_passes_strip_thinking_blocks():
+    def route(req):
+        return httpx.Response(200, json={
+            "choices": [{
+                "message": {"content": "<thinking>hide</thinking>visible"},
+                "finish_reason": "stop",
+            }],
+        })
+    rl, _ = _make_rate_limiter([{"id": "k", "api_key": "x", "base_url": "http://a/v1"}])
+    svc = LLMService(rl, client=httpx.AsyncClient(transport=_mock_transport(route)))
+    try:
+        r = await svc.handle(_Msg({
+            "pool": "minimax", "model": "m", "messages": [],
+            "strip_thinking_blocks": True,
+        }))
+        assert r["ok"] is True
+        assert r["content"] == "visible"
+    finally:
+        await svc.close()
+
+
+# -- _strip_thinking_blocks unit ---------------------------------
+
+
+def test_strip_handles_none_and_empty():
+    assert _strip_thinking_blocks(None) is None
+    assert _strip_thinking_blocks("") == ""
+
+
+def test_strip_removes_multiple_blocks_multiline():
+    src = "before\n<think>\nline1\nline2\n</think>\nmiddle\n<think>x</think>after"
+    assert _strip_thinking_blocks(src) == "before\n\nmiddle\nafter"
+
+
+def test_strip_handles_thinking_alias_and_attributes():
+    src = '<thinking model="x">a</thinking>real'
+    assert _strip_thinking_blocks(src) == "real"
+
+
+def test_strip_is_case_insensitive():
+    assert _strip_thinking_blocks("<THINK>a</THINK>b") == "b"
+
+
+def test_strip_truncates_orphan_opener():
+    # Provider truncated mid-thinking: drop everything from the opener on.
+    assert _strip_thinking_blocks("answer<think>partial reasoning") == "answer"
 
 
 async def test_handle_unknown_pool():

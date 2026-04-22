@@ -36,3 +36,11 @@ Thumbs.db
 data/
 config/secrets/
 *.log
+
+# Demo runners under examples/ create `_*_run_local/` scratch dirs with real
+# API keys / checkpoints at runtime — never commit those.
+examples/_*_run_local/
+
+# Demo agents write generated artifacts into their own reports/ dirs at
+# runtime; those are transient outputs, not source.
+examples/*/reports/

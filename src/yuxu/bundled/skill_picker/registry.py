@@ -45,6 +45,16 @@ VALID_SCOPES = ("global", "project", "agent")
 _PRECEDENCE = {"global": 0, "project": 1, "agent": 2}
 
 
+def installed_skills_bundled_root() -> Path:
+    """Where shipped skills live in the installed yuxu package.
+
+    Used as the default for global-scope discovery so an editable-install or
+    pip-installed yuxu finds its bundled skills regardless of caller cwd.
+    """
+    import yuxu
+    return Path(yuxu.__file__).parent / "skills_bundled"
+
+
 @dataclass
 class SkillScope:
     """A (skills_root, enable_file, scope, owner) bundle.
@@ -67,10 +77,14 @@ class SkillScope:
 
     @classmethod
     def global_scope(cls,
-                     skills_root: Path | str = "src/skills_bundled",
+                     skills_root: Path | str | None = None,
                      enable_file: Path | str = "config/skills_enabled.yaml") -> "SkillScope":
+        """Default skills_root is the installed yuxu package's
+        `skills_bundled/` directory; pass an explicit path to point elsewhere
+        (e.g. tests, alternate distributions)."""
         return cls(
-            skills_root=Path(skills_root),
+            skills_root=Path(skills_root) if skills_root is not None
+                        else installed_skills_bundled_root(),
             enable_file=Path(enable_file),
             scope="global",
             owner=None,
@@ -342,13 +356,14 @@ class SkillRegistry:
 
 
 def default_scopes(*,
-                   bundled_root: Path | str = "src/skills_bundled",
+                   bundled_root: Path | str | None = None,
                    global_enable_file: Path | str = "config/skills_enabled.yaml",
                    projects: Optional[Iterable[tuple[Path | str, str]]] = None,
                    agents: Optional[Iterable[tuple[Path | str, str]]] = None,
                    ) -> list[SkillScope]:
     """Build the standard SkillScope list.
 
+    `bundled_root` defaults to the installed yuxu package's `skills_bundled/`.
     `projects` items are `(project_dir, project_id)`;
     `agents` items are `(agent_dir, agent_name)`.
     """

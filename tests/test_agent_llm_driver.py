@@ -30,6 +30,18 @@ def _register_llm(bus, responses):
     return idx
 
 
+def _register_llm_capture(bus, response):
+    """Fake llm_service that records each request payload."""
+    seen: list[dict] = []
+
+    async def handler(msg):
+        seen.append(dict(msg.payload) if isinstance(msg.payload, dict) else {})
+        return response
+
+    bus.register("llm_service", handler)
+    return seen
+
+
 # -- unit tests ------------------------------------------------
 
 
@@ -295,3 +307,133 @@ async def test_handle_unknown_op():
     r = await driver.handle(type("M", (), {"payload": {"op": "weird"}})())
     assert r["ok"] is False
     assert "unknown op" in r["error"]
+
+
+async def test_strip_thinking_blocks_passes_through_to_llm_service():
+    bus = Bus()
+    seen = _register_llm_capture(bus, {
+        "ok": True, "content": "clean", "tool_calls": [],
+        "stop_reason": "end_turn", "usage": {},
+    })
+    driver = LlmDriver(bus)
+    await driver.run_turn(
+        system_prompt="sys", messages=[{"role": "user", "content": "hi"}],
+        pool="p", model="m", strip_thinking_blocks=True,
+    )
+    assert seen[0].get("strip_thinking_blocks") is True
+
+
+async def test_strip_thinking_blocks_default_off_omits_field():
+    bus = Bus()
+    seen = _register_llm_capture(bus, {
+        "ok": True, "content": "x", "tool_calls": [],
+        "stop_reason": "end_turn", "usage": {},
+    })
+    driver = LlmDriver(bus)
+    await driver.run_turn(
+        system_prompt="sys", messages=[{"role": "user", "content": "hi"}],
+        pool="p", model="m",
+    )
+    assert "strip_thinking_blocks" not in seen[0]
+
+
+async def test_token_budget_aborts_between_iterations():
+    bus = Bus()
+    # Each iteration burns 600 tokens and asks for another tool_call.
+    burn = [
+        {"ok": True, "content": "thinking",
+         "tool_calls": [{"id": f"c{i}", "name": "noop", "input": {}}],
+         "stop_reason": "tool_use",
+         "usage": {"prompt_tokens": 500, "completion_tokens": 100}}
+        for i in range(5)
+    ]
+    _register_llm(bus, burn)
+
+    async def noop(msg):
+        return {"output": "ok"}
+
+    bus.register("noop", noop)
+    driver = LlmDriver(bus)
+    r = await driver.run_turn(
+        system_prompt="s", messages=[{"role": "user", "content": "x"}],
+        pool="p", model="m",
+        tools=[{"name": "noop", "parameters": {}}],
+        max_iterations=10,
+        max_total_tokens=1000,
+    )
+    assert r["ok"] is False
+    assert r["stop_reason"] == "token_budget"
+    # First iter burns 600 (< 1000, dispatches tool); second hits 1200 → break.
+    assert r["iterations"] == 2
+    assert r["usage"]["prompt_tokens"] + r["usage"]["completion_tokens"] >= 1000
+    assert "token budget" in (r["error"] or "").lower()
+
+
+async def test_token_budget_default_unset_does_not_abort():
+    bus = Bus()
+    _register_llm(bus, [
+        {"ok": True, "content": "done", "tool_calls": [],
+         "stop_reason": "end_turn",
+         "usage": {"prompt_tokens": 999_999, "completion_tokens": 999_999}}
+    ])
+    driver = LlmDriver(bus)
+    r = await driver.run_turn(
+        system_prompt="s", messages=[{"role": "user", "content": "x"}],
+        pool="p", model="m",
+    )
+    assert r["stop_reason"] == "complete"
+
+
+async def test_token_budget_does_not_kill_natural_completion():
+    """If the LLM finishes (no tool_calls) on the same turn that crosses budget,
+    we report 'complete' — the budget check only fires before another iteration."""
+    bus = Bus()
+    _register_llm(bus, [
+        {"ok": True, "content": "answer", "tool_calls": [],
+         "stop_reason": "end_turn",
+         "usage": {"prompt_tokens": 5000, "completion_tokens": 0}}
+    ])
+    driver = LlmDriver(bus)
+    r = await driver.run_turn(
+        system_prompt="s", messages=[{"role": "user", "content": "x"}],
+        pool="p", model="m",
+        max_total_tokens=100,
+    )
+    assert r["ok"] is True
+    assert r["stop_reason"] == "complete"
+
+
+async def test_handle_passes_max_total_tokens():
+    bus = Bus()
+    seen = _register_llm_capture(bus, {
+        "ok": True, "content": "x", "tool_calls": [],
+        "stop_reason": "end_turn", "usage": {},
+    })
+    driver = LlmDriver(bus)
+    await driver.handle(type("M", (), {"payload": {
+        "op": "run_turn",
+        "system_prompt": "s",
+        "messages": [{"role": "user", "content": "hi"}],
+        "pool": "p", "model": "m",
+        "max_total_tokens": 4000,
+    }})())
+    # llm_service doesn't see the budget — driver enforces it locally.
+    # We just verify the call still works end-to-end with the param accepted.
+    assert seen[0]["model"] == "m"
+
+
+async def test_handle_passes_strip_thinking_blocks():
+    bus = Bus()
+    seen = _register_llm_capture(bus, {
+        "ok": True, "content": "x", "tool_calls": [],
+        "stop_reason": "end_turn", "usage": {},
+    })
+    driver = LlmDriver(bus)
+    await driver.handle(type("M", (), {"payload": {
+        "op": "run_turn",
+        "system_prompt": "s",
+        "messages": [{"role": "user", "content": "hi"}],
+        "pool": "p", "model": "m",
+        "strip_thinking_blocks": True,
+    }})())
+    assert seen[0].get("strip_thinking_blocks") is True

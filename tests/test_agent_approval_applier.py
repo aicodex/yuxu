@@ -1,0 +1,456 @@
+"""ApprovalApplier — closes reflection_agent's memory_edit loop."""
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+from textwrap import dedent
+from types import SimpleNamespace
+
+import pytest
+
+from yuxu.bundled.approval_applier.handler import (
+    APPLIED_TOPIC,
+    REJECTED_TOPIC,
+    SKIPPED_TOPIC,
+    ApprovalApplier,
+    _strip_outer_frontmatter,
+)
+from yuxu.bundled.approval_queue.handler import ApprovalQueue
+from yuxu.bundled.checkpoint_store.handler import CheckpointStore
+from yuxu.core.bus import Bus
+
+pytestmark = pytest.mark.asyncio
+
+
+# -- pure helper -----------------------------------------------
+
+
+def test_strip_outer_frontmatter_extracts_inner():
+    draft = dedent("""\
+        ---
+        status: draft
+        proposed_target: a.md
+        ---
+        ---
+        name: real_entry
+        description: y
+        type: reference
+        ---
+        # Title
+
+        body
+        """)
+    inner = _strip_outer_frontmatter(draft)
+    assert inner is not None
+    assert inner.startswith("---\nname: real_entry")
+    assert "# Title" in inner
+
+
+def test_strip_returns_none_on_missing_outer_fm():
+    assert _strip_outer_frontmatter("no frontmatter at all\n# Title") is None
+    assert _strip_outer_frontmatter("") is None
+
+
+# -- fixtures --------------------------------------------------
+
+
+def _make_ctx(bus: Bus) -> SimpleNamespace:
+    return SimpleNamespace(bus=bus, agent_dir=Path("/tmp"), name="approval_applier",
+                            loader=None)
+
+
+def _make_draft_file(tmp_path: Path, *, proposed_target: str = "feedback_x.md",
+                     inner_body: str | None = None) -> Path:
+    """Write a realistic two-frontmatter draft file and return its path."""
+    memory_root = tmp_path / "mem"
+    drafts_dir = memory_root / "_drafts"
+    drafts_dir.mkdir(parents=True, exist_ok=True)
+    draft = drafts_dir / "reflection_1_ab_x.md"
+    inner = inner_body or dedent("""\
+        ---
+        name: feedback_x
+        description: a test feedback entry
+        type: feedback
+        ---
+        # feedback_x
+
+        Real memory body.
+        """)
+    draft.write_text(
+        "---\n"
+        f"status: \"draft\"\nproposed_target: \"{proposed_target}\"\n"
+        "proposed_action: \"add\"\nreflection_run_id: \"ab\"\n"
+        "---\n" + inner,
+        encoding="utf-8",
+    )
+    return draft
+
+
+def _fake_aq_entry(aid: str, draft_path: Path, *,
+                   target: str = "feedback_x.md",
+                   action: str = "add") -> dict:
+    return {
+        "approval_id": aid,
+        "action": "memory_edit",
+        "requester": "reflection_agent",
+        "status": "approved",
+        "detail": {
+            "run_id": "ab", "need": "test",
+            "draft_path": str(draft_path),
+            "proposed_target": target,
+            "proposed_action": action,
+            "title": "x", "score": 0.9,
+        },
+    }
+
+
+def _register_fake_aq(bus: Bus, entries_by_id: dict[str, dict]):
+    async def handler(msg):
+        p = dict(msg.payload) if isinstance(msg.payload, dict) else {}
+        if p.get("op") == "get":
+            aid = p.get("approval_id")
+            if aid in entries_by_id:
+                return {"ok": True, "item": entries_by_id[aid]}
+            return {"ok": False, "error": "no such approval"}
+        return {"ok": False, "error": "unexpected op in fake aq"}
+    bus.register("approval_queue", handler)
+
+
+async def _yield(n: int = 20) -> None:
+    for _ in range(n):
+        await asyncio.sleep(0)
+
+
+def _collect_events(bus: Bus, topic: str) -> list[dict]:
+    got: list[dict] = []
+
+    async def _h(e):
+        p = e.get("payload") if isinstance(e, dict) else None
+        if isinstance(p, dict):
+            got.append(p)
+
+    bus.subscribe(topic, _h)
+    return got
+
+
+# -- approved + add happy path --------------------------------
+
+
+async def test_approved_add_writes_inner_body_and_deletes_draft(tmp_path):
+    bus = Bus()
+    draft = _make_draft_file(tmp_path)
+    _register_fake_aq(bus, {"A1": _fake_aq_entry("A1", draft)})
+    applied = _collect_events(bus, APPLIED_TOPIC)
+
+    applier = ApprovalApplier(_make_ctx(bus))
+    await applier.install()
+
+    await bus.publish("approval_queue.decided", {
+        "approval_id": "A1", "action": "memory_edit",
+        "requester": "reflection_agent", "reason": None,
+        "decision": "approved",
+    })
+    await _yield()
+
+    target = tmp_path / "mem" / "feedback_x.md"
+    assert target.exists()
+    written = target.read_text(encoding="utf-8")
+    assert written.startswith("---\nname: feedback_x")
+    assert "Real memory body." in written
+    assert not draft.exists(), "draft should be deleted after apply"
+    assert applied and applied[0]["target_path"] == str(target)
+    assert applied[0]["action"] == "add"
+
+
+async def test_approved_update_overwrites_existing_target(tmp_path):
+    bus = Bus()
+    draft = _make_draft_file(tmp_path)
+    target = tmp_path / "mem" / "feedback_x.md"
+    target.write_text("old content", encoding="utf-8")
+    _register_fake_aq(bus, {
+        "A1": _fake_aq_entry("A1", draft, action="update"),
+    })
+    applier = ApprovalApplier(_make_ctx(bus))
+    await applier.install()
+
+    await bus.publish("approval_queue.decided", {
+        "approval_id": "A1", "action": "memory_edit",
+        "decision": "approved", "requester": "x", "reason": None,
+    })
+    await _yield()
+
+    assert target.read_text(encoding="utf-8") != "old content"
+    assert "Real memory body." in target.read_text(encoding="utf-8")
+    assert not draft.exists()
+
+
+# -- refusal paths ---------------------------------------------
+
+
+async def test_add_refused_if_target_exists(tmp_path):
+    bus = Bus()
+    draft = _make_draft_file(tmp_path)
+    target = tmp_path / "mem" / "feedback_x.md"
+    target.write_text("do not overwrite me", encoding="utf-8")
+    _register_fake_aq(bus, {"A1": _fake_aq_entry("A1", draft)})
+    skipped = _collect_events(bus, SKIPPED_TOPIC)
+
+    applier = ApprovalApplier(_make_ctx(bus))
+    await applier.install()
+    await bus.publish("approval_queue.decided", {
+        "approval_id": "A1", "action": "memory_edit",
+        "decision": "approved", "requester": "x", "reason": None,
+    })
+    await _yield()
+
+    assert target.read_text(encoding="utf-8") == "do not overwrite me"
+    assert draft.exists(), "draft preserved on skip"
+    assert skipped and "exists" in skipped[0]["reason"]
+
+
+async def test_update_refused_if_target_missing(tmp_path):
+    bus = Bus()
+    draft = _make_draft_file(tmp_path)
+    _register_fake_aq(bus, {
+        "A1": _fake_aq_entry("A1", draft, action="update"),
+    })
+    skipped = _collect_events(bus, SKIPPED_TOPIC)
+
+    applier = ApprovalApplier(_make_ctx(bus))
+    await applier.install()
+    await bus.publish("approval_queue.decided", {
+        "approval_id": "A1", "action": "memory_edit",
+        "decision": "approved", "requester": "x", "reason": None,
+    })
+    await _yield()
+
+    assert not (tmp_path / "mem" / "feedback_x.md").exists()
+    assert draft.exists()
+    assert skipped and "does not exist" in skipped[0]["reason"]
+
+
+async def test_missing_draft_file_is_idempotent_skip(tmp_path):
+    bus = Bus()
+    draft_path = tmp_path / "mem" / "_drafts" / "gone.md"
+    _register_fake_aq(bus, {
+        "A1": _fake_aq_entry("A1", draft_path),
+    })
+    skipped = _collect_events(bus, SKIPPED_TOPIC)
+
+    applier = ApprovalApplier(_make_ctx(bus))
+    await applier.install()
+    await bus.publish("approval_queue.decided", {
+        "approval_id": "A1", "action": "memory_edit",
+        "decision": "approved", "requester": "x", "reason": None,
+    })
+    await _yield()
+
+    assert skipped and "draft missing" in skipped[0]["reason"]
+
+
+async def test_malformed_draft_without_outer_frontmatter_skipped(tmp_path):
+    bus = Bus()
+    drafts_dir = tmp_path / "mem" / "_drafts"
+    drafts_dir.mkdir(parents=True)
+    bad = drafts_dir / "bad.md"
+    bad.write_text("# not a draft, no frontmatter at all\n", encoding="utf-8")
+    _register_fake_aq(bus, {"A1": _fake_aq_entry("A1", bad)})
+    skipped = _collect_events(bus, SKIPPED_TOPIC)
+
+    applier = ApprovalApplier(_make_ctx(bus))
+    await applier.install()
+    await bus.publish("approval_queue.decided", {
+        "approval_id": "A1", "action": "memory_edit",
+        "decision": "approved", "requester": "x", "reason": None,
+    })
+    await _yield()
+
+    assert skipped and "no outer frontmatter" in skipped[0]["reason"]
+    assert bad.exists(), "malformed draft kept for inspection"
+
+
+# -- rejection path --------------------------------------------
+
+
+async def test_rejection_deletes_draft_and_emits_event(tmp_path):
+    bus = Bus()
+    draft = _make_draft_file(tmp_path)
+    _register_fake_aq(bus, {"A1": _fake_aq_entry("A1", draft)})
+    rejected = _collect_events(bus, REJECTED_TOPIC)
+
+    applier = ApprovalApplier(_make_ctx(bus))
+    await applier.install()
+    await bus.publish("approval_queue.decided", {
+        "approval_id": "A1", "action": "memory_edit",
+        "decision": "rejected", "requester": "x", "reason": "unwanted",
+    })
+    await _yield()
+
+    assert not draft.exists()
+    assert not (tmp_path / "mem" / "feedback_x.md").exists()
+    assert rejected and rejected[0]["approval_id"] == "A1"
+
+
+async def test_rejection_idempotent_on_missing_draft(tmp_path):
+    bus = Bus()
+    draft_path = tmp_path / "mem" / "_drafts" / "gone.md"
+    _register_fake_aq(bus, {"A1": _fake_aq_entry("A1", draft_path)})
+    rejected = _collect_events(bus, REJECTED_TOPIC)
+
+    applier = ApprovalApplier(_make_ctx(bus))
+    await applier.install()
+    await bus.publish("approval_queue.decided", {
+        "approval_id": "A1", "action": "memory_edit",
+        "decision": "rejected", "requester": "x", "reason": None,
+    })
+    await _yield()
+
+    assert rejected and rejected[0]["approval_id"] == "A1"
+
+
+# -- filtering -------------------------------------------------
+
+
+async def test_non_memory_edit_actions_are_ignored(tmp_path):
+    bus = Bus()
+    draft = _make_draft_file(tmp_path)
+    _register_fake_aq(bus, {"A1": _fake_aq_entry("A1", draft)})
+    applied = _collect_events(bus, APPLIED_TOPIC)
+    skipped = _collect_events(bus, SKIPPED_TOPIC)
+
+    applier = ApprovalApplier(_make_ctx(bus))
+    await applier.install()
+    await bus.publish("approval_queue.decided", {
+        "approval_id": "A1", "action": "delete_memory",  # different action
+        "decision": "approved", "requester": "x", "reason": None,
+    })
+    await _yield()
+
+    assert applied == []
+    assert skipped == []
+    assert draft.exists()  # unmodified
+
+
+async def test_malformed_detail_skipped(tmp_path):
+    bus = Bus()
+    bad_entry = {
+        "approval_id": "A1", "action": "memory_edit",
+        "requester": "x", "status": "approved",
+        "detail": {"run_id": "x"},   # missing draft_path / proposed_target / action
+    }
+    _register_fake_aq(bus, {"A1": bad_entry})
+    skipped = _collect_events(bus, SKIPPED_TOPIC)
+
+    applier = ApprovalApplier(_make_ctx(bus))
+    await applier.install()
+    await bus.publish("approval_queue.decided", {
+        "approval_id": "A1", "action": "memory_edit",
+        "decision": "approved", "requester": "x", "reason": None,
+    })
+    await _yield()
+
+    assert skipped and "malformed detail" in skipped[0]["reason"]
+
+
+# -- manual handle() op ----------------------------------------
+
+
+class _Msg:
+    def __init__(self, payload):
+        self.payload = payload
+
+
+async def test_handle_apply_draft_ok(tmp_path):
+    bus = Bus()
+    draft = _make_draft_file(tmp_path)
+    applier = ApprovalApplier(_make_ctx(bus))
+    r = await applier.handle(_Msg({
+        "op": "apply_draft",
+        "draft_path": str(draft),
+        "proposed_target": "feedback_x.md",
+        "proposed_action": "add",
+    }))
+    assert r["ok"] is True
+    assert (tmp_path / "mem" / "feedback_x.md").exists()
+    assert not draft.exists()
+
+
+async def test_handle_unknown_op(tmp_path):
+    bus = Bus()
+    applier = ApprovalApplier(_make_ctx(bus))
+    r = await applier.handle(_Msg({"op": "weird"}))
+    assert r["ok"] is False
+
+
+async def test_handle_missing_fields(tmp_path):
+    bus = Bus()
+    applier = ApprovalApplier(_make_ctx(bus))
+    r = await applier.handle(_Msg({"op": "apply_draft"}))
+    assert r["ok"] is False
+    assert "missing" in r["error"]
+
+
+async def test_handle_invalid_action(tmp_path):
+    bus = Bus()
+    draft = _make_draft_file(tmp_path)
+    applier = ApprovalApplier(_make_ctx(bus))
+    r = await applier.handle(_Msg({
+        "op": "apply_draft",
+        "draft_path": str(draft),
+        "proposed_target": "x.md",
+        "proposed_action": "remove",
+    }))
+    assert r["ok"] is False
+    assert "invalid proposed_action" in r["error"]
+
+
+# -- integration with real approval_queue ----------------------
+
+
+async def test_end_to_end_with_real_approval_queue_and_checkpoint(tmp_path,
+                                                                    monkeypatch):
+    """Enqueue a memory_edit, approve it, verify applier materializes it."""
+    monkeypatch.setenv("CHECKPOINT_ROOT", str(tmp_path / "chkp"))
+    bus = Bus()
+
+    # real checkpoint_store + approval_queue + applier (all on same bus)
+    store = CheckpointStore(tmp_path / "chkp")
+    bus.register("checkpoint_store", store.handle)
+
+    aq = ApprovalQueue(bus)
+    await aq.load_state()
+    bus.register("approval_queue", aq.handle)
+
+    applier = ApprovalApplier(_make_ctx(bus))
+    await applier.install()
+
+    # pre-stage a draft on disk
+    draft = _make_draft_file(tmp_path)
+    applied = _collect_events(bus, APPLIED_TOPIC)
+
+    # reflection_agent-style enqueue
+    r = await aq.enqueue(
+        action="memory_edit",
+        detail={
+            "run_id": "ab", "need": "test",
+            "draft_path": str(draft),
+            "proposed_target": "feedback_x.md",
+            "proposed_action": "add",
+            "title": "x", "score": 0.9,
+        },
+        requester="reflection_agent",
+    )
+    assert r["ok"]
+    aid = r["approval_id"]
+
+    # user approves
+    r2 = await aq.approve(aid, reason="looks right")
+    assert r2["ok"]
+
+    await _yield(30)
+
+    target = tmp_path / "mem" / "feedback_x.md"
+    assert target.exists()
+    assert "Real memory body." in target.read_text(encoding="utf-8")
+    assert not draft.exists()
+    assert applied and applied[0]["approval_id"] == aid

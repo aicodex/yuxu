@@ -23,6 +23,7 @@ resp = await bus.request("llm_service", {
     "json_mode": False,          # 可选
     "extra_body": {...},         # 可选：透传到请求体
     "timeout": 60.0,             # 可选：HTTP 超时
+    "strip_thinking_blocks": True,  # 可选：剥 <think>...</think> / <thinking>... 段
 })
 ```
 
@@ -60,6 +61,9 @@ minimax:
 - 同步单次调用；流式（stream=True）后续迭代
 - 不做自动重试；业务层按需重试（llm_driver 会兜底）
 - 上下文管理：`rate_limit_service.acquire(pool)` 范围内完成 HTTP 调用，确保释放并发槽
+- `strip_thinking_blocks`：默认关。MiniMax 等 provider 即使 prompt 禁了 `<think>` 还会泄露，
+  打开后服务端正则剥 `<think>…</think>` / `<thinking>…</thinking>`（含截断的孤儿 opener）。
+  仅作用于 `content`，不动 `tool_calls` / `usage`。
 
 ## 为什么是 agent 不是 core
 

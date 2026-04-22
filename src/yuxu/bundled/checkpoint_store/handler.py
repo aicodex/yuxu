@@ -4,6 +4,7 @@ Synchronous IO on small JSON files. See AGENT.md for the bus protocol.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -20,6 +21,13 @@ class CheckpointStore:
     def __init__(self, root: Path | str) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        self._ns_locks: dict[str, asyncio.Lock] = {}
+
+    def _get_ns_lock(self, namespace: str) -> asyncio.Lock:
+        """Per-namespace asyncio lock; serializes write ops within a namespace
+        so concurrent save/delete on the same key can't lose the .tmp file
+        between write and rename, and so reads land on a consistent record."""
+        return self._ns_locks.setdefault(namespace, asyncio.Lock())
 
     def _validate(self, s: str, kind: str) -> None:
         if not isinstance(s, str) or not s:
@@ -83,15 +91,23 @@ class CheckpointStore:
         op = payload.get("op")
         try:
             if op == "save":
-                return self.save(payload["namespace"], payload["key"], payload.get("data"))
+                ns = payload["namespace"]
+                async with self._get_ns_lock(ns):
+                    return self.save(ns, payload["key"], payload.get("data"))
             if op == "load":
-                return self.load(payload["namespace"], payload["key"])
+                ns = payload["namespace"]
+                async with self._get_ns_lock(ns):
+                    return self.load(ns, payload["key"])
             if op == "list":
-                return self.list_keys(payload["namespace"])
+                ns = payload["namespace"]
+                async with self._get_ns_lock(ns):
+                    return self.list_keys(ns)
             if op == "list_namespaces":
                 return self.list_namespaces()
             if op == "delete":
-                return self.delete(payload["namespace"], payload["key"])
+                ns = payload["namespace"]
+                async with self._get_ns_lock(ns):
+                    return self.delete(ns, payload["key"])
             return {"ok": False, "error": f"unknown op: {op!r}"}
         except KeyError as e:
             return {"ok": False, "error": f"missing field: {e.args[0]}"}
