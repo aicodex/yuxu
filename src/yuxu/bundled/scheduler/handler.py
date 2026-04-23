@@ -46,7 +46,8 @@ _CAP_TOPIC_HARD = ("minimax_budget.interval_hard_cap",
 
 class Scheduler:
     def __init__(self, bus, schedules: list[dict], *,
-                 throttle_ttl_sec: float = DEFAULT_THROTTLE_TTL_SEC) -> None:
+                 throttle_ttl_sec: float = DEFAULT_THROTTLE_TTL_SEC,
+                 reservation_check: bool = False) -> None:
         self.bus = bus
         self._schedules = [s for s in schedules if self._validate(s)]
         self._tasks: list[asyncio.Task] = []
@@ -56,6 +57,9 @@ class Scheduler:
         self._throttle_level: str = "normal"
         self._throttle_until: float = 0.0
         self._last_cap_topic: Optional[str] = None
+        # When True, scheduler asks minimax_budget.can_serve(target) before
+        # firing. Denied → skip with reason=reservation_locked.
+        self._reservation_check = bool(reservation_check)
 
     # -- validation -------------------------------------------------
 
@@ -135,6 +139,33 @@ class Scheduler:
             return priority in ("critical", "normal")
         return priority == "critical"
 
+    async def _check_reservation(self, s: dict) -> Optional[dict]:
+        """Query minimax_budget.can_serve for this schedule's target.
+
+        Returns None when allowed or when the check can't run (budget agent
+        not loaded, request raised). Returns a diagnostic dict when DENIED
+        so the caller can publish it in scheduler.skipped.
+        """
+        target = s.get("target")
+        if not isinstance(target, str) or not target:
+            return None
+        try:
+            r = await self.bus.request(
+                "minimax_budget", {"op": "can_serve", "agent": target},
+                timeout=2.0,
+            )
+        except LookupError:
+            # budget agent not running; don't gate
+            return None
+        except Exception:
+            log.exception("scheduler: can_serve check raised for %s", target)
+            return None
+        if not isinstance(r, dict) or not r.get("ok"):
+            return None
+        if r.get("allowed"):
+            return None
+        return r
+
     def _on_cap_event(self, event: dict) -> None:
         topic = (event or {}).get("topic", "")
         if topic in _CAP_TOPIC_HARD:
@@ -211,6 +242,24 @@ class Scheduler:
                 "skip_count": self._skip_counts[name],
             })
             return
+        # Optional reservation gate — asks budget_agent whether the target can
+        # still draw requests this interval. Denied means someone else's
+        # reservation floor would be violated if we fire. Hard-fail to skip
+        # rather than queue; schedules re-fire on next tick anyway.
+        if self._reservation_check:
+            denied = await self._check_reservation(s)
+            if denied is not None:
+                self._skip_counts[name] = self._skip_counts.get(name, 0) + 1
+                await self.bus.publish(f"{NAME}.skipped", {
+                    "schedule": name,
+                    "priority": priority,
+                    "throttle_level": level,
+                    "reason": "reservation_locked",
+                    "diagnostic": denied,
+                    "skipped_at": datetime.now(timezone.utc).isoformat(),
+                    "skip_count": self._skip_counts[name],
+                })
+                return
         fired_at = datetime.now(timezone.utc).isoformat()
         self._fire_counts[name] = self._fire_counts.get(name, 0) + 1
         try:

@@ -42,6 +42,10 @@ N_MIN_1H = 3
 # Last-resort cost when no history exists at all (fresh install).
 DEFAULT_CALL_TOKENS = 2000
 
+# Reservation window matches MiniMax's interval accounting (5h rolling).
+# We reset per-agent interval request counters on rollover.
+RESERVATION_WINDOW_SEC = 5 * 3600.0
+
 
 @dataclass
 class _Call:
@@ -132,7 +136,9 @@ async def _fetch_remains(client: httpx.AsyncClient, api_key: str,
 class MiniMaxBudget:
     def __init__(self, ctx, *,
                  poll_interval: float = DEFAULT_POLL_INTERVAL,
-                 http_client: Optional[httpx.AsyncClient] = None) -> None:
+                 http_client: Optional[httpx.AsyncClient] = None,
+                 reservations: Optional[dict[str, int]] = None,
+                 reservation_window_sec: float = RESERVATION_WINDOW_SEC) -> None:
         self.ctx = ctx
         self.poll_interval = poll_interval
         self._client = http_client
@@ -151,6 +157,13 @@ class MiniMaxBudget:
         # Global cumulative counters — power cross-agent cold-start fallback.
         self._global_calls: int = 0
         self._global_tokens: int = 0
+        # Per-agent reservations (requests per interval window). Unset agents
+        # have no floor; unlisted agents share whatever's left after honoring
+        # others' reservations. See `can_serve(agent)`.
+        self._reservations: dict[str, int] = dict(reservations or {})
+        self._reservation_window_sec = float(reservation_window_sec)
+        self._interval_start_mono: float = time.monotonic()
+        self._interval_requests: dict[str, int] = {}
         # track which (account, model) we've already alerted on in the
         # current interval to avoid alert storms
         self._alerted_interval_soft: set[tuple[str, str, int]] = set()
@@ -359,6 +372,91 @@ class MiniMaxBudget:
         dq.append(_Call(ts=now, tokens=total_tokens))
         self._global_calls += 1
         self._global_tokens += total_tokens
+        # Reservation interval counter with rollover
+        self._maybe_roll_interval(now)
+        self._interval_requests[agent] = \
+            self._interval_requests.get(agent, 0) + 1
+
+    # -- reservation window -------------------------------------
+
+    def _maybe_roll_interval(self, now: float) -> bool:
+        """Reset per-agent interval counters when the 5h window elapses.
+
+        Returns True if a rollover happened. Time-based (not synced to
+        MiniMax's actual start_time yet — phase 5 task). Aligning to the
+        authoritative interval end would eliminate the "we reset at a slightly
+        different time than the vendor does" drift.
+        """
+        if now - self._interval_start_mono >= self._reservation_window_sec:
+            self._interval_requests.clear()
+            self._interval_start_mono = now
+            return True
+        return False
+
+    def _current_interval_remaining(self) -> Optional[int]:
+        """Return the MOST CONSTRAINED interval.remaining across our accounts
+        and models, or None if no data / everything unlimited.
+
+        Conservative strategy: if any (account, model) is limited, use its
+        remaining as the global floor for reservation math. Unlimited entries
+        don't contribute."""
+        min_remaining: Optional[int] = None
+        for snap in self._snapshots.values():
+            models = (snap or {}).get("models") or {}
+            for m in models.values():
+                iv = (m or {}).get("interval") or {}
+                if iv.get("unlimited"):
+                    continue
+                total = iv.get("total")
+                used = iv.get("used")
+                if not isinstance(total, int) or not isinstance(used, int):
+                    continue
+                remaining = max(0, total - used)
+                if min_remaining is None or remaining < min_remaining:
+                    min_remaining = remaining
+        return min_remaining
+
+    def can_serve(self, agent: str) -> dict:
+        """Decide whether `agent` is allowed to make a request under the
+        current reservation configuration.
+
+        Rules:
+        - No reservations set → always True.
+        - If agent has its own reservation and agent_interval_used <
+          agent_reservation → True (floor guarantee).
+        - Else: True iff remaining > Σ(unused reservations of OTHER agents).
+
+        Returns a dict with decision + diagnostics so callers can log why.
+        """
+        self._maybe_roll_interval(time.monotonic())
+        if not self._reservations:
+            return {"ok": True, "allowed": True, "reason": "no_reservations",
+                    "agent": agent}
+        remaining = self._current_interval_remaining()
+        if remaining is None:
+            # No data or all unlimited → don't gate
+            return {"ok": True, "allowed": True, "reason": "no_remaining_data",
+                    "agent": agent}
+        own_reserved = self._reservations.get(agent, 0)
+        own_used = self._interval_requests.get(agent, 0)
+        reserved_for_others = sum(
+            max(0, cap - self._interval_requests.get(a, 0))
+            for a, cap in self._reservations.items()
+            if a != agent
+        )
+        diag = {
+            "ok": True,
+            "agent": agent,
+            "remaining": remaining,
+            "own_reserved": own_reserved,
+            "own_used_in_interval": own_used,
+            "reserved_for_others": reserved_for_others,
+        }
+        if own_reserved > 0 and own_used < own_reserved:
+            return {**diag, "allowed": True, "reason": "own_floor"}
+        if remaining > reserved_for_others:
+            return {**diag, "allowed": True, "reason": "free_pool"}
+        return {**diag, "allowed": False, "reason": "reserved_for_others"}
 
     # -- cost estimation -----------------------------------------
 
@@ -569,6 +667,11 @@ class MiniMaxBudget:
                     return {"ok": False, "error": "missing field: agent"}
                 return {"ok": True, "agent": agent,
                         **self.estimate_cost_per_call(agent)}
+            if op == "can_serve":
+                agent = payload.get("agent")
+                if not agent:
+                    return {"ok": False, "error": "missing field: agent"}
+                return self.can_serve(agent)
             if op == "refresh":
                 return await self.refresh(payload.get("account_id"))
             if op == "reset_local":

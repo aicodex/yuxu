@@ -36,6 +36,17 @@ scheduler 订阅 `minimax_budget.{interval,weekly}_{soft,hard}_cap` 事件：
 
 被 skip 的 fire 会发 `scheduler.skipped`，不占配额。
 
+## v0.3 Reservation gate（可选，env 开关）
+
+`SCHEDULER_RESERVATION_CHECK=1` 打开后，scheduler 每次 fire 前会问
+`minimax_budget.can_serve(target)`。拒绝时发 `scheduler.skipped reason=reservation_locked`
+（带 `diagnostic` 字段展示为什么拒绝：own_reserved / reserved_for_others /
+remaining）。
+
+配合 `MINIMAX_RESERVATIONS` env 使用——前者给关键 target 预留 5h 内的请求数，
+后者让 scheduler 真的按预留 gate。budget agent 没起 / 出错 → 不 gate（graceful
+degrade，不能因为监控挂了让定时任务全停）。
+
 ## Config 示例（`config/schedules.yaml`）
 
 ```yaml

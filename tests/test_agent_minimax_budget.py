@@ -790,3 +790,179 @@ async def test_agent_usage_includes_rolling_fields():
     assert r[0]["tokens_1h"] == 300
     assert r[0]["avg_tokens_per_req_1h"] == 150.0
     await budget.uninstall()
+
+
+# -- reservation / can_serve (phase 4) -------------------------
+
+
+def _snapshot_with_remaining(interval_total: int, interval_used: int) -> dict:
+    """Build a fake account snapshot matching MiniMaxBudget's internal shape."""
+    return {
+        "fetched_at": "2026-04-23T00:00:00+00:00",
+        "models": {
+            "M": {
+                "model_name": "M",
+                "interval": {
+                    "used": interval_used, "total": interval_total,
+                    "unlimited": False,
+                    "remaining_sec": 3600, "used_fraction": interval_used / interval_total,
+                },
+                "weekly": {"unlimited": True, "used": 0, "total": 0,
+                            "remaining_sec": None, "used_fraction": None},
+            }
+        },
+    }
+
+
+async def test_can_serve_no_reservations_always_true():
+    bus = Bus()
+    ctx = _make_ctx(bus, pools={})
+    budget = MiniMaxBudget(ctx,
+                           http_client=httpx.AsyncClient(
+                               transport=_mock_transport_remains([])))
+    r = budget.can_serve("x")
+    assert r["allowed"] is True
+    assert r["reason"] == "no_reservations"
+    await budget.uninstall()
+
+
+async def test_can_serve_reservations_but_no_snapshot_data_true():
+    """With reservations configured but no remaining data yet (startup), we
+    don't gate — safer to let through than deadlock."""
+    bus = Bus()
+    ctx = _make_ctx(bus, pools={})
+    budget = MiniMaxBudget(ctx,
+                           reservations={"A": 50},
+                           http_client=httpx.AsyncClient(
+                               transport=_mock_transport_remains([])))
+    r = budget.can_serve("A")
+    assert r["allowed"] is True
+    assert r["reason"] == "no_remaining_data"
+    await budget.uninstall()
+
+
+async def test_can_serve_own_floor_under_reserved():
+    """Agent with reservation can draw on its own floor even when free pool
+    is exhausted for others."""
+    bus = Bus()
+    ctx = _make_ctx(bus, pools={})
+    budget = MiniMaxBudget(ctx,
+                           reservations={"A": 100},
+                           http_client=httpx.AsyncClient(
+                               transport=_mock_transport_remains([])))
+    budget._snapshots["acc1"] = _snapshot_with_remaining(1000, 950)  # 50 left
+    # A has consumed nothing yet; even though remaining (50) == reserved_for_others (0),
+    # A still under own_reserved=100 → allowed by own floor
+    r = budget.can_serve("A")
+    assert r["allowed"] is True
+    assert r["reason"] == "own_floor"
+    await budget.uninstall()
+
+
+async def test_can_serve_blocks_non_reserved_when_locked():
+    """Non-reserved agent blocked when remaining ≤ Σ(others' unused reservations)."""
+    bus = Bus()
+    ctx = _make_ctx(bus, pools={})
+    budget = MiniMaxBudget(ctx,
+                           reservations={"A": 100, "B": 50},
+                           http_client=httpx.AsyncClient(
+                               transport=_mock_transport_remains([])))
+    budget._snapshots["acc1"] = _snapshot_with_remaining(1000, 880)  # 120 left
+    # A used 0, B used 0 → reserved_for_others (for C) = 100+50 = 150
+    # remaining (120) > 150? False → C blocked
+    r = budget.can_serve("C")
+    assert r["allowed"] is False
+    assert r["reason"] == "reserved_for_others"
+    # But A (who has reservation) can still go
+    r = budget.can_serve("A")
+    assert r["allowed"] is True
+    assert r["reason"] == "own_floor"
+    await budget.uninstall()
+
+
+async def test_can_serve_free_pool_when_headroom_exists():
+    bus = Bus()
+    ctx = _make_ctx(bus, pools={})
+    budget = MiniMaxBudget(ctx,
+                           reservations={"A": 100},
+                           http_client=httpx.AsyncClient(
+                               transport=_mock_transport_remains([])))
+    budget._snapshots["acc1"] = _snapshot_with_remaining(1000, 500)  # 500 left
+    # C: reserved_for_others = 100 - 0 = 100. remaining 500 > 100 → allowed.
+    r = budget.can_serve("C")
+    assert r["allowed"] is True
+    assert r["reason"] == "free_pool"
+    await budget.uninstall()
+
+
+async def test_can_serve_exhausts_own_floor_then_competes_in_free_pool():
+    bus = Bus()
+    ctx = _make_ctx(bus, pools={})
+    budget = MiniMaxBudget(ctx,
+                           reservations={"A": 3},
+                           http_client=httpx.AsyncClient(
+                               transport=_mock_transport_remains([])))
+    budget._snapshots["acc1"] = _snapshot_with_remaining(1000, 500)
+    # Simulate A has already used all 3 of its reservation
+    budget._interval_requests["A"] = 3
+    r = budget.can_serve("A")
+    # Own floor exhausted → falls through to free pool check
+    # reserved_for_others (nobody else reserved) = 0, remaining 500 > 0 → allowed
+    assert r["allowed"] is True
+    assert r["reason"] == "free_pool"
+    await budget.uninstall()
+
+
+async def test_interval_counter_ticks_on_completion():
+    bus = Bus()
+    ctx = _make_ctx(bus, pools={})
+    budget = MiniMaxBudget(ctx,
+                           http_client=httpx.AsyncClient(
+                               transport=_mock_transport_remains([])))
+    await budget._on_llm_completed({"topic": COMPLETION_TOPIC,
+                                    "payload": {"agent": "x", "model": "m",
+                                                "usage": {"total_tokens": 100}}})
+    await budget._on_llm_completed({"topic": COMPLETION_TOPIC,
+                                    "payload": {"agent": "x", "model": "m",
+                                                "usage": {"total_tokens": 100}}})
+    assert budget._interval_requests["x"] == 2
+    await budget.uninstall()
+
+
+async def test_interval_rollover_resets_counters():
+    bus = Bus()
+    ctx = _make_ctx(bus, pools={})
+    budget = MiniMaxBudget(ctx,
+                           reservation_window_sec=0.001,  # tiny window
+                           http_client=httpx.AsyncClient(
+                               transport=_mock_transport_remains([])))
+    await budget._on_llm_completed({"topic": COMPLETION_TOPIC,
+                                    "payload": {"agent": "x", "model": "m",
+                                                "usage": {"total_tokens": 100}}})
+    assert budget._interval_requests["x"] == 1
+    # Age the interval start so the next _maybe_roll_interval call resets
+    budget._interval_start_mono = time.monotonic() - 10.0
+    rolled = budget._maybe_roll_interval(time.monotonic())
+    assert rolled is True
+    assert budget._interval_requests == {}
+    await budget.uninstall()
+
+
+async def test_handle_can_serve_op():
+    bus = Bus()
+    ctx = _make_ctx(bus, pools={})
+    budget = MiniMaxBudget(ctx,
+                           reservations={"A": 100},
+                           http_client=httpx.AsyncClient(
+                               transport=_mock_transport_remains([])))
+    budget._snapshots["acc1"] = _snapshot_with_remaining(1000, 500)
+
+    class _Msg:
+        def __init__(self, p):
+            self.payload = p
+
+    r = await budget.handle(_Msg({"op": "can_serve", "agent": "A"}))
+    assert r["allowed"] is True
+    r = await budget.handle(_Msg({"op": "can_serve"}))  # missing agent
+    assert r["ok"] is False
+    await budget.uninstall()

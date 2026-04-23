@@ -455,6 +455,129 @@ async def test_override_throttle_rejects_bad_level():
     assert "invalid" in r["error"]
 
 
+async def test_reservation_check_skips_when_target_locked(tmp_path):
+    """reservation_check=True: scheduler calls minimax_budget.can_serve
+    before firing; denied targets publish scheduler.skipped reason=reservation_locked.
+    """
+    bus = Bus()
+    fired: list[str] = []
+
+    async def _sink(msg):
+        fired.append(msg.to)
+        return {"ok": True}
+
+    bus.register("target_a", _sink)
+    await bus.ready("target_a")
+
+    async def fake_budget(msg):
+        payload = msg.payload or {}
+        if payload.get("op") == "can_serve":
+            return {"ok": True, "allowed": False,
+                    "reason": "reserved_for_others",
+                    "agent": payload.get("agent")}
+        return {"ok": False}
+
+    bus.register("minimax_budget", fake_budget)
+    await bus.ready("minimax_budget")
+
+    skipped: list[dict] = []
+
+    def _on_skip(ev):
+        skipped.append(ev["payload"])
+
+    bus.subscribe(f"{NAME}.skipped", _on_skip)
+
+    s = Scheduler(bus, [
+        {"name": "locked_job", "target": "target_a", "event": "run",
+         "interval_sec": 60, "priority": "normal"},
+    ], reservation_check=True)
+    await s._fire(s._schedules[0])
+    await asyncio.sleep(0.01)
+    assert fired == []
+    assert len(skipped) == 1
+    assert skipped[0]["reason"] == "reservation_locked"
+    assert skipped[0]["diagnostic"]["reason"] == "reserved_for_others"
+
+
+async def test_reservation_check_passes_when_target_allowed(tmp_path):
+    bus = Bus()
+    fired: list[str] = []
+
+    async def _sink(msg):
+        fired.append(msg.to)
+        return {"ok": True}
+
+    bus.register("target_a", _sink)
+    await bus.ready("target_a")
+
+    async def fake_budget(msg):
+        return {"ok": True, "allowed": True, "reason": "free_pool",
+                "agent": "target_a"}
+
+    bus.register("minimax_budget", fake_budget)
+    await bus.ready("minimax_budget")
+
+    s = Scheduler(bus, [
+        {"name": "ok_job", "target": "target_a", "event": "run",
+         "interval_sec": 60, "priority": "normal"},
+    ], reservation_check=True)
+    await s._fire(s._schedules[0])
+    await asyncio.sleep(0.01)
+    assert fired == ["target_a"]
+
+
+async def test_reservation_check_off_by_default(tmp_path):
+    """Without reservation_check=True, scheduler never calls minimax_budget."""
+    bus = Bus()
+    fired: list[str] = []
+    budget_calls = [0]
+
+    async def _sink(msg):
+        fired.append(msg.to)
+        return {"ok": True}
+
+    async def fake_budget(msg):
+        budget_calls[0] += 1
+        return {"ok": True, "allowed": False, "reason": "reserved_for_others",
+                "agent": "target_a"}
+
+    bus.register("target_a", _sink)
+    bus.register("minimax_budget", fake_budget)
+    await bus.ready("target_a")
+    await bus.ready("minimax_budget")
+
+    s = Scheduler(bus, [
+        {"name": "job", "target": "target_a", "event": "run",
+         "interval_sec": 60},
+    ])  # no reservation_check
+    await s._fire(s._schedules[0])
+    await asyncio.sleep(0.01)
+    assert fired == ["target_a"]
+    assert budget_calls[0] == 0
+
+
+async def test_reservation_check_budget_missing_falls_through(tmp_path):
+    """If minimax_budget isn't running, reservation_check doesn't block fires."""
+    bus = Bus()
+    fired: list[str] = []
+
+    async def _sink(msg):
+        fired.append(msg.to)
+        return {"ok": True}
+
+    bus.register("target_a", _sink)
+    await bus.ready("target_a")
+    # no budget agent registered
+
+    s = Scheduler(bus, [
+        {"name": "job", "target": "target_a", "event": "run",
+         "interval_sec": 60},
+    ], reservation_check=True)
+    await s._fire(s._schedules[0])
+    await asyncio.sleep(0.01)
+    assert fired == ["target_a"]  # fell through (graceful degrade)
+
+
 async def test_subscriptions_installed_and_removed(bundled_dir, monkeypatch):
     monkeypatch.delenv("SCHEDULES_CONFIG", raising=False)
     bus = Bus()

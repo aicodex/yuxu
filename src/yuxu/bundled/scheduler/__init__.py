@@ -37,7 +37,14 @@ def _load_schedules() -> list[dict]:
 
 async def start(ctx) -> None:
     global _scheduler
-    _scheduler = Scheduler(ctx.bus, _load_schedules())
+    # `SCHEDULER_RESERVATION_CHECK=1` turns on reservation gating before fire.
+    # Default off so existing setups keep current behavior; turn on when
+    # MINIMAX_RESERVATIONS is also configured.
+    reservation_check = os.environ.get(
+        "SCHEDULER_RESERVATION_CHECK", "0"
+    ).lower() in ("1", "true", "yes", "on")
+    _scheduler = Scheduler(ctx.bus, _load_schedules(),
+                           reservation_check=reservation_check)
     ctx.bus.register(NAME, _scheduler.handle)
     await _scheduler.start_all()
     await ctx.ready()
