@@ -538,3 +538,200 @@ def test_framings_have_distinct_ids():
     ids = [f["id"] for f in FRAMINGS]
     assert len(ids) == len(set(ids))
     assert {"pattern_extractor", "anti_pattern_spotter", "synthesizer"} <= set(ids)
+
+
+# -- auto target via performance_ranker (dogfood integration) -----
+
+
+async def test_resolve_auto_target_synthesizes_need_from_ranker(tmp_path):
+    bus = Bus()
+
+    async def fake_ranker(msg):
+        return {"ok": True, "window_hours": 24,
+                "ranked": [{"agent": "harness_pro_max", "score": 5.0,
+                             "errors": 3, "rejections": 1}]}
+
+    bus.register("performance_ranker", fake_ranker)
+    ctx = _make_ctx(tmp_path, bus)
+    agent = ReflectionAgent(ctx)
+    need, top = await agent._resolve_auto_target()
+    assert top["agent"] == "harness_pro_max"
+    assert "harness_pro_max" in need
+    assert "3 error" in need
+    assert "1 rejection" in need
+
+
+async def test_resolve_auto_target_ranker_missing_returns_none(tmp_path):
+    # No handler registered for performance_ranker
+    bus = Bus()
+    ctx = _make_ctx(tmp_path, bus)
+    agent = ReflectionAgent(ctx)
+    need, top = await agent._resolve_auto_target()
+    assert need is None
+    assert top is None
+
+
+async def test_resolve_auto_target_empty_rank_returns_none(tmp_path):
+    bus = Bus()
+
+    async def fake_ranker(msg):
+        return {"ok": True, "window_hours": 24, "ranked": []}
+
+    bus.register("performance_ranker", fake_ranker)
+    ctx = _make_ctx(tmp_path, bus)
+    agent = ReflectionAgent(ctx)
+    need, top = await agent._resolve_auto_target()
+    assert need is None
+
+
+async def test_reflect_auto_resolves_and_runs_happy_path(tmp_path):
+    """End-to-end: auto=True synthesizes need from ranker, then proceeds
+    through normal hypothesize → rank → draft flow."""
+    bus = Bus()
+
+    async def fake_ranker(msg):
+        return {"ok": True, "window_hours": 24,
+                "ranked": [{"agent": "worst_bot", "score": 8.0,
+                             "errors": 2, "rejections": 3}]}
+
+    bus.register("performance_ranker", fake_ranker)
+    _wire_llm_driver(
+        bus,
+        extractor_payloads=[
+            {"edits": [{"action": "add", "target": "feedback_worst_bot.md",
+                        "title": "worst_bot patterns",
+                        "body": "worst_bot repeatedly fails at step X",
+                        "memory_type": "feedback"}],
+             "summary": "one useful edit"},
+        ] * 3,
+        ranker_payload={"chosen": [{"framing_id": "pattern_extractor",
+                                     "edit_index": 0,
+                                     "score": 0.9,
+                                     "reason": "relevant"}],
+                         "rejected_summary": ""},
+    )
+
+    ctx = _make_ctx(tmp_path, bus)
+    session_root = tmp_path / "proj" / "data" / "sessions"
+    session_root.mkdir(parents=True)
+    (session_root / "s1.md").write_text("session transcript mentioning worst_bot")
+
+    agent = ReflectionAgent(ctx)
+    result = await agent.reflect(auto=True)
+
+    assert result["ok"] is True
+    assert "worst_bot" in result["need"]
+    assert result["auto_target"]["agent"] == "worst_bot"
+    assert result["auto_target"]["errors"] == 2
+
+
+async def test_reflect_auto_with_no_ranker_fails_at_auto_target_stage(tmp_path):
+    bus = Bus()  # no ranker registered
+    ctx = _make_ctx(tmp_path, bus)
+    session_root = tmp_path / "proj" / "data" / "sessions"
+    session_root.mkdir(parents=True)
+    (session_root / "s1.md").write_text("x")
+    agent = ReflectionAgent(ctx)
+    result = await agent.reflect(auto=True)
+    assert result["ok"] is False
+    assert result["stage"] == "auto_target"
+
+
+async def test_handle_reflect_auto_true(tmp_path):
+    bus = Bus()
+
+    async def fake_ranker(msg):
+        return {"ok": True, "window_hours": 24,
+                "ranked": [{"agent": "flaky_bot", "score": 4.0,
+                             "errors": 4, "rejections": 0}]}
+
+    bus.register("performance_ranker", fake_ranker)
+
+    ctx = _make_ctx(tmp_path, bus)
+    agent = ReflectionAgent(ctx)
+    # No sources → fails at load_sources, but auto_target ran successfully
+    # and is carried through on the error path.
+    result = await agent.handle(type("M", (), {
+        "payload": {"op": "reflect", "auto": True}})())
+    assert result["ok"] is False
+    assert result["stage"] == "load_sources"   # reached past auto_target
+    assert result["auto_target"]["agent"] == "flaky_bot"
+
+
+async def test_slash_command_auto_keyword_triggers_auto(tmp_path):
+    """`/reflect auto` invokes reflect(auto=True) rather than need='auto'."""
+    bus = Bus()
+    ranker_called = [False]
+
+    async def fake_ranker(msg):
+        ranker_called[0] = True
+        return {"ok": True, "window_hours": 24,
+                "ranked": [{"agent": "x_bot", "score": 1.0,
+                             "errors": 1, "rejections": 0}]}
+
+    bus.register("performance_ranker", fake_ranker)
+
+    # stub gateway so _reply doesn't error
+    async def fake_gateway(msg):
+        return {"ok": True}
+
+    bus.register("gateway", fake_gateway)
+    # stub llm_driver to avoid real work — will be unreachable if auto fails
+    _wire_llm_driver(
+        bus,
+        extractor_payloads=[{"edits": [], "summary": ""}] * 3,
+        ranker_payload={"chosen": [], "rejected_summary": ""},
+    )
+
+    ctx = _make_ctx(tmp_path, bus)
+    session_root = tmp_path / "proj" / "data" / "sessions"
+    session_root.mkdir(parents=True)
+    (session_root / "s1.md").write_text("transcript")
+
+    agent = ReflectionAgent(ctx)
+
+    await agent._on_command({
+        "topic": "gateway.command_invoked",
+        "payload": {"command": COMMAND, "args": "auto",
+                    "session_key": "console:test"},
+    })
+    # Allow bus tasks to drain
+    await asyncio.sleep(0.02)
+    assert ranker_called[0] is True
+
+
+async def test_slash_command_explicit_need_does_not_call_ranker(tmp_path):
+    """`/reflect <normal need>` must NOT query ranker."""
+    bus = Bus()
+    ranker_called = [False]
+
+    async def fake_ranker(msg):
+        ranker_called[0] = True
+        return {"ok": True, "window_hours": 24, "ranked": []}
+
+    bus.register("performance_ranker", fake_ranker)
+
+    async def fake_gateway(msg):
+        return {"ok": True}
+
+    bus.register("gateway", fake_gateway)
+    _wire_llm_driver(
+        bus,
+        extractor_payloads=[{"edits": [], "summary": ""}] * 3,
+        ranker_payload={"chosen": [], "rejected_summary": ""},
+    )
+
+    ctx = _make_ctx(tmp_path, bus)
+    session_root = tmp_path / "proj" / "data" / "sessions"
+    session_root.mkdir(parents=True)
+    (session_root / "s1.md").write_text("transcript")
+
+    agent = ReflectionAgent(ctx)
+
+    await agent._on_command({
+        "topic": "gateway.command_invoked",
+        "payload": {"command": COMMAND, "args": "how did we handle logging",
+                    "session_key": "console:test"},
+    })
+    await asyncio.sleep(0.02)
+    assert ranker_called[0] is False

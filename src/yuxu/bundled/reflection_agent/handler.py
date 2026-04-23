@@ -22,8 +22,13 @@ from typing import Any, Optional
 log = logging.getLogger(__name__)
 
 COMMAND = "/reflect"
-COMMAND_HELP = ("Iteratively explore past sessions for `<need>`; stage memory "
-                "edit proposals you can approve. Usage: `/reflect <need>`.")
+COMMAND_HELP = (
+    "Iteratively explore past sessions; stage memory edit proposals "
+    "you can approve. "
+    "Usage: `/reflect <need>` or `/reflect auto` "
+    "(auto picks the worst-performing agent via performance_ranker)."
+)
+AUTO_KEYWORD = "auto"
 
 DEFAULT_HYPOTHESES = 3
 MAX_SOURCE_BYTES = 8_192       # per source file, post-truncation
@@ -245,18 +250,24 @@ class ReflectionAgent:
         if not isinstance(payload, dict) or payload.get("command") != COMMAND:
             return
         session_key = payload.get("session_key", "")
-        need = (payload.get("args") or "").strip()
-        if not need:
+        args = (payload.get("args") or "").strip()
+        if not args:
             usage = {"ok": False, "stage": "usage",
-                     "error": f"Usage: `{COMMAND} <need>`\n\n{COMMAND_HELP}",
+                     "error": f"Usage: `{COMMAND} <need>` or "
+                              f"`{COMMAND} {AUTO_KEYWORD}`\n\n{COMMAND_HELP}",
                      "warnings": []}
             await self._reply(session_key, usage)
             return
-        result = await self.reflect(need=need)
+        if args.lower() == AUTO_KEYWORD:
+            result = await self.reflect(auto=True)
+            await self._reply(session_key, result,
+                              quote_text=f"{COMMAND} {AUTO_KEYWORD}")
+            return
+        result = await self.reflect(need=args)
         # Quote the user's /reflect invocation so the reply shows what
         # request the drafts / stats correspond to.
         await self._reply(session_key, result,
-                          quote_text=f"{COMMAND} {need}")
+                          quote_text=f"{COMMAND} {args}")
 
     # -- core flow -------------------------------------------------
 
@@ -284,7 +295,40 @@ class ReflectionAgent:
                 return cand / "data" / "sessions"
         return Path.cwd() / "data" / "sessions"
 
-    async def reflect(self, *, need: str,
+    async def _resolve_auto_target(self) -> tuple[Optional[str], Optional[dict]]:
+        """Query performance_ranker for the worst-performing agent and
+        synthesize a `need` string focused on that agent. Returns
+        (need_string, ranker_row) or (None, None) if unavailable.
+        """
+        try:
+            r = await self.ctx.bus.request(
+                "performance_ranker", {"op": "rank", "limit": 1},
+                timeout=2.0,
+            )
+        except LookupError:
+            return None, None  # ranker not loaded
+        except Exception:
+            log.exception("reflection_agent: performance_ranker request raised")
+            return None, None
+        if not isinstance(r, dict) or not r.get("ok"):
+            return None, None
+        ranked = r.get("ranked") or []
+        if not ranked:
+            return None, None
+        top = ranked[0]
+        window = r.get("window_hours", 24)
+        need = (
+            f"Review agent `{top['agent']}` which has accumulated "
+            f"{top['errors']} error(s) and {top['rejections']} rejection(s) "
+            f"in the last {window}h (score={top['score']:.1f}). "
+            "Identify concrete improvements or anti-patterns — what is this "
+            "agent getting wrong repeatedly, and what should future sessions "
+            "do differently?"
+        )
+        return need, top
+
+    async def reflect(self, *, need: Optional[str] = None,
+                      auto: bool = False,
                       sources: Optional[list[str]] = None,
                       memory_root: Optional[Path | str] = None,
                       n_hypotheses: int = DEFAULT_HYPOTHESES,
@@ -292,13 +336,33 @@ class ReflectionAgent:
                       model: Optional[str] = None) -> dict:
         run_id = uuid.uuid4().hex[:8]
         warnings: list[str] = []
+        auto_target: Optional[dict] = None
+        # Auto-mode: synthesize `need` from performance_ranker's top worst.
+        if auto or not (isinstance(need, str) and need.strip()):
+            if not auto:
+                # `need` was empty and `auto` wasn't set — preserve old
+                # behavior: require a real need.
+                return {"ok": False, "run_id": run_id,
+                        "stage": "usage",
+                        "error": "missing or empty field: need",
+                        "warnings": warnings}
+            resolved_need, auto_target = await self._resolve_auto_target()
+            if resolved_need is None:
+                return {"ok": False, "run_id": run_id,
+                        "stage": "auto_target",
+                        "error": ("performance_ranker unavailable or no "
+                                  "struggling agents in the window"),
+                        "warnings": warnings}
+            need = resolved_need
+        assert isinstance(need, str)
         memory_root_path, drafts_dir = self._resolve_paths(memory_root)
         loaded, load_warnings = _load_sources(sources, self._default_session_root())
         warnings.extend(load_warnings)
         if not loaded:
             return {"ok": False, "run_id": run_id, "stage": "load_sources",
                     "error": "no readable session sources",
-                    "warnings": warnings}
+                    "warnings": warnings,
+                    **({"auto_target": auto_target} if auto_target else {})}
 
         n = max(1, min(n_hypotheses, len(FRAMINGS)))
         framings = list(FRAMINGS[:n])
@@ -328,7 +392,8 @@ class ReflectionAgent:
         if not all_edits:
             return {"ok": False, "run_id": run_id, "stage": "hypothesize",
                     "error": "no usable edits from any hypothesis",
-                    "hypotheses": hypotheses, "warnings": warnings}
+                    "hypotheses": hypotheses, "warnings": warnings,
+                    **({"auto_target": auto_target} if auto_target else {})}
 
         # Phase 2: rank
         rank_resp = await self._rank(need=need, hypotheses=hypotheses,
@@ -394,6 +459,8 @@ class ReflectionAgent:
                 "warnings": warnings,
                 "memory_root": str(memory_root_path),
                 "n_sources": len(loaded),
+                "need": need,
+                **({"auto_target": auto_target} if auto_target else {}),
                 "llm_stats": {
                     "elapsed_ms": round(total_elapsed_ms, 2),
                     "completion_tokens": total_completion,
@@ -586,10 +653,11 @@ class ReflectionAgent:
         if op != "reflect":
             return {"ok": False, "error": f"unknown op: {op!r}"}
         need = payload.get("need")
-        if not isinstance(need, str) or not need.strip():
+        auto = bool(payload.get("auto", False))
+        if not auto and (not isinstance(need, str) or not need.strip()):
             return {"ok": False, "error": "missing or empty field: need"}
         return await self.reflect(
-            need=need,
+            need=need, auto=auto,
             sources=payload.get("sources"),
             memory_root=payload.get("memory_root"),
             n_hypotheses=int(payload.get("n_hypotheses", DEFAULT_HYPOTHESES)),

@@ -4,7 +4,7 @@ run_mode: persistent
 scope: system
 edit_warning: true
 depends_on: [gateway, llm_driver]
-optional_deps: [approval_queue]
+optional_deps: [approval_queue, performance_ranker]
 ready_timeout: 5
 ---
 # reflection_agent
@@ -40,6 +40,7 @@ agents (filename prefix `_` keeps loader / picker scans clean).
 | op | payload | 返回 |
 |---|---|---|
 | `reflect` | `{need, sources?, memory_root?, n_hypotheses?=3, model?, pool?}` | `{ok, run_id, hypotheses, chosen, drafts, approval_ids, warnings}` |
+| `reflect` (auto) | `{auto: true, ...}` | same shape, `need` synthesized from performance_ranker |
 
 `hypotheses` is the raw N-way exploration. `chosen` is the post-rank merged
 edit set. `drafts` is the list of `<memory_root>/_drafts/reflection_*.md`
@@ -48,8 +49,12 @@ paths written to disk. `approval_ids` is the list of approval_queue item ids
 
 ## Slash command
 
-`/reflect <need>` — equivalent to
-`bus.request("reflection_agent", {op: "reflect", need: <args>})`.
+- `/reflect <need>` — equivalent to
+  `bus.request("reflection_agent", {op: "reflect", need: <args>})`.
+- `/reflect auto` — ask `performance_ranker` for the worst-performing agent
+  (most recent `.error` + `approval_queue.rejected` signals in the window)
+  and synthesize a `need` focused on that agent. Fails gracefully with
+  `stage=auto_target` if ranker isn't running or has no candidates.
 
 ## Why this is an agent
 
