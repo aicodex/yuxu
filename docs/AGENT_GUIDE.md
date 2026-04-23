@@ -7,7 +7,7 @@
 
 ## Principles (read before creating)
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the invariants (I1–I8). When
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the invariants (I1–I11). When
 creating a new agent, these operational principles apply — not hard rules,
 but pause and check if you're about to violate one:
 

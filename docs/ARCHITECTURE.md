@@ -189,6 +189,79 @@ The scoring method itself is subject to the same test. If scores
 fail to predict useful references, the scoring changes. This is
 turtles all the way down — and the pattern is deliberate.
 
+### I11. Agent iteration is a bounded fork tree with memory-carry rollback
+
+An agent's **tree** is `(AGENT.md, handler.py, memory/)`. Iteration
+forks a tree into variants that share a parent pointer. Variants
+compete; a winner merges back to `live`; losers stay archived (not
+deleted) — future iterations can read why they failed.
+
+**Rollback has two semantics:**
+- *Hard*: restore live tree to an ancestor; discard intermediate memory.
+- *With-memory*: restore code / prompt to an ancestor **but** cherry-
+  pick selected memory entries (e.g. `dead-end-X.md`) from the failed
+  exploration forward, so the next branch inherits "what didn't work
+  and why." This is the primary differentiator from pure git rollback.
+
+**Bounded exploration — no unbounded trees.** Every run carries an
+`iteration_policy.yaml` with hard safety rails only:
+
+```yaml
+ceilings:
+  max_depth: 3           # rollback-retry cycles
+  max_per_level: 4       # fork breadth per layer
+  total_budget: 12       # variant cap
+  wall_clock: "2h"       # time ceiling (token budget tracked separately)
+on_exhaustion:
+  route: approval_queue
+  surface_top_k: 3
+```
+
+The iteration agent picks criterion type (`test` / `llm_judge` /
+hybrid) and decides when to terminate — `ceilings` are hard safety
+rails, not policy. Its decisions + rationale are written to
+`_tree.json` so `performance_ranker` can later score judge quality
+itself (consistent with I10: the judge is also subject to practice).
+
+When a ceiling is hit without the agent declaring a winner, the run
+does not silently fail — it surfaces the top-k candidates + a
+`_tree.json` summary via `approval_queue` for human judgment
+(`pick_winner` / `reject_all` / `extend_budget`).
+
+**Layout:**
+
+```
+<project>/data/variants/<agent>/
+  _tree.json                # DAG: {variant_id: {parent, children,
+                            #       status, fitness, reason}} plus the
+                            #       iteration agent's judge_policy and
+                            #       termination rationale for this run
+  _archive/YYYYMMDD-<run>.json.gz
+  <variant_id>/
+    AGENT.md
+    handler.py
+    memory/                 # this variant's incremental memory
+    _notes.md               # why forked / why failed / which memory
+                            # to carry on rollback-with-memory
+<project>/agents/<agent>/   # the live tree (= current winner)
+```
+
+**Reuse of existing components:**
+- `performance_ranker` feeds fitness signals.
+- `approval_queue` + `approval_applier` handles both the merge-winner
+  commit and the on-exhaustion surfacing — no new approval mechanism.
+- `memory_curator` emits `dead-end-*.md` drafts as a variant ages out.
+- `memory` skill (2-layer disclosure) indexes variant-local memory so
+  a rolled-back branch can cheaply query its siblings' lessons.
+
+**Deferred:**
+- Tournament runner implementation (how variants get scheduled and
+  scored) — needs its own agent.
+- Tree backend: yuxu-native JSON (MVP) vs git worktree (later upgrade);
+  the layout above is backend-agnostic.
+- `handler.py` variants need human approval per I6; `AGENT.md` / prompt
+  variants can be agent-proposed.
+
 ## Lifecycle states
 
 ```
