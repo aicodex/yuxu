@@ -1,0 +1,4 @@
+# Do not version raw session JSONLs — too large.
+# README.md is versioned; JSONL archives stay local.
+*.jsonl
+*.jsonl.gz
