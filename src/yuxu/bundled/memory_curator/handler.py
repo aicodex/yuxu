@@ -32,6 +32,7 @@ from yuxu.bundled.reflection_agent.handler import (
     _slugify,
     _truncate_bytes,
 )
+from yuxu.core.frontmatter import parse_frontmatter
 from yuxu.core.session_log import format_jsonl_transcript
 
 log = logging.getLogger(__name__)
@@ -88,6 +89,12 @@ RULES
   characters.
 - For `update`, `target` MUST reference a file plausibly already in memory.
   For `add`, pick a new snake_case filename.
+- Each `body`'s inner frontmatter MUST include `name`, `description`, `type`
+  (one of user/feedback/project/reference). SHOULD include
+  `evidence_level: observed` (new observations start here — curator is
+  empirical, not validated), `status: current`, and `updated: YYYY-MM-DD`.
+  MAY include `tags: [...]`. If you omit evidence_level / status / updated,
+  the curator will inject defaults post-hoc.
 - If nothing in this session is worth preserving, return empty lists. Do not
   invent.
 - STRICT JSON only — no prose, no markdown fences.
@@ -162,6 +169,49 @@ def _append_improvements(log_path: Path, entries: list[str],
     return len(to_append), dupes
 
 
+def _ensure_inner_frontmatter_defaults(body: str) -> str:
+    """Inject I6 default fields into a memory entry's inner frontmatter.
+
+    Curator-produced entries land at evidence_level `observed` (single real
+    observation, not yet validated) with status `current` and today's
+    `updated` date. If the LLM already provided these fields we leave them
+    alone. If the body has no frontmatter at all, pass through untouched
+    (approval_applier will reject it downstream).
+    """
+    fm, rest = parse_frontmatter(body or "")
+    if not isinstance(fm, dict) or not fm:
+        return body
+    changed = False
+    if "evidence_level" not in fm:
+        fm["evidence_level"] = "observed"
+        changed = True
+    if "status" not in fm:
+        fm["status"] = "current"
+        changed = True
+    if "updated" not in fm:
+        fm["updated"] = time.strftime("%Y-%m-%d", time.localtime())
+        changed = True
+    if not changed:
+        return body
+    # Serialize back. Prefer json.dumps for strings/numbers/lists to preserve
+    # non-ASCII and escape cleanly; this matches the outer-frontmatter style
+    # already used by _stage_edit_draft below.
+    lines = ["---"]
+    for k, v in fm.items():
+        if isinstance(v, (dict, list)):
+            lines.append(f"{k}: {json.dumps(v, ensure_ascii=False)}")
+        elif isinstance(v, bool):
+            lines.append(f"{k}: {'true' if v else 'false'}")
+        elif v is None:
+            lines.append(f"{k}: null")
+        else:
+            lines.append(f"{k}: {v}")
+    lines.append("---")
+    head = "\n".join(lines)
+    tail = rest if rest.startswith("\n") else ("\n" + rest)
+    return head + tail
+
+
 def _stage_edit_draft(*, drafts_dir: Path, run_id: str, edit: dict,
                       score: Optional[float] = None,
                       body: Optional[str] = None) -> dict:
@@ -170,6 +220,7 @@ def _stage_edit_draft(*, drafts_dir: Path, run_id: str, edit: dict,
     drafts_dir.mkdir(parents=True, exist_ok=True)
     ts = int(time.time())
     body = _truncate_bytes(body or edit.get("body", ""), MAX_DRAFT_BYTES)
+    body = _ensure_inner_frontmatter_defaults(body)
     body_hash = _content_hash(body)[:8]
     slug = _slugify(edit.get("target", "") or edit.get("title", ""))
     fname = f"curator_{ts}_{run_id}_{slug}_{body_hash}.md"

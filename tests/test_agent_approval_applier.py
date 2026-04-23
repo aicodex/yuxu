@@ -272,9 +272,11 @@ async def test_malformed_draft_without_outer_frontmatter_skipped(tmp_path):
 # -- rejection path --------------------------------------------
 
 
-async def test_rejection_deletes_draft_and_emits_event(tmp_path):
+async def test_rejection_archives_draft_preserves_contents(tmp_path):
+    """I6 retention: rejected drafts move to _archive/rejected/, don't delete."""
     bus = Bus()
     draft = _make_draft_file(tmp_path)
+    original_contents = draft.read_text(encoding="utf-8")
     _register_fake_aq(bus, {"A1": _fake_aq_entry("A1", draft)})
     rejected = _collect_events(bus, REJECTED_TOPIC)
 
@@ -286,9 +288,44 @@ async def test_rejection_deletes_draft_and_emits_event(tmp_path):
     })
     await _yield()
 
+    # Original draft is gone but contents live on under _archive/rejected/
     assert not draft.exists()
     assert not (tmp_path / "mem" / "feedback_x.md").exists()
+    archive_dir = tmp_path / "mem" / "_archive" / "rejected"
+    assert archive_dir.exists()
+    archived = list(archive_dir.iterdir())
+    assert len(archived) == 1
+    assert archived[0].read_text(encoding="utf-8") == original_contents
     assert rejected and rejected[0]["approval_id"] == "A1"
+    assert rejected[0]["archived_path"] == str(archived[0])
+
+
+def test_archive_draft_handles_same_name_collision(tmp_path):
+    """Two rejects with identical draft names get unique archive paths."""
+    from yuxu.bundled.approval_applier.handler import _archive_draft
+    drafts_dir = tmp_path / "mem" / "_drafts"
+    drafts_dir.mkdir(parents=True)
+
+    # First reject
+    d1 = drafts_dir / "dup.md"
+    d1.write_text("v1", encoding="utf-8")
+    a1 = _archive_draft(d1)
+    assert a1.exists()
+    assert a1.read_text(encoding="utf-8") == "v1"
+    assert not d1.exists()
+
+    # Second reject with the same base name, created in the same second
+    d2 = drafts_dir / "dup.md"
+    d2.write_text("v2", encoding="utf-8")
+    a2 = _archive_draft(d2)
+    assert a2.exists()
+    assert a2 != a1   # collision suffix kept them distinct
+    assert a2.read_text(encoding="utf-8") == "v2"
+
+    # Both versions preserved — neither overwrote the other
+    archive_dir = tmp_path / "mem" / "_archive" / "rejected"
+    contents = {p.read_text(encoding="utf-8") for p in archive_dir.iterdir()}
+    assert contents == {"v1", "v2"}
 
 
 async def test_rejection_idempotent_on_missing_draft(tmp_path):
@@ -306,6 +343,8 @@ async def test_rejection_idempotent_on_missing_draft(tmp_path):
     await _yield()
 
     assert rejected and rejected[0]["approval_id"] == "A1"
+    # Missing draft: no archive created, event still fires with null archived
+    assert rejected[0].get("archived_path") is None
 
 
 # -- filtering -------------------------------------------------

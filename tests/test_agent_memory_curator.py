@@ -17,8 +17,10 @@ from yuxu.bundled.memory_curator.handler import (
     MemoryCurator,
     SESSION_ENDED_TOPIC,
     _append_improvements,
+    _ensure_inner_frontmatter_defaults,
     _read_or_empty,
 )
+from yuxu.core.frontmatter import parse_frontmatter
 from yuxu.core.bus import Bus
 
 pytestmark = pytest.mark.asyncio
@@ -45,6 +47,49 @@ def test_append_improvements_skips_blank(tmp_path):
     lp = tmp_path / "log.md"
     a, d = _append_improvements(lp, ["", "   ", "real one"])
     assert a == 1
+
+
+def test_ensure_defaults_injects_missing_i6_fields():
+    body = (
+        "---\n"
+        "name: Canary\n"
+        "description: example\n"
+        "type: feedback\n"
+        "---\n\n"
+        "body here\n"
+    )
+    out = _ensure_inner_frontmatter_defaults(body)
+    fm, _ = parse_frontmatter(out)
+    assert fm["evidence_level"] == "observed"
+    assert fm["status"] == "current"
+    assert isinstance(fm.get("updated"), (str, object))
+    # name / description / type preserved
+    assert fm["name"] == "Canary"
+    assert fm["type"] == "feedback"
+
+
+def test_ensure_defaults_preserves_existing_values():
+    body = (
+        "---\n"
+        "name: Already graded\n"
+        "description: example\n"
+        "type: feedback\n"
+        "evidence_level: consensus\n"
+        "status: archived\n"
+        "updated: 2020-01-01\n"
+        "---\n\n"
+        "body\n"
+    )
+    out = _ensure_inner_frontmatter_defaults(body)
+    fm, _ = parse_frontmatter(out)
+    assert fm["evidence_level"] == "consensus"
+    assert fm["status"] == "archived"
+    assert str(fm["updated"]) == "2020-01-01"
+
+
+def test_ensure_defaults_passthrough_on_no_frontmatter():
+    body = "plain text without frontmatter\n"
+    assert _ensure_inner_frontmatter_defaults(body) == body
 
 
 def test_append_improvements_roll_trim(tmp_path):
@@ -146,6 +191,17 @@ async def test_curate_happy_path_writes_log_and_drafts(tmp_path):
     assert len(r["drafts"]) == 1
     assert r["approval_ids"] == ["AP-1"]
     assert aq_calls[0]["action"] == "memory_edit"
+
+    # Draft on disk has I6 defaults injected into inner frontmatter
+    draft_path = Path(r["drafts"][0]["path"])
+    raw = draft_path.read_text(encoding="utf-8")
+    # Outer frontmatter is the curator's staging metadata; inner begins
+    # after the first '---...---' block.
+    _, inner = parse_frontmatter(raw)
+    inner_fm, _ = parse_frontmatter(inner)
+    assert inner_fm["evidence_level"] == "observed"
+    assert inner_fm["status"] == "current"
+    assert "updated" in inner_fm
 
     # improvement_log.md exists and contains both entries
     log = Path(r["memory_root"]) / "_improvement_log.md"

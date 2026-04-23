@@ -4,11 +4,17 @@ Closes the reflection_agent loop: the LLM proposes, the user approves via
 approval_queue, and this agent does the actual filesystem mutation. No LLM
 calls, no semantic checks — that's all upstream. Here it's strict,
 idempotent file IO.
+
+Per I6 retention: rejected drafts are archived under
+`<memory_root>/_archive/rejected/<timestamp>-<original_name>`, not deleted.
+Forgotten failures repeat; the archive preserves why a proposal didn't
+land so future reflection can learn from it.
 """
 from __future__ import annotations
 
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -42,6 +48,32 @@ def _atomic_write(path: Path, text: str) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
+
+
+def _archive_draft(draft_path: Path) -> Path:
+    """Move a rejected draft to `<memory_root>/_archive/rejected/` with a
+    timestamp prefix. Preserves the file for future reflection per I6
+    (archive, don't delete).
+
+    Returns the archived path. `memory_root` is derived as
+    `draft_path.parent.parent` — the same convention _apply_approval uses.
+    """
+    memory_root = draft_path.parent.parent
+    archive_dir = memory_root / "_archive" / "rejected"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    ts = int(time.time())
+    dest = archive_dir / f"{ts}-{draft_path.name}"
+    # Handle collision (same second, same name) by appending an index
+    if dest.exists():
+        i = 1
+        while True:
+            candidate = archive_dir / f"{ts}-{i}-{draft_path.name}"
+            if not candidate.exists():
+                dest = candidate
+                break
+            i += 1
+    os.replace(draft_path, dest)
+    return dest
 
 
 class ApprovalApplier:
@@ -154,15 +186,17 @@ class ApprovalApplier:
             await self._skip(aid, "malformed detail: no draft_path on rejection")
             return
         draft_path = Path(draft_path_s)
+        archived_path: Optional[Path] = None
         if draft_path.exists():
             try:
-                draft_path.unlink()
+                archived_path = _archive_draft(draft_path)
             except OSError as e:
-                await self._skip(aid, f"unlink {draft_path} on reject: {e}")
+                await self._skip(aid, f"archive {draft_path} on reject: {e}")
                 return
         await self.ctx.bus.publish(REJECTED_TOPIC, {
             "approval_id": aid,
             "draft_path": str(draft_path),
+            "archived_path": str(archived_path) if archived_path else None,
         })
 
     async def _skip(self, aid: str, reason: str) -> None:
