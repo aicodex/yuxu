@@ -162,7 +162,10 @@ yuxu commits to the lazy model:
   `description` + `type`. MAY have `tags: [...]` (L1 filter),
   `updated: YYYY-MM-DD` (recency / decay), `scope`, `evidence_level`,
   `status`, `score`, `probation` (below). Missing required fields →
-  skipped from index.
+  skipped from index. **`scope` marks *where the rule applies* (e.g.
+  one agent's behavior vs. cross-project convention), not where the
+  file is physically stored** — a global-scope entry can live in any
+  memory directory; consumers filter by semantic applicability.
 - **Scope-internal stratification is optional.** Within a scope,
   entries MAY be further split (e.g. durable `MEMORY.md` vs transient
   daily notes, per OpenClaw's pattern). Not mandatory for MVP; the

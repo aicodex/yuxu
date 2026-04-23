@@ -1,36 +1,86 @@
 ---
 name: memory
-version: "0.1.0"
+version: "0.2.0"
 author: yuxu
 license: MIT
-description: Read yuxu memory with progressive disclosure — `list` returns a lightweight index (name + description + type, from frontmatter), `get` returns the full body for one entry. Writes still flow through memory_curator / approval_queue.
-triggers: [list memory, read memory, memory index, recall memory]
+description: Progressive disclosure over yuxu memory. `stats` returns counts (L0, scale-independent), `list` returns a filtered index (L1, frontmatter only), `get` returns a full entry (L2), `search` ranks name+description matches. Writes still flow through memory_curator / approval_queue.
+triggers: [list memory, read memory, memory stats, memory search, recall memory]
 parameters:
   type: object
   required: [op]
   properties:
     op:
       type: string
-      enum: [list, get]
-      description: "`list` — scan memory_root and return index entries (frontmatter only). `get` — read one entry fully."
+      enum: [stats, list, get, search]
+      description: "`stats` — L0 counts by type/scope/status/evidence_level; `list` — L1 filtered index; `get` — L2 one entry body; `search` — keyword match ranked top-K."
     memory_root:
       type: string
       description: Override memory root. Defaults to `<project>/data/memory` resolved via yuxu.json walk-up, falling back to cwd.
+    mode:
+      type: string
+      enum: [blank, explore, execute, reflect, debug]
+      description: "Default filter policy per I6. `execute` (default) = {validated, consensus, observed} + current, excludes probation. `blank`/`explore` = only mandatory-tagged. `reflect` = no restrictions. `debug` = observed + archived. User-provided filters below override the mode's corresponding axis."
     path:
       type: string
-      description: For `get` — path to the memory file, either absolute or relative to memory_root.
+      description: For `get` — path to memory file, absolute or relative to memory_root.
+    query:
+      type: string
+      description: For `search` — keyword(s) to match on name + description.
+    limit:
+      type: integer
+      description: For `search` — top-K cap (default 10).
+    type:
+      type: string
+      description: Filter by frontmatter type (alias for `types` with a single value).
     types:
       type: array
       items: {type: string}
-      description: For `list` — optional filter (e.g. `["feedback", "project"]`). Entries without a matching `type` in frontmatter are excluded.
+      description: Filter by frontmatter type (e.g. `["feedback", "project"]`).
+    scope:
+      type: [string, array]
+      description: Filter by scope (semantic — where the rule applies, not where stored).
+    evidence_level:
+      type: [string, array]
+      description: Filter by evidence level (validated | consensus | observed | speculative). Overrides mode default.
+    status:
+      type: [string, array]
+      description: Filter by status (current | archived). Overrides mode default.
+    tags:
+      type: array
+      items: {type: string}
+      description: Entry must carry ALL given tags (AND semantics).
+    include_probation:
+      type: boolean
+      description: Override mode's probation exclusion (default false in execute mode).
 ---
 # memory
 
-Two-layer progressive disclosure over `<project>/data/memory/*.md`:
+Progressive disclosure over `<project>/data/memory/*.md`, following I6's
+Memory access discipline: lazy, tool-mediated, never auto-injected.
 
-- **Layer 1 (index)**: `{op: "list"}` → `{ok, memory_root, entries: [{path, name, description, type, bytes}]}`. Parses only frontmatter.
-- **Layer 2 (body)**: `{op: "get", path}` → `{ok, path, frontmatter, body, bytes}`. Reads the full file.
+- **L0 — stats**: `{op: "stats"}` → counts by type / scope / status /
+  evidence_level + probation/mandatory totals. Payload size independent of
+  total entry count.
+- **L1 — list**: `{op: "list", mode?, type?, scope?, evidence_level?, status?, tags?}`
+  → filtered frontmatter-only index. Mode sets defaults; explicit filters
+  override per-axis.
+- **L2 — get**: `{op: "get", path}` → full body + parsed frontmatter.
+- **Cross-cut — search**: `{op: "search", query, limit?, mode?}` → top-K
+  ranked by name + description match.
 
-Skipped from the index: `_drafts/`, `_improvement_log.md`, dotfiles, and files missing frontmatter `name` / `description`.
+Modes (per I6):
 
-Callers decide which entries they need from the index, then fetch those bodies — mirroring Claude Code's skill loader and OpenClaw's 2-layer memory.
+| mode | default filter |
+|---|---|
+| `blank`   | only entries tagged `mandatory` |
+| `explore` | only entries tagged `mandatory` |
+| `execute` | evidence_level ∈ {validated, consensus, observed}, status=current, probation excluded (**default**) |
+| `reflect` | no restrictions (includes archived + probation) |
+| `debug`   | evidence_level=observed, status=archived |
+
+Skipped from all ops: `_drafts/`, `_improvement_log.md`, dotfiles, entries
+missing frontmatter `name` / `description`.
+
+Entries without `evidence_level` default to `observed` for filter purposes;
+without `status` default to `current`. Keeps Phase 1 ungraded entries
+addressable under execute mode.

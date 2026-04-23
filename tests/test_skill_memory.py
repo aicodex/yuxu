@@ -24,21 +24,36 @@ pytestmark = pytest.mark.asyncio
 
 
 def _write_entry(root: Path, path: str, *, name: str, description: str,
-                  type_: str, body_lines: int = 20) -> int:
+                  type_: str, body_lines: int = 20,
+                  scope: str | None = None,
+                  evidence_level: str | None = None,
+                  status: str | None = None,
+                  tags: list[str] | None = None,
+                  probation: bool = False) -> int:
     p = root / path
     p.parent.mkdir(parents=True, exist_ok=True)
     body = "\n".join(
         f"line {i}: lorem ipsum body content padding for a realistic entry"
         for i in range(body_lines)
     )
-    text = (
-        "---\n"
-        f"name: {name}\n"
-        f"description: {description}\n"
-        f"type: {type_}\n"
-        "---\n\n"
-        f"# {name}\n\n{body}\n"
-    )
+    fm_lines = [
+        "---",
+        f"name: {name}",
+        f"description: {description}",
+        f"type: {type_}",
+    ]
+    if scope is not None:
+        fm_lines.append(f"scope: {scope}")
+    if evidence_level is not None:
+        fm_lines.append(f"evidence_level: {evidence_level}")
+    if status is not None:
+        fm_lines.append(f"status: {status}")
+    if tags:
+        fm_lines.append(f"tags: [{', '.join(tags)}]")
+    if probation:
+        fm_lines.append("probation: true")
+    fm_lines.append("---")
+    text = "\n".join(fm_lines) + f"\n\n# {name}\n\n{body}\n"
     p.write_text(text, encoding="utf-8")
     return len(text.encode("utf-8"))
 
@@ -78,9 +93,13 @@ async def test_list_returns_index_only_no_bodies(tmp_path):
     assert names == {"Terse", "Goal", "Docs"}
 
     # Index rows carry only summary fields — no body leak.
+    expected_keys = {
+        "path", "name", "description", "type", "bytes",
+        "scope", "evidence_level", "status", "tags", "probation", "updated",
+    }
     for e in entries:
-        assert set(e.keys()) == {"path", "name", "description", "type", "bytes"}
-        assert "lorem ipsum" not in json.dumps(e)
+        assert set(e.keys()) == expected_keys
+        assert "lorem ipsum" not in json.dumps(e, default=str)
 
     # Progressive disclosure ROI: the serialized index is much smaller than
     # the sum of file bytes. Use a generous ratio so padding / filesystem
@@ -181,9 +200,314 @@ async def test_get_missing_file(tmp_path):
 
 
 async def test_unknown_op(tmp_path):
-    r = await execute({"op": "search"}, _ctx(tmp_path / "data" / "memory"))
+    r = await execute({"op": "nope"}, _ctx(tmp_path / "data" / "memory"))
     assert r["ok"] is False
     assert "unknown op" in r["error"]
+
+
+# ---------- stats (L0) ----------
+
+
+async def test_stats_aggregates_by_dimensions(tmp_path):
+    project = tmp_path
+    (project / "yuxu.json").write_text("{}\n")
+    mem = project / "data" / "memory"
+    mem.mkdir(parents=True)
+
+    _write_entry(mem, "a.md", name="A", description="a",
+                  type_="feedback", scope="global",
+                  evidence_level="consensus", status="current",
+                  tags=["architectural", "mandatory"])
+    _write_entry(mem, "b.md", name="B", description="b",
+                  type_="feedback", scope="project",
+                  evidence_level="observed", status="current")
+    _write_entry(mem, "c.md", name="C", description="c",
+                  type_="project", scope="global",
+                  evidence_level="consensus", status="archived")
+    _write_entry(mem, "d.md", name="D", description="d",
+                  type_="reference", scope="project",
+                  evidence_level="speculative", status="current",
+                  probation=True)
+
+    r = await execute({"op": "stats"}, _ctx(mem))
+    assert r["ok"] is True
+    assert r["total"] == 4
+    assert r["by_type"] == {"feedback": 2, "project": 1, "reference": 1}
+    assert r["by_scope"] == {"global": 2, "project": 2}
+    assert r["by_status"] == {"current": 3, "archived": 1}
+    assert r["by_evidence_level"] == {
+        "consensus": 2, "observed": 1, "speculative": 1,
+    }
+    assert r["probation_count"] == 1
+    assert r["mandatory_count"] == 1
+
+
+async def test_stats_empty_root(tmp_path):
+    project = tmp_path
+    (project / "yuxu.json").write_text("{}\n")
+    mem = project / "data" / "memory"
+    mem.mkdir(parents=True)
+    r = await execute({"op": "stats"}, _ctx(mem))
+    assert r["ok"] is True
+    assert r["total"] == 0
+    assert r["by_type"] == {}
+
+
+# ---------- search (cross-cut) ----------
+
+
+async def test_search_matches_name_and_description(tmp_path):
+    project = tmp_path
+    (project / "yuxu.json").write_text("{}\n")
+    mem = project / "data" / "memory"
+    mem.mkdir(parents=True)
+    _write_entry(mem, "a.md", name="Kernel Invariants",
+                  description="reliability over simplicity",
+                  type_="feedback", evidence_level="consensus")
+    _write_entry(mem, "b.md", name="Session Archive",
+                  description="session JSONL pattern",
+                  type_="reference", evidence_level="consensus")
+    _write_entry(mem, "c.md", name="Random",
+                  description="nothing relevant here",
+                  type_="feedback", evidence_level="consensus")
+
+    r = await execute({"op": "search", "query": "kernel"}, _ctx(mem))
+    assert r["ok"] is True
+    names = [e["name"] for e in r["entries"]]
+    assert names == ["Kernel Invariants"]
+
+
+async def test_search_ranks_name_hits_above_description(tmp_path):
+    project = tmp_path
+    (project / "yuxu.json").write_text("{}\n")
+    mem = project / "data" / "memory"
+    mem.mkdir(parents=True)
+    # Both contain "memory" — but only first has it in the NAME
+    _write_entry(mem, "a.md", name="Memory Designs",
+                  description="overview of systems",
+                  type_="reference", evidence_level="consensus")
+    _write_entry(mem, "b.md", name="Terse replies",
+                  description="notes about memory usage",
+                  type_="feedback", evidence_level="consensus")
+
+    r = await execute({"op": "search", "query": "memory", "limit": 5},
+                        _ctx(mem))
+    assert r["ok"] is True
+    assert [e["name"] for e in r["entries"]] == [
+        "Memory Designs", "Terse replies",
+    ]
+
+
+async def test_search_honors_limit(tmp_path):
+    project = tmp_path
+    (project / "yuxu.json").write_text("{}\n")
+    mem = project / "data" / "memory"
+    mem.mkdir(parents=True)
+    for i in range(5):
+        _write_entry(mem, f"e{i}.md", name=f"Test entry {i}",
+                      description="test test test",
+                      type_="feedback", evidence_level="consensus")
+    r = await execute(
+        {"op": "search", "query": "test", "limit": 2}, _ctx(mem),
+    )
+    assert r["ok"] is True
+    assert len(r["entries"]) == 2
+
+
+async def test_search_respects_mode_filter(tmp_path):
+    project = tmp_path
+    (project / "yuxu.json").write_text("{}\n")
+    mem = project / "data" / "memory"
+    mem.mkdir(parents=True)
+    _write_entry(mem, "a.md", name="Exploration pattern",
+                  description="observed lesson",
+                  type_="feedback", evidence_level="observed",
+                  status="current")
+    _write_entry(mem, "b.md", name="Exploration hypothesis",
+                  description="speculative idea",
+                  type_="feedback", evidence_level="speculative",
+                  status="current")
+
+    # execute mode excludes speculative
+    r = await execute({"op": "search", "query": "exploration",
+                       "mode": "execute"}, _ctx(mem))
+    assert [e["name"] for e in r["entries"]] == ["Exploration pattern"]
+
+    # reflect mode includes both
+    r = await execute({"op": "search", "query": "exploration",
+                       "mode": "reflect"}, _ctx(mem))
+    assert {e["name"] for e in r["entries"]} == {
+        "Exploration pattern", "Exploration hypothesis",
+    }
+
+
+# ---------- list with modes ----------
+
+
+async def test_list_execute_mode_excludes_speculative_archived_probation(tmp_path):
+    project = tmp_path
+    (project / "yuxu.json").write_text("{}\n")
+    mem = project / "data" / "memory"
+    mem.mkdir(parents=True)
+    _write_entry(mem, "validated.md", name="V", description="v",
+                  type_="feedback", evidence_level="validated",
+                  status="current")
+    _write_entry(mem, "consensus.md", name="C", description="c",
+                  type_="feedback", evidence_level="consensus",
+                  status="current")
+    _write_entry(mem, "observed.md", name="O", description="o",
+                  type_="feedback", evidence_level="observed",
+                  status="current")
+    _write_entry(mem, "speculative.md", name="S", description="s",
+                  type_="feedback", evidence_level="speculative",
+                  status="current")
+    _write_entry(mem, "archived.md", name="A", description="a",
+                  type_="feedback", evidence_level="consensus",
+                  status="archived")
+    _write_entry(mem, "probation.md", name="P", description="p",
+                  type_="feedback", evidence_level="consensus",
+                  status="current", probation=True)
+
+    # default mode = execute
+    r = await execute({"op": "list"}, _ctx(mem))
+    assert r["mode"] == "execute"
+    names = {e["name"] for e in r["entries"]}
+    # Keeps validated/consensus/observed at status=current, not in probation
+    assert names == {"V", "C", "O"}
+
+
+async def test_list_reflect_mode_includes_everything(tmp_path):
+    project = tmp_path
+    (project / "yuxu.json").write_text("{}\n")
+    mem = project / "data" / "memory"
+    mem.mkdir(parents=True)
+    _write_entry(mem, "a.md", name="Validated", description="v",
+                  type_="feedback", evidence_level="validated",
+                  status="current")
+    _write_entry(mem, "b.md", name="Archived", description="a",
+                  type_="feedback", evidence_level="consensus",
+                  status="archived")
+    _write_entry(mem, "c.md", name="Probation", description="p",
+                  type_="feedback", evidence_level="observed",
+                  status="current", probation=True)
+
+    r = await execute({"op": "list", "mode": "reflect"}, _ctx(mem))
+    names = {e["name"] for e in r["entries"]}
+    assert names == {"Validated", "Archived", "Probation"}
+
+
+async def test_list_blank_and_explore_modes_return_only_mandatory(tmp_path):
+    project = tmp_path
+    (project / "yuxu.json").write_text("{}\n")
+    mem = project / "data" / "memory"
+    mem.mkdir(parents=True)
+    _write_entry(mem, "safety.md", name="Safety", description="kernel",
+                  type_="feedback", evidence_level="consensus",
+                  tags=["architectural", "mandatory"])
+    _write_entry(mem, "advisory.md", name="Advisory", description="not mandatory",
+                  type_="feedback", evidence_level="consensus",
+                  tags=["discipline"])
+
+    for mode in ("blank", "explore"):
+        r = await execute({"op": "list", "mode": mode}, _ctx(mem))
+        names = {e["name"] for e in r["entries"]}
+        assert names == {"Safety"}, f"mode={mode} returned {names}"
+
+
+async def test_list_debug_mode_observed_archived(tmp_path):
+    project = tmp_path
+    (project / "yuxu.json").write_text("{}\n")
+    mem = project / "data" / "memory"
+    mem.mkdir(parents=True)
+    _write_entry(mem, "a.md", name="ObservedArchived", description="d",
+                  type_="feedback", evidence_level="observed",
+                  status="archived")
+    _write_entry(mem, "b.md", name="ObservedCurrent", description="d",
+                  type_="feedback", evidence_level="observed",
+                  status="current")
+    _write_entry(mem, "c.md", name="ConsensusArchived", description="d",
+                  type_="feedback", evidence_level="consensus",
+                  status="archived")
+
+    r = await execute({"op": "list", "mode": "debug"}, _ctx(mem))
+    names = {e["name"] for e in r["entries"]}
+    # Only observed + archived combo hits
+    assert names == {"ObservedArchived"}
+
+
+async def test_user_filter_overrides_mode_default(tmp_path):
+    project = tmp_path
+    (project / "yuxu.json").write_text("{}\n")
+    mem = project / "data" / "memory"
+    mem.mkdir(parents=True)
+    _write_entry(mem, "a.md", name="Validated", description="v",
+                  type_="feedback", evidence_level="validated",
+                  status="current")
+    _write_entry(mem, "b.md", name="Speculative", description="s",
+                  type_="feedback", evidence_level="speculative",
+                  status="current")
+
+    # execute mode normally excludes speculative — user override adds it back
+    r = await execute({
+        "op": "list", "mode": "execute",
+        "evidence_level": ["validated", "speculative"],
+    }, _ctx(mem))
+    names = {e["name"] for e in r["entries"]}
+    assert names == {"Validated", "Speculative"}
+
+
+async def test_tags_filter_requires_all(tmp_path):
+    project = tmp_path
+    (project / "yuxu.json").write_text("{}\n")
+    mem = project / "data" / "memory"
+    mem.mkdir(parents=True)
+    _write_entry(mem, "a.md", name="A", description="d",
+                  type_="feedback", evidence_level="consensus",
+                  tags=["architectural", "kernel"])
+    _write_entry(mem, "b.md", name="B", description="d",
+                  type_="feedback", evidence_level="consensus",
+                  tags=["architectural"])
+    _write_entry(mem, "c.md", name="C", description="d",
+                  type_="feedback", evidence_level="consensus",
+                  tags=["kernel"])
+
+    r = await execute({
+        "op": "list", "mode": "reflect",
+        "tags": ["architectural", "kernel"],
+    }, _ctx(mem))
+    names = {e["name"] for e in r["entries"]}
+    assert names == {"A"}
+
+
+async def test_list_unknown_mode_errors(tmp_path):
+    project = tmp_path
+    (project / "yuxu.json").write_text("{}\n")
+    mem = project / "data" / "memory"
+    mem.mkdir(parents=True)
+    r = await execute({"op": "list", "mode": "bogus"}, _ctx(mem))
+    assert r["ok"] is False
+    assert "unknown mode" in r["error"]
+
+
+async def test_summary_carries_new_fields(tmp_path):
+    """Phase 1 canary: list output exposes the I6 extended fields."""
+    project = tmp_path
+    (project / "yuxu.json").write_text("{}\n")
+    mem = project / "data" / "memory"
+    mem.mkdir(parents=True)
+    _write_entry(mem, "entry.md", name="Canary",
+                  description="I6 schema smoke test",
+                  type_="feedback", scope="global",
+                  evidence_level="consensus", status="current",
+                  tags=["architectural", "mandatory"])
+
+    r = await execute({"op": "list", "mode": "reflect"}, _ctx(mem))
+    entry = r["entries"][0]
+    assert entry["scope"] == "global"
+    assert entry["evidence_level"] == "consensus"
+    assert entry["status"] == "current"
+    assert set(entry["tags"]) == {"architectural", "mandatory"}
+    assert entry["probation"] is False
 
 
 async def test_via_bus_request_roundtrip(tmp_path, monkeypatch, bundled_dir):
