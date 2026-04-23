@@ -37,6 +37,23 @@ but pause and check if you're about to violate one:
   `performance_ranker`; (3) token inefficiency — value per token
   consumed. The top-scoring agent gets the next iteration slot. Unused
   budget goes to background exploration, never to idle.
+- **Less is more, but change-locality beats count** (Occam's razor,
+  nuanced) — default to extending an existing agent or skill before
+  creating a new one. But don't worship minimum count; the real metric
+  is **change locality**: when a new need arrives, does the solution
+  touch one place, or ripple across every agent?
+
+  Example from practice: making `reasoning` and `tool_use` first-class
+  subscription Info Sources (new pattern, adds an agent or source
+  registration) keeps all future rendering / visibility logic in one
+  place. Stuffing that logic into `gateway.send` wrappers would have
+  required editing every business agent that produces these streams —
+  more agents modified, more total code, more ripple.
+
+  Ask before merging: "does putting this in an existing agent force
+  unrelated agents to change later?" If yes, split. If no, extend.
+  High cohesion + low coupling is the objective; agent count is a
+  lagging indicator, not a target.
 - **Don't work in isolation (闭门造车)** — before proposing a new
   design or mechanism, actively check reference implementations:
   Claude Code, OpenClaw, Hermes, and established internet patterns.
