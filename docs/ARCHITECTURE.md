@@ -72,16 +72,43 @@ doubt, it's probably an agent.
 `persistent` (always on) / `scheduled` (cron) / `triggered` (event) /
 `one_shot` (explicit) / `spawned` (by parent). Every agent declares one.
 
-### I6. Three-layer memory and scope
+### I6. Four-layer scope for behavior-shaping data
 
-Memory and agent-instance scope share the hierarchy:
-- **Global** (`~/.yuxu/`) — cross-project, user-wide.
-- **Project** (`<project>/.yuxu/`) — within one project.
-- **Agent/Session** (`<project>/.yuxu/_sessions/<agent>[#id]/<key>/`) —
-  per-instance, per-conversation.
+"Memory" is a convenient word but **deliberately not formalized** — the
+edge cases are too fuzzy (is `handler.py` memory? the `AGENT.md` body?
+session transcript? `rate_limits.yaml`?). Instead, yuxu formalizes
+**where to go to change agent behavior**. Four scopes, widest to
+narrowest:
 
-Reads climb layers. Writes that cross a boundary (e.g. session →
-project) go through approval.
+- **Global** — cross-project, user-wide. Typical path: `~/.yuxu/`.
+  Preferences, credentials (encrypted), cross-project curated memory.
+- **Project** — shared across all agents in one project. Typical:
+  `<project>/data/memory/_shared/` + project config. Themes, domain
+  facts, cross-agent knowledge within one project.
+- **Agent** — one specific agent's persistent state across runs.
+  Includes its `AGENT.md` body, `handler.py`, per-agent memory files,
+  curated notes. Typical: `<project>/agents/<name>/` (code + AGENT.md)
+  plus `<project>/data/memory/<name>/` (data).
+- **Session** — one conversation or run's ephemeral state: transcript,
+  in-flight vars, scratch. Typical:
+  `<project>/data/sessions/<agent>[#id]/<key>/`.
+
+Forms are open: today markdown dominates; future may add yaml, sqlite,
+embeddings, images, structured indexes. **The scope tells you where to
+look; the form is orthogonal.**
+
+Reads climb scopes (session → agent → project → global). Writes that
+cross a scope boundary (e.g. session → agent, project → global) go
+through approval (`approval_queue` → `approval_applier`).
+
+**How do I change behavior X?**
+- Change one agent's prompt → its `AGENT.md` (agent scope).
+  iteration_agent proposes variants as drafts.
+- Change one agent's code → its `handler.py` (agent scope). Human-only
+  for now; iteration_agent v0.5+ may propose variants.
+- Change a conversation's context → session scope files.
+- Change cross-project preferences → global scope.
+- Add shared project facts → project scope (`_shared/`).
 
 ### I7. User-facing messages are subscription Info Sources
 
