@@ -50,6 +50,31 @@ class LLMServiceError(Exception):
     pass
 
 
+class ProviderRateLimitError(LLMServiceError):
+    """Raised when the LLM provider signals a rate-limit error.
+
+    Common triggers:
+      - HTTP 429 (OpenAI, Anthropic, most vendors)
+      - MiniMax `base_resp.status_code == 1002` (RPM / concurrency exceeded)
+
+    Callers (e.g. llm_driver) should catch this and retry via the
+    rate_limit_service's retry priority lane after an exponential backoff.
+    The first attempt's slot has already been released (and was NOT debited,
+    since we never set `actual_cost`); the retry re-enters via
+    `priority="retry"` to jump the weighted queue. If the retry succeeds,
+    THAT attempt debits cost — one logical call = at most one debit.
+    """
+    def __init__(self, message: str, *, retry_after_sec: Optional[float] = None,
+                 code: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.retry_after_sec = retry_after_sec
+        self.code = code
+
+
+# MiniMax (via MiniMaxi and Lark relay) wraps errors in `base_resp`.
+MINIMAX_RATE_LIMIT_CODES = {1002, 1039, 1027}  # 1002 RPM, 1039 concurrent, 1027 overload
+
+
 class LLMService:
     DEFAULT_TIMEOUT = 60.0
     COMPLETION_TOPIC = "llm_service.request_completed"
@@ -80,8 +105,21 @@ class LLMService:
                    json_mode: bool = False,
                    extra_body: Optional[dict] = None,
                    timeout: Optional[float] = None,
-                   strip_thinking_blocks: bool = False) -> dict:
-        async with self.rate_limiter(pool) as ctx:
+                   strip_thinking_blocks: bool = False,
+                   agent: Optional[str] = None,
+                   cost_hint: Optional[float] = None,
+                   priority: str = "normal") -> dict:
+        # Pass identity + budget + priority downstream so rate_limit_service
+        # can do weighted admission (DWRR) + retry priority lane. All optional
+        # for backwards compat — rate_limiters that don't accept these kwargs
+        # will still work with the positional `pool`-only fast path below.
+        try:
+            rl_ctx = self.rate_limiter(pool, agent=agent, cost_hint=cost_hint,
+                                       priority=priority)
+        except TypeError:
+            # Legacy rate limiter that doesn't accept the kwargs.
+            rl_ctx = self.rate_limiter(pool)
+        async with rl_ctx as ctx:
             if not isinstance(ctx, dict):
                 raise LLMServiceError(
                     f"rate limiter returned no account for pool {pool!r}; "
@@ -120,6 +158,18 @@ class LLMService:
             except httpx.RequestError as e:
                 raise LLMServiceError(f"request error: {e}") from e
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            if resp.status_code == 429:
+                retry_after = resp.headers.get("Retry-After")
+                ra_sec: Optional[float] = None
+                if retry_after:
+                    try:
+                        ra_sec = float(retry_after)
+                    except ValueError:
+                        ra_sec = None
+                raise ProviderRateLimitError(
+                    f"HTTP 429 rate-limited by provider: {resp.text[:200]}",
+                    retry_after_sec=ra_sec, code="http_429",
+                )
             if resp.status_code >= 400:
                 text = resp.text
                 raise LLMServiceError(f"HTTP {resp.status_code}: {text[:300]}")
@@ -127,6 +177,23 @@ class LLMService:
                 api_resp = resp.json()
             except json.JSONDecodeError as e:
                 raise LLMServiceError(f"non-JSON response: {e}") from e
+            # MiniMax uses an in-body error envelope even on HTTP 200.
+            base_resp = api_resp.get("base_resp") if isinstance(api_resp, dict) else None
+            if isinstance(base_resp, dict):
+                code = base_resp.get("status_code")
+                try:
+                    code_i = int(code) if code is not None else 0
+                except (TypeError, ValueError):
+                    code_i = 0
+                if code_i in MINIMAX_RATE_LIMIT_CODES:
+                    raise ProviderRateLimitError(
+                        f"MiniMax {code_i}: {base_resp.get('status_msg', '')}",
+                        code=f"minimax_{code_i}",
+                    )
+                if code_i != 0:
+                    raise LLMServiceError(
+                        f"MiniMax base_resp {code_i}: {base_resp.get('status_msg', '')}"
+                    )
             normalized = self._normalize(api_resp)
             if strip_thinking_blocks:
                 normalized["content"] = _strip_thinking_blocks(
@@ -138,12 +205,18 @@ class LLMService:
             normalized["elapsed_ms"] = round(elapsed_ms, 2)
             usage = normalized.get("usage") or {}
             completion_tokens = int(usage.get("completion_tokens") or 0)
+            total_tokens = int(usage.get("total_tokens") or 0)
             if elapsed_ms > 0 and completion_tokens > 0:
                 normalized["output_tps"] = round(
                     completion_tokens / (elapsed_ms / 1000.0), 2,
                 )
             else:
                 normalized["output_tps"] = None
+            # Signal successful completion + actual cost to rate_limit_service
+            # so its DWRR deficit accounting reflects truth. Failed paths
+            # (exceptions above) skip this and thus don't debit.
+            if isinstance(ctx, dict) and total_tokens > 0:
+                ctx["actual_cost"] = total_tokens
             return normalized
 
     def _normalize(self, api_resp: dict) -> dict:
@@ -205,7 +278,23 @@ class LLMService:
                 extra_body=payload.get("extra_body"),
                 timeout=payload.get("timeout"),
                 strip_thinking_blocks=payload.get("strip_thinking_blocks", False),
+                # v0.2: weighted admission + retry plumbing. Sender defaults
+                # agent; callers can override via `agent` field for multi-hop
+                # attribution (e.g. llm_driver → llm_service).
+                agent=payload.get("agent")
+                      or getattr(msg, "sender", None) or None,
+                cost_hint=payload.get("cost_hint"),
+                priority=payload.get("priority", "normal"),
             )
+        except ProviderRateLimitError as e:
+            # Surface as a structured error the caller can classify without
+            # string-matching. llm_driver uses this to decide to retry.
+            return {
+                "ok": False, "error": str(e),
+                "error_kind": "provider_rate_limit",
+                "error_code": e.code,
+                "retry_after_sec": e.retry_after_sec,
+            }
         except LLMServiceError as e:
             return {"ok": False, "error": str(e)}
         except KeyError as e:

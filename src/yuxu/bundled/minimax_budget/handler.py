@@ -18,6 +18,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import httpx
@@ -31,6 +33,20 @@ DEFAULT_HTTP_TIMEOUT = 10.0
 SOFT_CAP_FRAC = 0.80
 HARD_CAP_FRAC = 0.95
 COMPLETION_TOPIC = "llm_service.request_completed"
+
+# Rolling-window cost estimate tuning
+WINDOW_1H_SEC = 3600.0
+# Minimum calls in the 1h window before we trust the per-agent mean as a
+# prediction. Below this, fall back to cross-agent mean → default.
+N_MIN_1H = 3
+# Last-resort cost when no history exists at all (fresh install).
+DEFAULT_CALL_TOKENS = 2000
+
+
+@dataclass
+class _Call:
+    ts: float
+    tokens: int
 
 
 # -- helpers ----------------------------------------------------
@@ -127,8 +143,14 @@ class MiniMaxBudget:
         # per-account config: {id, api_key, base_url}
         self._accounts: list[dict] = []
         # local per-agent attribution:
-        # { (agent, model): {"requests": int, "total_tokens": int} }
+        #   _local[(agent, model)] = {"requests": int, "total_tokens": int,
+        #                             "window": deque[_Call]}   # 1h rolling
+        # The cumulative `requests` / `total_tokens` stay for ops that want
+        # lifetime stats; `window` drives cost-per-call estimation.
         self._local: dict[tuple[str, str], dict] = {}
+        # Global cumulative counters — power cross-agent cold-start fallback.
+        self._global_calls: int = 0
+        self._global_tokens: int = 0
         # track which (account, model) we've already alerted on in the
         # current interval to avoid alert storms
         self._alerted_interval_soft: set[tuple[str, str, int]] = set()
@@ -322,9 +344,100 @@ class MiniMaxBudget:
         usage = payload.get("usage") or {}
         total_tokens = int(usage.get("total_tokens") or 0)
         key = (agent, model)
-        rec = self._local.setdefault(key, {"requests": 0, "total_tokens": 0})
+        rec = self._local.setdefault(
+            key, {"requests": 0, "total_tokens": 0, "window": deque()}
+        )
+        # Back-compat guard for records created without window (tests that
+        # mutate _local directly).
+        if "window" not in rec:
+            rec["window"] = deque()
         rec["requests"] += 1
         rec["total_tokens"] += total_tokens
+        now = time.monotonic()
+        dq: deque = rec["window"]
+        self._prune_window(dq, now)
+        dq.append(_Call(ts=now, tokens=total_tokens))
+        self._global_calls += 1
+        self._global_tokens += total_tokens
+
+    # -- cost estimation -----------------------------------------
+
+    @staticmethod
+    def _prune_window(dq: deque, now: float) -> None:
+        cutoff = now - WINDOW_1H_SEC
+        while dq and dq[0].ts < cutoff:
+            dq.popleft()
+
+    def _global_mean(self) -> Optional[float]:
+        if self._global_calls <= 0:
+            return None
+        return self._global_tokens / self._global_calls
+
+    def _window_stats(self, key: tuple[str, str],
+                      now: Optional[float] = None) -> tuple[int, int]:
+        """Return (calls_1h, tokens_1h) for a given (agent, model)."""
+        rec = self._local.get(key)
+        if not rec:
+            return (0, 0)
+        dq = rec.get("window")
+        if not dq:
+            return (0, 0)
+        now = now or time.monotonic()
+        self._prune_window(dq, now)
+        calls = len(dq)
+        tokens = sum(c.tokens for c in dq)
+        return (calls, tokens)
+
+    def _agent_window_stats(self, agent: str,
+                            now: Optional[float] = None) -> tuple[int, int]:
+        """Aggregate rolling stats across all models for an agent."""
+        now = now or time.monotonic()
+        calls = 0
+        tokens = 0
+        for (a, _m), rec in self._local.items():
+            if a != agent:
+                continue
+            dq = rec.get("window")
+            if not dq:
+                continue
+            self._prune_window(dq, now)
+            calls += len(dq)
+            tokens += sum(c.tokens for c in dq)
+        return (calls, tokens)
+
+    def estimate_cost_per_call(self, agent: str) -> dict:
+        """Predict tokens the next call by `agent` will consume.
+
+        Fallback chain:
+          1. per-agent 1h mean    (needs ≥ N_MIN_1H samples)
+          2. cross-agent global cumulative mean
+          3. DEFAULT_CALL_TOKENS constant
+        """
+        now = time.monotonic()
+        calls_1h, tokens_1h = self._agent_window_stats(agent, now)
+        if calls_1h >= N_MIN_1H:
+            return {
+                "value": tokens_1h / calls_1h,
+                "source": "per_agent_1h",
+                "calls_1h": calls_1h,
+                "tokens_1h": tokens_1h,
+            }
+        gm = self._global_mean()
+        if gm is not None:
+            return {
+                "value": gm,
+                "source": "global_mean",
+                "calls_1h": calls_1h,
+                "tokens_1h": tokens_1h,
+                "global_calls": self._global_calls,
+                "global_tokens": self._global_tokens,
+            }
+        return {
+            "value": float(DEFAULT_CALL_TOKENS),
+            "source": "default",
+            "calls_1h": calls_1h,
+            "tokens_1h": tokens_1h,
+        }
 
     # -- queries --------------------------------------------
 
@@ -349,28 +462,44 @@ class MiniMaxBudget:
                 "poll_interval": self.poll_interval}
 
     def agent_usage(self, agent: Optional[str] = None) -> dict:
+        now = time.monotonic()
         out = []
         for (name, model), rec in sorted(self._local.items()):
             if agent is not None and name != agent:
                 continue
             reqs = rec.get("requests") or 0
             toks = rec.get("total_tokens") or 0
+            calls_1h, tokens_1h = self._window_stats((name, model), now)
             out.append({
                 "agent": name,
                 "model": model,
                 "requests": reqs,
                 "total_tokens": toks,
                 "avg_tokens_per_req": (toks / reqs) if reqs else None,
+                # Rolling 1h fields (additive, don't replace lifetime)
+                "calls_1h": calls_1h,
+                "tokens_1h": tokens_1h,
+                "avg_tokens_per_req_1h": (
+                    (tokens_1h / calls_1h) if calls_1h else None
+                ),
             })
         return {"ok": True, "usage": out}
 
     def estimate(self, *, agent: str,
                  n_requests: Optional[int] = None,
                  n_tokens: Optional[int] = None) -> dict:
-        """If `n_requests` given → project token cost using avg. If `n_tokens`
-        given → project request count needed to burn that many tokens
-        (inverse)."""
-        # aggregate this agent's history across models
+        """If `n_requests` given → project token cost using best available
+        mean. If `n_tokens` given → project request count needed to burn that
+        many tokens (inverse).
+
+        Projection uses the rolling 1h per-agent mean when available, else
+        falls back to the cross-agent global mean. See `estimate_cost_per_call`.
+        The response carries:
+          - `avg_tokens_per_req`: LEGACY all-time agent average (unchanged)
+          - `cost_per_call` + `cost_source`: NEW rolling-first estimate
+          - projections use `cost_per_call` as the multiplier
+        """
+        # aggregate this agent's all-time history across models (legacy)
         total_reqs = 0
         total_toks = 0
         for (name, _m), rec in self._local.items():
@@ -379,28 +508,36 @@ class MiniMaxBudget:
             total_reqs += rec.get("requests") or 0
             total_toks += rec.get("total_tokens") or 0
         avg = (total_toks / total_reqs) if total_reqs else None
+
+        cost = self.estimate_cost_per_call(agent)
+        cpc = cost["value"]
+
         out: dict[str, Any] = {
             "ok": True,
             "agent": agent,
             "history_requests": total_reqs,
             "history_tokens": total_toks,
             "avg_tokens_per_req": avg,
+            "cost_per_call": cpc,
+            "cost_source": cost["source"],
+            "calls_1h": cost["calls_1h"],
+            "tokens_1h": cost["tokens_1h"],
         }
         if n_requests is not None:
             out["projected_requests"] = int(n_requests)
-            out["projected_tokens"] = (
-                int(round(avg * n_requests)) if avg is not None else None
-            )
+            out["projected_tokens"] = int(round(cpc * n_requests))
         elif n_tokens is not None:
             out["projected_tokens"] = int(n_tokens)
             out["projected_requests"] = (
-                int(round(n_tokens / avg)) if (avg and avg > 0) else None
+                int(round(n_tokens / cpc)) if cpc > 0 else None
             )
         return out
 
     def reset_local(self, agent: Optional[str] = None) -> dict:
         if agent is None:
             self._local.clear()
+            self._global_calls = 0
+            self._global_tokens = 0
             return {"ok": True, "cleared": "all"}
         before = len(self._local)
         self._local = {k: v for k, v in self._local.items() if k[0] != agent}
@@ -425,6 +562,13 @@ class MiniMaxBudget:
                     n_requests=payload.get("n_requests"),
                     n_tokens=payload.get("n_tokens"),
                 )
+            if op == "cost_per_call":
+                # Lightweight hot-path query for rate_limit / llm_driver.
+                agent = payload.get("agent")
+                if not agent:
+                    return {"ok": False, "error": "missing field: agent"}
+                return {"ok": True, "agent": agent,
+                        **self.estimate_cost_per_call(agent)}
             if op == "refresh":
                 return await self.refresh(payload.get("account_id"))
             if op == "reset_local":

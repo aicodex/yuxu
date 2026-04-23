@@ -223,3 +223,153 @@ async def test_rate_limit_unknown_pool_raises(tmp_path, monkeypatch, bundled_dir
     with pytest.raises(KeyError):
         async with rls.acquire("ghost"):
             pass
+
+
+# -- v0.2 weighted admission (DWRR) + priority lane + deficit ---
+
+
+async def test_weights_parsed_from_config():
+    svc = RateLimitService({
+        "p": {"accounts": [{"id": "a"}],
+              "weights": {"agent_a": 4, "agent_b": 2}},
+    })
+    pool = svc.pools["p"]
+    assert pool.weights == {"agent_a": 4, "agent_b": 2}
+
+
+async def test_weights_reject_non_positive():
+    svc = RateLimitService({
+        "p": {"accounts": [{"id": "a"}],
+              "weights": {"x": 0, "y": -1, "z": 3}},
+    })
+    assert svc.pools["p"].weights == {"z": 3}
+
+
+async def test_actual_cost_debits_consumed_on_success():
+    svc = RateLimitService({"p": {"accounts": [{"id": "a"}]}})
+    async with svc.acquire("p", agent="bob", cost_hint=100) as h:
+        h["actual_cost"] = 150.0
+    # `consumed` is the invariant counter (monotonic in successful calls,
+    # decoupled from DWRR refill churn)
+    assert svc.pools["p"].consumed["bob"] == 150.0
+
+
+async def test_no_actual_cost_means_not_consumed():
+    """Simulates a failed call: caller never sets actual_cost. The call
+    took a slot but didn't burn a "successful" cost."""
+    svc = RateLimitService({"p": {"accounts": [{"id": "a"}]}})
+    async with svc.acquire("p", agent="bob", cost_hint=100):
+        pass  # no h["actual_cost"]
+    assert svc.pools["p"].consumed.get("bob", 0.0) == 0.0
+
+
+async def test_retry_priority_still_debits_on_success():
+    """A successful retry does consume the logical-call's tokens. Only
+    FAILED attempts (no actual_cost set) skip debit, regardless of priority.
+    """
+    svc = RateLimitService({"p": {"accounts": [{"id": "a"}]}})
+    async with svc.acquire("p", agent="bob", cost_hint=50,
+                           priority="retry") as h:
+        h["actual_cost"] = 100.0
+    assert svc.pools["p"].consumed["bob"] == 100.0
+
+
+async def test_retry_priority_no_debit_on_failure():
+    """Retry that also fails (rare, e.g. retry-ceiling exceeded) doesn't debit."""
+    svc = RateLimitService({"p": {"accounts": [{"id": "a"}]}})
+    async with svc.acquire("p", agent="bob", cost_hint=50,
+                           priority="retry"):
+        pass  # still no actual_cost
+    assert svc.pools["p"].consumed.get("bob", 0.0) == 0.0
+
+
+async def test_weighted_admission_favors_higher_weight():
+    """weights a=3, b=1: a should dominate early slots.
+
+    With max_concurrent=1 and a small hold per slot, the first few winners
+    under contention reflect DWRR with initial credits of weight-each.
+    """
+    svc = RateLimitService({
+        "p": {"accounts": [{"id": "x"}],
+              "max_concurrent": 1,
+              "weights": {"a": 3, "b": 1}},
+    })
+    served: list[str] = []
+
+    async def _task(name):
+        async with svc.acquire("p", agent=name, cost_hint=1) as h:
+            served.append(name)
+            h["actual_cost"] = 1
+            await asyncio.sleep(0.01)
+
+    tasks = [asyncio.create_task(_task("a")) for _ in range(4)]
+    tasks += [asyncio.create_task(_task("b")) for _ in range(4)]
+    await asyncio.gather(*tasks)
+
+    # Everyone eventually runs
+    assert served.count("a") == 4 and served.count("b") == 4
+    # But "a" (weight 3) should dominate the first 4 — DWRR gives a 3 credits
+    # and b only 1 per refill round.
+    first_four = served[:4]
+    assert first_four.count("a") >= 3
+
+
+async def test_retry_lane_preempts_weighted_waiters():
+    """A retry waiter that queues AFTER a normal waiter jumps ahead."""
+    svc = RateLimitService({"p": {"accounts": [{"id": "x"}],
+                                   "max_concurrent": 1}})
+    served: list[str] = []
+    release = asyncio.Event()
+
+    async def _hold():
+        async with svc.acquire("p", agent="holder", cost_hint=0) as h:
+            h["actual_cost"] = 0
+            await release.wait()
+
+    async def _normal():
+        async with svc.acquire("p", agent="normal", cost_hint=0) as h:
+            served.append("normal")
+            h["actual_cost"] = 0
+
+    async def _retry():
+        async with svc.acquire("p", agent="retrier", cost_hint=0,
+                               priority="retry") as h:
+            served.append("retry")
+            h["actual_cost"] = 0
+
+    holder = asyncio.create_task(_hold())
+    await asyncio.sleep(0.02)
+    n = asyncio.create_task(_normal())
+    await asyncio.sleep(0.02)
+    r = asyncio.create_task(_retry())
+    await asyncio.sleep(0.02)
+    release.set()
+    await asyncio.gather(holder, n, r)
+    assert served == ["retry", "normal"]
+
+
+async def test_anon_caller_backwards_compatible():
+    svc = RateLimitService({"p": {"accounts": [{"id": "x"}]}})
+    async with svc.acquire("p") as h:
+        assert h["agent"] == "_anon"
+        assert h["priority"] == "normal"
+        assert h["cost_hint"] == 0.0
+        assert h["actual_cost"] is None
+
+
+async def test_snapshot_exposes_weights_and_queue_sizes():
+    svc = RateLimitService({
+        "p": {"accounts": [{"id": "x"}],
+              "weights": {"a": 2, "b": 1}},
+    })
+    snap = svc.snapshot()
+    assert snap["p"]["weights"] == {"a": 2, "b": 1}
+    assert snap["p"]["retry_waiters"] == 0
+    assert snap["p"]["weighted_waiters"] == 0
+
+
+async def test_invalid_priority_raises():
+    svc = RateLimitService({"p": {"accounts": [{"id": "x"}]}})
+    with pytest.raises(ValueError, match="priority"):
+        async with svc.acquire("p", priority="urgent"):
+            pass

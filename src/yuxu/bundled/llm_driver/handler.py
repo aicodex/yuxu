@@ -76,6 +76,11 @@ def _extract_tool_output(raw: Any) -> Any:
 
 
 class LlmDriver:
+    # v0.2 retry knobs. Kept as class attrs so tests (and users) can override.
+    MAX_RETRIES_ON_PROVIDER_RATE_LIMIT = 3
+    RETRY_BACKOFF_BASE_SEC = 1.0
+    RETRY_BACKOFF_MAX_SEC = 30.0
+
     def __init__(self, bus) -> None:
         self.bus = bus
 
@@ -96,11 +101,14 @@ class LlmDriver:
         json_mode: bool = False,
         strip_thinking_blocks: bool = False,
         max_total_tokens: Optional[int] = DEFAULT_MAX_TOTAL_TOKENS,
+        agent: Optional[str] = None,
+        cost_hint: Optional[float] = None,
     ) -> dict:
         dispatch = tool_dispatch or {}
         total_prompt = 0
         total_completion = 0
         total_elapsed_ms = 0.0
+        total_retries = 0
         final_content: Optional[str] = None
         stop_reason = "max_iter"
         error_msg: Optional[str] = None
@@ -109,29 +117,34 @@ class LlmDriver:
         for it in range(max_iterations):
             iterations_done = it + 1
             api_messages = [{"role": "system", "content": system_prompt}, *messages]
-            llm_req: dict[str, Any] = {
+            base_req: dict[str, Any] = {
                 "pool": pool,
                 "model": model,
                 "messages": api_messages,
             }
             if tools:
-                llm_req["tools"] = [_to_openai_tool(t) for t in tools]
+                base_req["tools"] = [_to_openai_tool(t) for t in tools]
             if temperature is not None:
-                llm_req["temperature"] = temperature
+                base_req["temperature"] = temperature
             if json_mode:
-                llm_req["json_mode"] = True
+                base_req["json_mode"] = True
             if strip_thinking_blocks:
-                llm_req["strip_thinking_blocks"] = True
+                base_req["strip_thinking_blocks"] = True
+            if agent is not None:
+                base_req["agent"] = agent
+            if cost_hint is not None:
+                base_req["cost_hint"] = cost_hint
 
-            try:
-                resp = await self.bus.request("llm_service", llm_req, timeout=llm_timeout)
-            except Exception as e:
-                log.exception("llm_driver: llm_service failed at iter %d", it)
+            resp, retries, fatal_error = await self._call_with_retry(
+                base_req, llm_timeout, agent,
+            )
+            total_retries += retries
+            if fatal_error is not None:
                 stop_reason = "error"
-                error_msg = f"llm_service: {e}"
+                error_msg = fatal_error
                 break
 
-            if not resp.get("ok", True):  # llm_service may return ok:false
+            if not resp.get("ok", True):  # non-retryable failure
                 stop_reason = "error"
                 error_msg = f"llm_service: {resp.get('error')}"
                 break
@@ -192,8 +205,64 @@ class LlmDriver:
             "usage": {"prompt_tokens": total_prompt, "completion_tokens": total_completion},
             "elapsed_ms": round(total_elapsed_ms, 2),
             "output_tps": output_tps,
+            "retries": total_retries,
             "error": error_msg,
         }
+
+    async def _call_with_retry(
+        self, base_req: dict, llm_timeout: float, sender: Optional[str],
+    ) -> tuple[dict, int, Optional[str]]:
+        """Call llm_service with provider-rate-limit retry + priority lane.
+
+        Returns (response_dict, retries_used, fatal_error_msg). On non-retryable
+        transport failure, response_dict is the last attempt and fatal_error_msg
+        is set. On retryable rate-limit exhaustion, the final 429/1002 response
+        is returned as-is (ok=False), no fatal error.
+        """
+        attempts = self.MAX_RETRIES_ON_PROVIDER_RATE_LIMIT + 1
+        retries = 0
+        last_resp: Optional[dict] = None
+        for attempt in range(attempts):
+            req = dict(base_req)
+            if attempt > 0:
+                req["priority"] = "retry"
+            try:
+                resp = await self.bus.request(
+                    "llm_service", req, timeout=llm_timeout,
+                    sender=sender,
+                )
+            except Exception as e:
+                log.exception("llm_driver: bus.request to llm_service failed")
+                return {}, retries, f"llm_service: {e}"
+            last_resp = resp
+            if resp.get("ok"):
+                return resp, retries, None
+            if resp.get("error_kind") != "provider_rate_limit":
+                # Non-retryable failure — bubble it up unchanged.
+                return resp, retries, None
+            # Retryable. If we've hit the limit, give up and return the 429 resp.
+            if attempt >= self.MAX_RETRIES_ON_PROVIDER_RATE_LIMIT:
+                log.warning("llm_driver: exhausted %d retries on %s",
+                            attempt, resp.get("error_code"))
+                return resp, retries, None
+            retries += 1
+            # Backoff: exp unless provider gave Retry-After, then take the max.
+            backoff = min(
+                self.RETRY_BACKOFF_MAX_SEC,
+                self.RETRY_BACKOFF_BASE_SEC * (2 ** attempt),
+            )
+            ra = resp.get("retry_after_sec")
+            if ra is not None:
+                try:
+                    backoff = max(backoff, float(ra))
+                except (TypeError, ValueError):
+                    pass
+            log.info(
+                "llm_driver: %s on attempt %d, sleeping %.1fs before retry",
+                resp.get("error_code"), attempt + 1, backoff,
+            )
+            await asyncio.sleep(backoff)
+        return last_resp or {}, retries, None
 
     async def handle(self, msg) -> dict:
         payload = msg.payload if isinstance(msg.payload, dict) else {}
@@ -205,6 +274,10 @@ class LlmDriver:
         if missing:
             return {"ok": False, "error": f"missing fields: {missing}"}
         messages = list(payload["messages"])  # don't mutate caller's list
+        # Preserve the ORIGINAL caller identity across the driver→service hop
+        # so rate_limit_service attributes to the real agent (e.g.
+        # "reflection_agent"), not to llm_driver itself.
+        original_sender = getattr(msg, "sender", None)
         result = await self.run_turn(
             system_prompt=payload["system_prompt"],
             messages=messages,
@@ -220,6 +293,8 @@ class LlmDriver:
             json_mode=payload.get("json_mode", False),
             strip_thinking_blocks=payload.get("strip_thinking_blocks", False),
             max_total_tokens=payload.get("max_total_tokens", DEFAULT_MAX_TOTAL_TOKENS),
+            agent=payload.get("agent") or original_sender,
+            cost_hint=payload.get("cost_hint"),
         )
         result["messages"] = messages
         return result

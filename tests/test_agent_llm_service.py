@@ -8,6 +8,7 @@ import pytest
 from yuxu.bundled.llm_service.handler import (
     LLMService,
     LLMServiceError,
+    ProviderRateLimitError,
     _strip_thinking_blocks,
 )
 from yuxu.bundled.rate_limit_service.handler import RateLimitService
@@ -173,6 +174,88 @@ async def test_chat_missing_api_key_raises():
     try:
         with pytest.raises(LLMServiceError, match="no api_key"):
             await svc.chat(pool="minimax", model="m", messages=[])
+    finally:
+        await svc.close()
+
+
+# -- provider rate-limit detection (phase 3a) ------------------
+
+
+async def test_http_429_raises_provider_rate_limit_error():
+    def route(req):
+        return httpx.Response(429, text="Too Many Requests",
+                              headers={"Retry-After": "3"})
+    rl, _ = _make_rate_limiter([{"id": "k", "api_key": "x",
+                                  "base_url": "http://a/v1"}])
+    svc = LLMService(rl, client=httpx.AsyncClient(
+        transport=_mock_transport(route)))
+    try:
+        with pytest.raises(ProviderRateLimitError) as exc_info:
+            await svc.chat(pool="minimax", model="m", messages=[])
+        assert exc_info.value.code == "http_429"
+        assert exc_info.value.retry_after_sec == 3.0
+    finally:
+        await svc.close()
+
+
+async def test_minimax_1002_raises_provider_rate_limit_error():
+    def route(req):
+        return httpx.Response(200, json={
+            "base_resp": {"status_code": 1002,
+                          "status_msg": "rate limit exceeded"},
+        })
+    rl, _ = _make_rate_limiter([{"id": "k", "api_key": "x",
+                                  "base_url": "http://a/v1"}])
+    svc = LLMService(rl, client=httpx.AsyncClient(
+        transport=_mock_transport(route)))
+    try:
+        with pytest.raises(ProviderRateLimitError) as exc_info:
+            await svc.chat(pool="minimax", model="m", messages=[])
+        assert exc_info.value.code == "minimax_1002"
+    finally:
+        await svc.close()
+
+
+async def test_minimax_non_zero_non_rate_limit_code_raises_llm_error():
+    """base_resp with a non-rate-limit code still fails, just not as retryable."""
+    def route(req):
+        return httpx.Response(200, json={
+            "base_resp": {"status_code": 1008, "status_msg": "bad token"},
+        })
+    rl, _ = _make_rate_limiter([{"id": "k", "api_key": "x",
+                                  "base_url": "http://a/v1"}])
+    svc = LLMService(rl, client=httpx.AsyncClient(
+        transport=_mock_transport(route)))
+    try:
+        with pytest.raises(LLMServiceError) as exc_info:
+            await svc.chat(pool="minimax", model="m", messages=[])
+        assert not isinstance(exc_info.value, ProviderRateLimitError)
+        assert "1008" in str(exc_info.value)
+    finally:
+        await svc.close()
+
+
+async def test_handle_surfaces_rate_limit_error_kind():
+    def route(req):
+        return httpx.Response(429, text="slow down")
+    rl, _ = _make_rate_limiter([{"id": "k", "api_key": "x",
+                                  "base_url": "http://a/v1"}])
+    svc = LLMService(rl, client=httpx.AsyncClient(
+        transport=_mock_transport(route)))
+
+    class _Msg:
+        def __init__(self, payload):
+            self.payload = payload
+            self.sender = "test_agent"
+
+    try:
+        r = await svc.handle(_Msg({
+            "pool": "minimax", "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        assert r["ok"] is False
+        assert r["error_kind"] == "provider_rate_limit"
+        assert r["error_code"] == "http_429"
     finally:
         await svc.close()
 

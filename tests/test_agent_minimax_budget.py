@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from types import SimpleNamespace
 
 import httpx
@@ -348,7 +349,11 @@ async def test_estimate_inverse_from_tokens():
     await budget.uninstall()
 
 
-async def test_estimate_with_no_history_returns_none_avg():
+async def test_estimate_with_no_history_falls_back_to_default():
+    """No history anywhere → estimate uses DEFAULT_CALL_TOKENS hardcoded default.
+    (Old behavior: None. New: always give SOME number, callers can
+    inspect `cost_source` to know fidelity.)"""
+    from yuxu.bundled.minimax_budget.handler import DEFAULT_CALL_TOKENS
     bus = Bus()
     ctx = _make_ctx(bus, pools={})
     budget = MiniMaxBudget(ctx,
@@ -356,8 +361,10 @@ async def test_estimate_with_no_history_returns_none_avg():
                                transport=_mock_transport_remains([])))
     r = budget.estimate(agent="ghost", n_requests=10)
     assert r["history_requests"] == 0
-    assert r["avg_tokens_per_req"] is None
-    assert r["projected_tokens"] is None
+    assert r["avg_tokens_per_req"] is None  # legacy field still None
+    assert r["cost_source"] == "default"
+    assert r["cost_per_call"] == float(DEFAULT_CALL_TOKENS)
+    assert r["projected_tokens"] == 10 * DEFAULT_CALL_TOKENS
     await budget.uninstall()
 
 
@@ -604,4 +611,182 @@ async def test_llm_service_event_attributes_to_budget():
     assert r[0]["model"] == "MiniMax-M2.7-highspeed"
     assert r[0]["total_tokens"] == 77
     await svc.close()
+    await budget.uninstall()
+
+
+# -- rolling 1h window + cost-per-call fallback (phase 1) -------
+
+
+async def test_rolling_window_tracks_recent_calls():
+    bus = Bus()
+    ctx = _make_ctx(bus, pools={})
+    budget = MiniMaxBudget(ctx,
+                           http_client=httpx.AsyncClient(
+                               transport=_mock_transport_remains([])))
+    for tokens in (100, 200, 300):
+        await budget._on_llm_completed({"topic": COMPLETION_TOPIC,
+                                        "payload": {"agent": "a",
+                                                    "model": "m",
+                                                    "usage": {"total_tokens": tokens}}})
+    calls_1h, tokens_1h = budget._window_stats(("a", "m"))
+    assert calls_1h == 3
+    assert tokens_1h == 600
+    await budget.uninstall()
+
+
+async def test_rolling_window_prunes_old_entries():
+    bus = Bus()
+    ctx = _make_ctx(bus, pools={})
+    budget = MiniMaxBudget(ctx,
+                           http_client=httpx.AsyncClient(
+                               transport=_mock_transport_remains([])))
+    for tokens in (100, 200):
+        await budget._on_llm_completed({"topic": COMPLETION_TOPIC,
+                                        "payload": {"agent": "a",
+                                                    "model": "m",
+                                                    "usage": {"total_tokens": tokens}}})
+    # Age the first entry past the 1h window
+    dq = budget._local[("a", "m")]["window"]
+    dq[0].ts = time.monotonic() - 4000  # > 1 hour
+    calls_1h, tokens_1h = budget._window_stats(("a", "m"))
+    assert calls_1h == 1
+    assert tokens_1h == 200
+    await budget.uninstall()
+
+
+async def test_cost_per_call_uses_per_agent_1h_when_enough_samples():
+    bus = Bus()
+    ctx = _make_ctx(bus, pools={})
+    budget = MiniMaxBudget(ctx,
+                           http_client=httpx.AsyncClient(
+                               transport=_mock_transport_remains([])))
+    # 3 calls — exactly at the threshold (N_MIN_1H)
+    for tokens in (100, 200, 300):
+        await budget._on_llm_completed({"topic": COMPLETION_TOPIC,
+                                        "payload": {"agent": "fast",
+                                                    "model": "m",
+                                                    "usage": {"total_tokens": tokens}}})
+    r = budget.estimate_cost_per_call("fast")
+    assert r["source"] == "per_agent_1h"
+    assert r["value"] == 200.0  # 600 / 3
+    await budget.uninstall()
+
+
+async def test_cost_per_call_falls_back_to_global_mean():
+    """New agent with < N_MIN_1H samples → use cross-agent global mean."""
+    bus = Bus()
+    ctx = _make_ctx(bus, pools={})
+    budget = MiniMaxBudget(ctx,
+                           http_client=httpx.AsyncClient(
+                               transport=_mock_transport_remains([])))
+    # Populate global: 4 calls of 1000 tokens each from another agent
+    for _ in range(4):
+        await budget._on_llm_completed({"topic": COMPLETION_TOPIC,
+                                        "payload": {"agent": "veteran",
+                                                    "model": "m",
+                                                    "usage": {"total_tokens": 1000}}})
+    # Newcomer has only 1 call (below N_MIN_1H=3)
+    await budget._on_llm_completed({"topic": COMPLETION_TOPIC,
+                                    "payload": {"agent": "newbie",
+                                                "model": "m",
+                                                "usage": {"total_tokens": 50}}})
+    r = budget.estimate_cost_per_call("newbie")
+    assert r["source"] == "global_mean"
+    # global_mean = (4000 + 50) / 5 = 810
+    assert r["value"] == pytest.approx(810.0)
+    assert r["calls_1h"] == 1
+    await budget.uninstall()
+
+
+async def test_cost_per_call_default_when_zero_history():
+    from yuxu.bundled.minimax_budget.handler import DEFAULT_CALL_TOKENS
+    bus = Bus()
+    ctx = _make_ctx(bus, pools={})
+    budget = MiniMaxBudget(ctx,
+                           http_client=httpx.AsyncClient(
+                               transport=_mock_transport_remains([])))
+    r = budget.estimate_cost_per_call("nobody")
+    assert r["source"] == "default"
+    assert r["value"] == float(DEFAULT_CALL_TOKENS)
+    await budget.uninstall()
+
+
+async def test_cost_per_call_aggregates_across_models():
+    """An agent using two models — 1h rolling combines both."""
+    bus = Bus()
+    ctx = _make_ctx(bus, pools={})
+    budget = MiniMaxBudget(ctx,
+                           http_client=httpx.AsyncClient(
+                               transport=_mock_transport_remains([])))
+    await budget._on_llm_completed({"topic": COMPLETION_TOPIC,
+                                    "payload": {"agent": "multi",
+                                                "model": "m1",
+                                                "usage": {"total_tokens": 100}}})
+    await budget._on_llm_completed({"topic": COMPLETION_TOPIC,
+                                    "payload": {"agent": "multi",
+                                                "model": "m1",
+                                                "usage": {"total_tokens": 200}}})
+    await budget._on_llm_completed({"topic": COMPLETION_TOPIC,
+                                    "payload": {"agent": "multi",
+                                                "model": "m2",
+                                                "usage": {"total_tokens": 600}}})
+    r = budget.estimate_cost_per_call("multi")
+    assert r["source"] == "per_agent_1h"
+    assert r["value"] == pytest.approx(300.0)  # (100 + 200 + 600) / 3
+    await budget.uninstall()
+
+
+async def test_handle_cost_per_call_op():
+    bus = Bus()
+    ctx = _make_ctx(bus, pools={})
+    budget = MiniMaxBudget(ctx,
+                           http_client=httpx.AsyncClient(
+                               transport=_mock_transport_remains([])))
+    for tokens in (100, 150, 200):
+        await budget._on_llm_completed({"topic": COMPLETION_TOPIC,
+                                        "payload": {"agent": "z", "model": "m",
+                                                    "usage": {"total_tokens": tokens}}})
+
+    class _Msg:
+        def __init__(self, p):
+            self.payload = p
+
+    r = await budget.handle(_Msg({"op": "cost_per_call", "agent": "z"}))
+    assert r["ok"] is True
+    assert r["agent"] == "z"
+    assert r["source"] == "per_agent_1h"
+    assert r["value"] == 150.0
+    await budget.uninstall()
+
+
+async def test_reset_local_all_wipes_globals_too():
+    bus = Bus()
+    ctx = _make_ctx(bus, pools={})
+    budget = MiniMaxBudget(ctx,
+                           http_client=httpx.AsyncClient(
+                               transport=_mock_transport_remains([])))
+    await budget._on_llm_completed({"topic": COMPLETION_TOPIC,
+                                    "payload": {"agent": "a", "model": "m",
+                                                "usage": {"total_tokens": 100}}})
+    assert budget._global_calls == 1
+    budget.reset_local()
+    assert budget._global_calls == 0
+    assert budget._global_tokens == 0
+    await budget.uninstall()
+
+
+async def test_agent_usage_includes_rolling_fields():
+    bus = Bus()
+    ctx = _make_ctx(bus, pools={})
+    budget = MiniMaxBudget(ctx,
+                           http_client=httpx.AsyncClient(
+                               transport=_mock_transport_remains([])))
+    for tokens in (100, 200):
+        await budget._on_llm_completed({"topic": COMPLETION_TOPIC,
+                                        "payload": {"agent": "a", "model": "m",
+                                                    "usage": {"total_tokens": tokens}}})
+    r = budget.agent_usage()["usage"]
+    assert r[0]["calls_1h"] == 2
+    assert r[0]["tokens_1h"] == 300
+    assert r[0]["avg_tokens_per_req_1h"] == 150.0
     await budget.uninstall()

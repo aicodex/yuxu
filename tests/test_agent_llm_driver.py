@@ -488,3 +488,140 @@ async def test_handle_passes_strip_thinking_blocks():
         "strip_thinking_blocks": True,
     }})())
     assert seen[0].get("strip_thinking_blocks") is True
+
+
+# -- v0.2 provider rate-limit retry loop -----------------------
+
+
+async def test_retry_succeeds_on_second_attempt():
+    bus = Bus()
+    idx = [0]
+
+    async def handler(msg):
+        idx[0] += 1
+        if idx[0] == 1:
+            return {"ok": False, "error": "MiniMax 1002: rate limit",
+                    "error_kind": "provider_rate_limit",
+                    "error_code": "minimax_1002"}
+        return {"ok": True, "content": "done", "tool_calls": [], "usage": {}}
+
+    bus.register("llm_service", handler)
+    driver = LlmDriver(bus)
+    driver.RETRY_BACKOFF_BASE_SEC = 0.01
+    r = await driver.run_turn(system_prompt="s", messages=[],
+                              pool="p", model="m", agent="caller")
+    assert r["ok"] is True
+    assert r["retries"] == 1
+    assert r["content"] == "done"
+
+
+async def test_retry_sets_priority_flag_on_retry_attempt():
+    bus = Bus()
+    seen: list[dict] = []
+    idx = [0]
+
+    async def handler(msg):
+        seen.append(dict(msg.payload))
+        idx[0] += 1
+        if idx[0] == 1:
+            return {"ok": False, "error": "rate limited",
+                    "error_kind": "provider_rate_limit",
+                    "error_code": "http_429"}
+        return {"ok": True, "content": "ok", "tool_calls": [], "usage": {}}
+
+    bus.register("llm_service", handler)
+    driver = LlmDriver(bus)
+    driver.RETRY_BACKOFF_BASE_SEC = 0.01
+    await driver.run_turn(system_prompt="s", messages=[],
+                          pool="p", model="m", agent="caller")
+    assert "priority" not in seen[0] or seen[0].get("priority") == "normal"
+    assert seen[1]["priority"] == "retry"
+
+
+async def test_retry_gives_up_after_max_attempts():
+    bus = Bus()
+
+    async def handler(msg):
+        return {"ok": False, "error": "always 1002",
+                "error_kind": "provider_rate_limit",
+                "error_code": "minimax_1002"}
+
+    bus.register("llm_service", handler)
+    driver = LlmDriver(bus)
+    driver.MAX_RETRIES_ON_PROVIDER_RATE_LIMIT = 2
+    driver.RETRY_BACKOFF_BASE_SEC = 0.01
+    r = await driver.run_turn(system_prompt="s", messages=[],
+                              pool="p", model="m", agent="caller")
+    assert r["ok"] is False
+    assert r["stop_reason"] == "error"
+    assert "1002" in r["error"]
+    assert r["retries"] == 2  # max attempts = 3 → 2 retries
+
+
+async def test_non_retryable_error_does_not_retry():
+    bus = Bus()
+    call_count = [0]
+
+    async def handler(msg):
+        call_count[0] += 1
+        return {"ok": False, "error": "400 bad request"}
+
+    bus.register("llm_service", handler)
+    driver = LlmDriver(bus)
+    driver.RETRY_BACKOFF_BASE_SEC = 0.01
+    r = await driver.run_turn(system_prompt="s", messages=[],
+                              pool="p", model="m", agent="caller")
+    assert call_count[0] == 1   # no retry
+    assert r["ok"] is False
+    assert r["retries"] == 0
+
+
+async def test_retry_honors_retry_after_hint():
+    bus = Bus()
+    idx = [0]
+    sleep_durations: list[float] = []
+
+    async def handler(msg):
+        idx[0] += 1
+        if idx[0] == 1:
+            return {"ok": False, "error": "slow down",
+                    "error_kind": "provider_rate_limit",
+                    "error_code": "http_429",
+                    "retry_after_sec": 0.05}
+        return {"ok": True, "content": "ok", "tool_calls": [], "usage": {}}
+
+    bus.register("llm_service", handler)
+
+    import yuxu.bundled.llm_driver.handler as _h
+    orig_sleep = _h.asyncio.sleep
+
+    async def record_sleep(t, *args, **kwargs):
+        sleep_durations.append(t)
+        await orig_sleep(0)
+
+    _h.asyncio.sleep = record_sleep
+    try:
+        driver = LlmDriver(bus)
+        driver.RETRY_BACKOFF_BASE_SEC = 0.01
+        r = await driver.run_turn(system_prompt="s", messages=[],
+                                  pool="p", model="m", agent="caller")
+        assert r["ok"] is True
+        assert max(sleep_durations) >= 0.05
+    finally:
+        _h.asyncio.sleep = orig_sleep
+
+
+async def test_agent_and_cost_hint_forwarded_to_llm_service():
+    bus = Bus()
+    seen = _register_llm_capture(bus, {
+        "ok": True, "content": "ok", "tool_calls": [],
+        "stop_reason": "end_turn", "usage": {},
+    })
+    driver = LlmDriver(bus)
+    await driver.run_turn(
+        system_prompt="s", messages=[],
+        pool="p", model="m",
+        agent="reflection_agent", cost_hint=1234,
+    )
+    assert seen[0]["agent"] == "reflection_agent"
+    assert seen[0]["cost_hint"] == 1234
