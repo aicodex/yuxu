@@ -72,47 +72,59 @@ doubt, it's probably an agent.
 `persistent` (always on) / `scheduled` (cron) / `triggered` (event) /
 `one_shot` (explicit) / `spawned` (by parent). Every agent declares one.
 
-### I6. Three-layer scope for behavior-shaping data
+### I6. Four-layer scope for behavior-shaping data
 
-"Memory" is a convenient word but **deliberately not formalized** — the
-edge cases are too fuzzy (is `handler.py` memory? the `AGENT.md` body?
-session transcript? `rate_limits.yaml`?). Instead, yuxu formalizes
-**where to go to change agent behavior**. Three scopes, widest to
-narrowest:
+"Memory" is a convenient word but **deliberately not formalized** —
+edge cases are fuzzy (is `handler.py` memory? AGENT.md body? session
+transcript? `rate_limits.yaml`?). yuxu formalizes **where to go to
+change agent behavior** instead. Four scopes:
 
-- **Project** — shared across all agents in one project. Typical:
-  `<project>/data/memory/_shared/` + project config. Themes, domain
-  facts, cross-agent knowledge within one project.
-- **Agent** — one specific agent's persistent state across runs.
-  Includes its `AGENT.md` body, `handler.py`, per-agent memory files,
-  curated notes. Typical: `<project>/agents/<name>/` (code + AGENT.md)
-  plus `<project>/data/memory/<name>/` (data).
-- **Session** — one conversation or run's ephemeral state: transcript,
+- **Global** — cross-project, user-wide. Typical: `~/.yuxu/`.
+  **Reserved empty slot** (like Claude Code's `~/.claude/CLAUDE.md`,
+  which ships empty); active users fill it over time with cross-
+  project preferences, credentials, or meta-rules.
+- **Project** — shared across agents in one project. Typical:
+  `<project>/data/memory/_shared/` + project config.
+- **Agent** — one specific agent's persistent state across runs:
+  `AGENT.md`, `handler.py`, per-agent memory files, curated notes.
+  Typical: `<project>/agents/<name>/` + `<project>/data/memory/<name>/`.
+- **Session** — one conversation / run's ephemeral state: transcript,
   in-flight vars, scratch. Typical:
   `<project>/data/sessions/<agent>[#id]/<key>/`.
 
 Forms are open: today markdown dominates; future may add yaml, sqlite,
-embeddings, images, structured indexes. **The scope tells you where to
-look; the form is orthogonal.**
+embeddings, images. **Scope = where to look; form is orthogonal.**
 
-Reads climb scopes (session → agent → project). Writes that cross a
-scope boundary (e.g. session → agent) go through approval
-(`approval_queue` → `approval_applier`).
+Reads climb scopes (session → agent → project → global). Writes
+crossing a scope boundary go through approval (`approval_queue` →
+`approval_applier`).
 
 **How do I change behavior X?**
-- Change one agent's prompt → its `AGENT.md` (agent scope).
+- One agent's prompt → its `AGENT.md` (agent scope).
   iteration_agent proposes variants as drafts.
-- Change one agent's code → its `handler.py` (agent scope). Human-only
-  for now; iteration_agent v0.5+ may propose variants.
-- Change a conversation's context → session scope files.
-- Add shared project facts → project scope (`_shared/`).
+- One agent's code → its `handler.py` (agent scope). Human-only for
+  now; iteration_agent v0.5+ may propose variants.
+- A conversation's context → session scope files.
+- Cross-project preferences → global scope (empty today; future
+  `/memory` slash command opens an editor).
+- Shared project facts → project scope (`_shared/`).
 
-**What about a global / cross-project scope?** Deliberately deferred.
-Claude Code has one (`~/.claude/CLAUDE.md`), but it's pure user
-convenience — default empty, system works without it. No yuxu bundled
-agent currently needs cross-project data. We'll add a global scope when
-a concrete use case demands it (candidates: user preferences, encrypted
-credentials, cross-project methodology library), not before.
+**How memory is written** (modeled on Claude Code's three paths):
+- **User-initiated** (future): `/memory` slash opens the relevant
+  scope file in `$EDITOR`. Analog: CC `commands/memory/memory.tsx`.
+- **Auto-extraction**: `memory_curator` / `reflection_agent` generate
+  drafts → `approval_queue` → `approval_applier`. Main write path
+  today. Corresponds to CC's background extract system but with
+  explicit draft + approval rather than a standard permission
+  framework.
+- **Direct LLM write**: discouraged at scope boundaries; routed
+  through approval_queue instead.
+
+**Why keep global empty?** Empty slot is free to carry; filling it
+later avoids a migration. CC ships the slot empty; power users fill
+it with meta-rules (tool preferences, coding styles). yuxu does the
+same — when a cross-project use case lands, the path is already
+reserved.
 
 ### I7. User-facing messages are subscription Info Sources
 
