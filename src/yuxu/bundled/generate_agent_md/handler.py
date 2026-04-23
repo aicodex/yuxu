@@ -14,6 +14,7 @@ import re
 from typing import Any
 
 from yuxu.core.frontmatter import parse_frontmatter
+from yuxu.core.principles import load_creation_context
 
 log = logging.getLogger(__name__)
 
@@ -65,7 +66,7 @@ def _build_system_prompt(*, name: str, description: str, run_mode: str,
         f"\nAdditional hints from the caller:\n\"\"\"\n{extra_hints.strip()}\n\"\"\"\n"
         if extra_hints else ""
     )
-    return SYSTEM_PROMPT_TEMPLATE.format(
+    base = SYSTEM_PROMPT_TEMPLATE.format(
         name=name,
         description=description.strip(),
         run_mode=run_mode,
@@ -74,6 +75,21 @@ def _build_system_prompt(*, name: str, description: str, run_mode: str,
         depends_on=depends_on,
         extra_hints_block=extra_block,
     )
+    # Append yuxu's architecture + operational principles so every new
+    # AGENT.md is written in the context of the framework's invariants.
+    # Falls back silently if the doc files are missing (partial install).
+    creation_context = load_creation_context()
+    if creation_context:
+        return (
+            base
+            + "\n\n---\n\n"
+            + "## Reference: yuxu framework context\n\n"
+            + "Use the material below as invariants and operational "
+            + "principles while writing the AGENT.md. Do not copy it "
+            + "into the output; internalize it.\n\n"
+            + creation_context
+        )
+    return base
 
 
 def _strip_outer_fence(text: str) -> str:

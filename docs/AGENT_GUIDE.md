@@ -2,7 +2,38 @@
 
 > Audience: an LLM (or human) creating a new agent from a natural-language
 > need. This is the **recipe book**. For the formal framework contract,
-> see [CORE_INTERFACE.md](CORE_INTERFACE.md); for skills, [SKILL_FORMAT.md](SKILL_FORMAT.md).
+> see [CORE_INTERFACE.md](CORE_INTERFACE.md); for skills, [SKILL_FORMAT.md](SKILL_FORMAT.md);
+> for the core mental model, see [ARCHITECTURE.md](ARCHITECTURE.md).
+
+## Principles (read before creating)
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the invariants (I1–I8). When
+creating a new agent, these operational principles apply — not hard rules,
+but pause and check if you're about to violate one:
+
+- **Dogfood drives** — build a system agent only when real business code
+  needs it. Speculative abstractions accumulate as dead weight; "we might
+  want this later" is usually a sign to wait.
+- **Reuse before invent** — before proposing a new mechanism, grep `docs/`,
+  `bundled/`, and memory for a pre-existing abstraction. Extending a proven
+  pattern beats a parallel new one. If genuinely new, state why.
+- **Respect the core contract** — `src/yuxu/core/` is frozen; don't edit it
+  to solve an agent-level problem. `AgentContext` fields are additive-only.
+- **Mechanism vs policy** — high-frequency, no-semantics, always-stable
+  code goes in core; event-driven, decision-making, replaceable logic goes
+  in an agent. When in doubt, it's an agent.
+- **User-facing streams flow through Feed** — don't call `gateway.send`
+  directly from business logic. Register an Info Source; the main reply is
+  a `forced` subscription. See `docs/subscription_model.md`.
+- **Asymmetric iteration signals** — for any agent that scores itself or
+  another agent, weight success higher than failure (e.g. +5 vs −1).
+  Failure is common; rare success is the load-bearing signal.
+
+These principles are **injected into the system prompts of agent-creation
+skills** (`generate_agent_md`, `classify_intent`, and `harness_pro_max`)
+so they are read every time a new agent is being built. For everyday
+development of existing agents, these apply too, but they are not forced
+into every session.
 
 ## Agent vs. skill — pick before you scaffold
 

@@ -13,6 +13,8 @@ import os
 import re
 from typing import Any
 
+from yuxu.core.principles import load_creation_context
+
 log = logging.getLogger(__name__)
 
 REQUIRED_KEYS = ("agent_type", "suggested_name", "run_mode",
@@ -41,6 +43,23 @@ Rules:
   cron trigger → scheduled).
 - Don't invent depends_on entries. Only include agents you'd actually use.
 - Output STRICT JSON only — no prose, no markdown fences."""
+
+
+def _system_prompt_with_context() -> str:
+    """Append yuxu architecture + principles to the classifier prompt so
+    classification decisions (run_mode, driver, depends_on) are consistent
+    with framework invariants. Falls back silently if docs missing."""
+    creation_context = load_creation_context()
+    if not creation_context:
+        return SYSTEM_PROMPT
+    return (
+        SYSTEM_PROMPT
+        + "\n\n---\n\n"
+        + "## Reference: yuxu framework context\n\n"
+        + "Use the material below when picking run_mode, driver, and "
+        + "depends_on. Do not copy any of it into the output JSON.\n\n"
+        + creation_context
+    )
 
 
 def _build_user_message(description: str, available_templates: list[str]) -> str:
@@ -114,7 +133,7 @@ async def execute(input: dict, ctx) -> dict:
     try:
         resp = await ctx.bus.request("llm_driver", {
             "op": "run_turn",
-            "system_prompt": SYSTEM_PROMPT,
+            "system_prompt": _system_prompt_with_context(),
             "messages": [{"role": "user",
                           "content": _build_user_message(description, available)}],
             "pool": pool,
