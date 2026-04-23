@@ -36,8 +36,12 @@ from yuxu.bundled.reflection_agent.handler import (
 log = logging.getLogger(__name__)
 
 COMMAND = "/curate"
-COMMAND_HELP = ("Extract improvements + propose memory edits from a session "
-                "transcript. Usage: `/curate [hint]` (reads configured sources).")
+COMMAND_HELP = (
+    "Extract improvements + propose memory edits from a session transcript. "
+    "Usage: `/curate [hint]` — reads configured sources; "
+    "`/curate auto` — focuses on the worst-performing agent via performance_ranker."
+)
+AUTO_KEYWORD = "auto"
 
 # Thresholds --------------------------------------------------
 
@@ -259,9 +263,13 @@ class MemoryCurator:
             return
         session_key = payload.get("session_key", "")
         args = (payload.get("args") or "").strip()
-        hint = args or None
-        result = await self.curate(context_hint=hint)
-        quote = f"{COMMAND} {args}".strip() if args else COMMAND
+        if args.lower() == AUTO_KEYWORD:
+            result = await self.curate(auto=True)
+            quote = f"{COMMAND} {AUTO_KEYWORD}"
+        else:
+            hint = args or None
+            result = await self.curate(context_hint=hint)
+            quote = f"{COMMAND} {args}".strip() if args else COMMAND
         await self._reply(session_key, result, quote_text=quote)
 
     # -- core flow -------------------------------------------------
@@ -282,15 +290,57 @@ class MemoryCurator:
                 return cand / "data" / "sessions"
         return Path.cwd() / "data" / "sessions"
 
+    async def _resolve_auto_hint(self) -> tuple[Optional[str], Optional[dict]]:
+        """Ask performance_ranker for the worst agent and return
+        (hint_string, ranker_row), or (None, None) if unavailable."""
+        try:
+            r = await self.ctx.bus.request(
+                "performance_ranker", {"op": "rank", "limit": 1},
+                timeout=2.0,
+            )
+        except LookupError:
+            return None, None
+        except Exception:
+            log.exception("memory_curator: performance_ranker request raised")
+            return None, None
+        if not isinstance(r, dict) or not r.get("ok"):
+            return None, None
+        ranked = r.get("ranked") or []
+        if not ranked:
+            return None, None
+        top = ranked[0]
+        window = r.get("window_hours", 24)
+        hint = (
+            f"Focus curation on agent `{top['agent']}` — it has accumulated "
+            f"{top['errors']} error(s) and {top['rejections']} rejection(s) "
+            f"in the last {window}h (score={top['score']:.1f}). "
+            "Prefer improvements / memory edits that would help this agent."
+        )
+        return hint, top
+
     async def curate(self, *,
                      sources: Optional[list[str]] = None,
                      transcript: Optional[str] = None,
                      context_hint: Optional[str] = None,
+                     auto: bool = False,
                      memory_root: Optional[Path | str] = None,
                      pool: Optional[str] = None,
                      model: Optional[str] = None) -> dict:
         run_id = uuid.uuid4().hex[:8]
         warnings: list[str] = []
+        auto_target: Optional[dict] = None
+        # Auto mode: query ranker and merge its hint with caller's (caller's
+        # hint wins position, ranker's appends). Ranker unavailable → warn
+        # and proceed without auto hint (soft failure, unlike reflection).
+        if auto:
+            auto_hint, auto_target = await self._resolve_auto_hint()
+            if auto_hint is None:
+                warnings.append("auto mode: performance_ranker unavailable "
+                                "or no struggling agents; proceeding without "
+                                "auto hint")
+            else:
+                context_hint = (f"{context_hint}\n\n{auto_hint}"
+                                 if context_hint else auto_hint)
         mem_root = self._resolve_memory_root(memory_root)
         drafts_dir = mem_root / "_drafts"
         log_path = mem_root / "_improvement_log.md"
@@ -407,6 +457,7 @@ class MemoryCurator:
             "summary": summary,
             "warnings": warnings,
             "memory_root": str(mem_root),
+            **({"auto_target": auto_target} if auto_target else {}),
             "llm_stats": {
                 "n_calls": 1,
                 "elapsed_ms": round(llm_elapsed_ms, 2),
@@ -474,6 +525,7 @@ class MemoryCurator:
             sources=payload.get("sources"),
             transcript=payload.get("transcript"),
             context_hint=payload.get("context_hint"),
+            auto=bool(payload.get("auto", False)),
             memory_root=payload.get("memory_root"),
             pool=payload.get("pool"), model=payload.get("model"),
         )

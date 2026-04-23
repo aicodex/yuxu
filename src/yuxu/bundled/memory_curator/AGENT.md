@@ -4,7 +4,7 @@ run_mode: persistent
 scope: system
 edit_warning: true
 depends_on: [llm_driver]
-optional_deps: [gateway, approval_queue, scheduler]
+optional_deps: [gateway, approval_queue, scheduler, performance_ranker]
 ready_timeout: 5
 ---
 # memory_curator
@@ -57,11 +57,22 @@ yuxu 审批闭环（structured memory edit 必经 approval_queue）。
 | op | payload | 返回 |
 |---|---|---|
 | `curate` | `{sources?, transcript?, context_hint?, memory_root?, pool?, model?}` | `{ok, log_entries: int, drafts, approval_ids, summary, warnings}` |
+| `curate` (auto) | `{auto: true, context_hint?, ...}` | 同上，`context_hint` 会自动追加 worst-agent 信息 |
 | `status` | `{}` | `{ok, log_path, log_bytes, improvements_total}` |
 
 `sources` 同 reflection_agent（文件路径 / 目录 / glob 都行）；
 `transcript` 是直接传 text，绕过文件加载；
 二者至少一个。`context_hint` 是可选提示（"this was a design debate about X"）。
+
+**`auto: true`**: 先向 `performance_ranker` 查 `rank {limit:1}` 拿最差 agent，
+把"focus curation on agent X, which has N errors and M rejections..."合并
+进 context_hint 后走正常流程。用户 hint 不被覆盖，在前、ranker 追加在后。
+ranker 未加载或无候选 → 跳过 auto hint、照常 curate（不报错），warnings 记一条。
+
+## Slash command
+
+- `/curate [hint]` — 直接传 hint 走正常 curate
+- `/curate auto` — 走 auto 模式（ranker 选 focus agent）
 
 ## 发出的事件
 

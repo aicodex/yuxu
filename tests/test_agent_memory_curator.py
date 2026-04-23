@@ -472,3 +472,186 @@ async def test_handle_unknown_op(tmp_path):
     r = await curator.handle(_Msg({"op": "weird"}))
     assert r["ok"] is False
     assert "unknown op" in r["error"]
+
+
+# -- auto target via performance_ranker (dogfood integration) ----
+
+
+async def test_resolve_auto_hint_synthesizes_from_ranker(tmp_path):
+    bus = Bus()
+
+    async def fake_ranker(msg):
+        return {"ok": True, "window_hours": 24,
+                "ranked": [{"agent": "harness_pro_max", "score": 5.0,
+                             "errors": 3, "rejections": 1}]}
+
+    bus.register("performance_ranker", fake_ranker)
+    ctx = _make_ctx(tmp_path, bus)
+    curator = MemoryCurator(ctx)
+    hint, top = await curator._resolve_auto_hint()
+    assert top["agent"] == "harness_pro_max"
+    assert "harness_pro_max" in hint
+    assert "3 error" in hint
+    assert "1 rejection" in hint
+
+
+async def test_resolve_auto_hint_ranker_missing(tmp_path):
+    bus = Bus()
+    ctx = _make_ctx(tmp_path, bus)
+    curator = MemoryCurator(ctx)
+    hint, top = await curator._resolve_auto_hint()
+    assert hint is None and top is None
+
+
+async def test_resolve_auto_hint_empty_rank(tmp_path):
+    bus = Bus()
+
+    async def fake_ranker(msg):
+        return {"ok": True, "window_hours": 24, "ranked": []}
+
+    bus.register("performance_ranker", fake_ranker)
+    ctx = _make_ctx(tmp_path, bus)
+    curator = MemoryCurator(ctx)
+    hint, _ = await curator._resolve_auto_hint()
+    assert hint is None
+
+
+async def test_curate_auto_merges_ranker_hint_with_user_hint(tmp_path):
+    """User's context_hint comes first; ranker's auto-hint appends after."""
+    bus = Bus()
+
+    async def fake_ranker(msg):
+        return {"ok": True, "window_hours": 24,
+                "ranked": [{"agent": "flaky_bot", "score": 4.0,
+                             "errors": 4, "rejections": 0}]}
+
+    bus.register("performance_ranker", fake_ranker)
+    seen_llm = _register_llm(bus, _llm_payload())
+
+    ctx = _make_ctx(tmp_path, bus)
+    curator = MemoryCurator(ctx)
+    await curator.curate(transcript=_long_transcript(),
+                         context_hint="my own hint",
+                         auto=True)
+    assert len(seen_llm) == 1
+    sys_prompt = seen_llm[0]["system_prompt"]
+    # Both user hint and ranker hint should appear
+    assert "my own hint" in sys_prompt
+    assert "flaky_bot" in sys_prompt
+    # User hint comes first
+    assert sys_prompt.index("my own hint") < sys_prompt.index("flaky_bot")
+
+
+async def test_curate_auto_records_auto_target(tmp_path):
+    bus = Bus()
+
+    async def fake_ranker(msg):
+        return {"ok": True, "window_hours": 24,
+                "ranked": [{"agent": "worst_bot", "score": 8.0,
+                             "errors": 2, "rejections": 3}]}
+
+    bus.register("performance_ranker", fake_ranker)
+    _register_llm(bus, _llm_payload())
+    ctx = _make_ctx(tmp_path, bus)
+    curator = MemoryCurator(ctx)
+    r = await curator.curate(transcript=_long_transcript(), auto=True)
+    assert r["ok"] is True
+    assert r["auto_target"]["agent"] == "worst_bot"
+
+
+async def test_curate_auto_warns_but_proceeds_when_ranker_missing(tmp_path):
+    """Soft failure: missing ranker records a warning, still curates."""
+    bus = Bus()  # no ranker
+    _register_llm(bus, _llm_payload())
+    ctx = _make_ctx(tmp_path, bus)
+    curator = MemoryCurator(ctx)
+    r = await curator.curate(transcript=_long_transcript(), auto=True)
+    assert r["ok"] is True  # proceeded despite auto unavailable
+    assert "auto_target" not in r
+    assert any("performance_ranker unavailable" in w
+               for w in r["warnings"])
+
+
+async def test_handle_auto_true_forwards_to_curate(tmp_path):
+    bus = Bus()
+
+    async def fake_ranker(msg):
+        return {"ok": True, "window_hours": 24,
+                "ranked": [{"agent": "x_bot", "score": 1.0,
+                             "errors": 1, "rejections": 0}]}
+
+    bus.register("performance_ranker", fake_ranker)
+    _register_llm(bus, _llm_payload())
+    ctx = _make_ctx(tmp_path, bus)
+    curator = MemoryCurator(ctx)
+    r = await curator.handle(_Msg({
+        "op": "curate", "auto": True,
+        "transcript": _long_transcript(),
+    }))
+    assert r["ok"] is True
+    assert r["auto_target"]["agent"] == "x_bot"
+
+
+async def test_slash_auto_keyword_triggers_auto_mode(tmp_path):
+    bus = Bus()
+    ranker_called = [False]
+
+    async def fake_ranker(msg):
+        ranker_called[0] = True
+        return {"ok": True, "window_hours": 24,
+                "ranked": [{"agent": "b", "score": 1.0,
+                             "errors": 1, "rejections": 0}]}
+
+    bus.register("performance_ranker", fake_ranker)
+    _register_llm(bus, _llm_payload())
+
+    async def fake_gateway(msg):
+        return {"ok": True}
+
+    bus.register("gateway", fake_gateway)
+    ctx = _make_ctx(tmp_path, bus)
+    # Need a session dir so default source loader has something to find
+    (tmp_path / "proj" / "data" / "sessions").mkdir(parents=True)
+    (tmp_path / "proj" / "data" / "sessions" / "s.md").write_text(
+        _long_transcript()
+    )
+
+    curator = MemoryCurator(ctx)
+    await curator._on_command({
+        "topic": "gateway.command_invoked",
+        "payload": {"command": COMMAND, "args": "auto",
+                    "session_key": "console:test"},
+    })
+    await asyncio.sleep(0.02)
+    assert ranker_called[0] is True
+
+
+async def test_slash_explicit_hint_does_not_query_ranker(tmp_path):
+    bus = Bus()
+    ranker_called = [False]
+
+    async def fake_ranker(msg):
+        ranker_called[0] = True
+        return {"ok": True, "window_hours": 24, "ranked": []}
+
+    bus.register("performance_ranker", fake_ranker)
+    _register_llm(bus, _llm_payload())
+
+    async def fake_gateway(msg):
+        return {"ok": True}
+
+    bus.register("gateway", fake_gateway)
+    ctx = _make_ctx(tmp_path, bus)
+    (tmp_path / "proj" / "data" / "sessions").mkdir(parents=True)
+    (tmp_path / "proj" / "data" / "sessions" / "s.md").write_text(
+        _long_transcript()
+    )
+
+    curator = MemoryCurator(ctx)
+    await curator._on_command({
+        "topic": "gateway.command_invoked",
+        "payload": {"command": COMMAND, "args": "focus on the CLI",
+                    "session_key": "console:test"},
+    })
+    await asyncio.sleep(0.02)
+    assert ranker_called[0] is False
