@@ -135,6 +135,41 @@ it with meta-rules (tool preferences, coding styles). yuxu does the
 same — when a cross-project use case lands, the path is already
 reserved.
 
+**Memory access discipline — lazy, tool-mediated, never auto-injected.**
+Validated against OpenClaw and Hermes: OpenClaw is fully lazy (tools
+`memory_search` / `memory_get`, no snapshot); Hermes freezes a snapshot
+at session start specifically to preserve Anthropic prefix cache —
+that optimization doesn't apply to providers yuxu uses today, and
+auto-injection doesn't scale past a few hundred entries regardless.
+yuxu commits to the lazy model:
+
+- **Never auto-inject memory into prompts.** All access goes through
+  the `memory` skill ops (`list` / `get` / `search` / `stats`). Agents
+  that `rglob` memory files directly violate the contract; the
+  current eager `_load_sources` inside `memory_curator` is a
+  dev-phase shortcut and must be refactored to use the skill before
+  iteration_agent consumes memory.
+- **Progressive disclosure levels** (implemented incrementally as
+  scale demands):
+  - L0 `memory.stats` — counts by type / scope / recency bucket;
+    payload size independent of total entry count
+  - L1 `memory.list {type?, scope?, tag?, since?, limit?}` — filtered
+    index (frontmatter only)
+  - L2 `memory.get {path}` — one entry's body
+  - Cross-cut `memory.search {query, limit}` — ranked top-K, not
+    full index
+- **Frontmatter contract.** Every entry MUST have `name` +
+  `description` + `type`. MAY have `tags: [...]` (L1 filter) and
+  `updated: YYYY-MM-DD` (recency / decay). Missing required fields
+  → skipped from index.
+- **Scope-internal stratification is optional.** Within a scope,
+  entries MAY be further split (e.g. durable `MEMORY.md` vs transient
+  daily notes, per OpenClaw's pattern). Not mandatory for MVP; the
+  `memory` skill sees all files uniformly until stratification lands.
+- **Search / decay / SQLite index** are deferred to when real scale
+  hits (~500+ entries). The op surface above is stable; the backend
+  can change transparently.
+
 ### I7. User-facing messages are subscription Info Sources
 
 Any stream to the user (reply, reasoning, tool trace, dashboard,
