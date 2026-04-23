@@ -28,6 +28,13 @@ but pause and check if you're about to violate one:
 - **Asymmetric iteration signals** — for any agent that scores itself or
   another agent, weight success higher than failure (e.g. +5 vs −1).
   Failure is common; rare success is the load-bearing signal.
+- **Iteration priority** — when an orchestrator (or an agent itself)
+  picks what to improve next, compute a weighted score with factors in
+  this order of weight: (1) user attention — complaints, `/improve`,
+  recent rejections; (2) error / rejection rate from
+  `performance_ranker`; (3) token inefficiency — value per token
+  consumed. The top-scoring agent gets the next iteration slot. Unused
+  budget goes to background exploration, never to idle.
 
 These principles are **injected into the system prompts of agent-creation
 skills** (`generate_agent_md`, `classify_intent`, and `harness_pro_max`)

@@ -10,6 +10,11 @@ complementary docs. This doc changes rarely.
 - Nature: a **long-lived agent OS**, not an SDK. 7×24 autonomous;
   systemd pulls it up; users observe and approve, don't chat at it.
 - Package: pip `yuxu`; projects depend on it.
+- **What an agent is, conceptually**: a **reusable workflow** — a named,
+  versioned, reusable unit of work that can be invoked, subscribed to,
+  iterated on, and recombined. "Workflow" is broader than "prompt" or
+  "function"; an agent holds the policy, dependencies, and state needed
+  to repeat a job well.
 
 ## Vision (north star)
 
@@ -91,6 +96,27 @@ Dashboards subscribe to the same sources, uniformly. See
 
 `src/yuxu/core/` API is frozen. Adding fields to `AgentContext` is
 additive-only; never rename/remove. Changes need explicit eng review.
+
+### I9. Iteration is continuous and budget-bound
+
+Agents evolve indefinitely — reflection, curation, prompt variants,
+workflow edits. The **only hard ceiling is the request budget** (MiniMax
+5h interval, token plan, etc.). When the budget has headroom, yuxu
+actively picks which agent to iterate next; when tight, it falls back to
+the reservation floor (see `minimax_budget`).
+
+Priority is a **weighted score**, highest first:
+
+1. **User attention** — complaints, explicit `/improve` calls, recently
+   rejected outputs, stuck approvals.
+2. **Error and rejection rate** — per `performance_ranker`'s negative-
+   signal accumulation.
+3. **Token inefficiency** — value per token consumed (an agent that
+   burns budget for little business output ranks up).
+
+These combine into one score; the top-ranked agent gets the next
+iteration slot. Unused headroom is spent on background exploration
+(research, corpus build-up, memory consolidation) — never left idle.
 
 ## Lifecycle states
 
