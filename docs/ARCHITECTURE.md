@@ -296,12 +296,31 @@ drafts, session archives, existing index).
 
 **Staleness as a hard threshold.**
 Entries with `updated` older than a configurable window (initial
-30 days) auto-demote one level unless recently touched by a
-successful retrieval. Adapted from Slime's sample-level staleness
-check in off-policy RL: when the underlying behavior distribution
-has drifted, prior validation is no longer reliable evidence. A
-stale `validated` entry that hasn't been exercised in a month
-cannot be trusted at validated tier just because it once was.
+30 days) auto-demote one evidence level. Adapted from Slime's
+sample-level staleness check in off-policy RL: when the underlying
+behavior distribution has drifted, prior validation is no longer
+reliable evidence. A stale `validated` entry that hasn't been
+touched in a month cannot be trusted at validated tier just
+because it once was.
+
+Runtime lives in `performance_ranker` as a periodic background
+sweep (default 24h interval). Policy:
+- `validated → consensus → observed → speculative`; `speculative`
+  is the floor (no further demotion)
+- `tags: [mandatory, ...]` entries exempt (hard rules don't age)
+- entries without `updated` not judged (no basis to date)
+- demotion resets `updated` to today so a single sweep does not
+  walk a stale entry all the way down
+- each demotion publishes `memory.demoted`
+
+v0 uses strict content age (`updated` only). The "recently touched
+by successful retrieval" qualifier from the original ROLL/Slime
+framing waits on outcome attribution signals that only
+iteration_agent can supply; until then the `score.last_evaluated`
+field (written by Phase 4 bookkeeping and by probation resets) is
+noisier than it is signal, and extending staleness to consider it
+would mix content-age and retrieval-recency in ways that weaken
+both axes.
 
 ### I7. User-facing messages are subscription Info Sources
 

@@ -39,6 +39,28 @@ v0.1 信号（两种）：
 - **排名不受污染**。memory.retrieved 不进入 agent 错误/拒绝的滑动窗口，
   `rank` / `score` / `reset` 语义不变。
 
+## Staleness auto-demote
+
+后台定时任务（默认 24h，`PERFORMANCE_RANKER_SWEEP_INTERVAL_HOURS`）扫所有
+已知 memory root，对 `updated` 字段超过
+`PERFORMANCE_RANKER_STALENESS_WINDOW_DAYS`（默认 30 天）的条目做**一级降级**
+（`validated → consensus → observed → speculative`；`speculative` 为底，不再下降）。
+被降级条目的 `updated` 重置为今天，避免下次 sweep 立刻再降。
+
+- **roots 的来源**：每次 `memory.retrieved` 事件把 payload 里的
+  `memory_root` 记到集合里；注入到 agent 的 `memory_root=` 参数也会预
+  注册。所以第一次 sweep 前必须要有至少一次 retrieval。测试可直接调
+  `sweep_staleness` op 并传 `memory_root`。
+- **豁免**：`tags` 含 `mandatory` 的条目不过期（硬规则）；没有
+  `updated` 字段的条目不判断（无法定年龄）；evidence_level 为未知值的
+  条目不动（不造惊喜）。
+- **直写，不走 approval**：和 probation 清除同样路径——系统机械动作，
+  归档留档通过 `_archive` 保底已有；降级是保守动作（不会提权）。
+- **事件**：每次降级发 `memory.demoted` 事件，payload 含
+  `{path, memory_root, from_level, to_level, age_days, reason}`。
+- **启动不立即 sweep**：避免重启风暴；第一次 sweep 发生在一个完整
+  interval 之后。需要立刻跑用 `sweep_staleness` op。
+
 ## 窗口
 
 滑动窗口默认 24 小时（env `PERFORMANCE_RANKER_WINDOW_HOURS`）。过期事件
@@ -51,6 +73,7 @@ v0.1 信号（两种）：
 | `rank` | `{limit?: int, min_score?: float}` | `{ok, window_hours, ranked: [{agent, score, errors, rejections}]}` — 默认降序 |
 | `score` | `{agent: str}` | `{ok, agent, window_hours, score, errors, rejections}` |
 | `reset` | `{agent?: str}` | `{ok, cleared: int}` — 省略 agent 则清空全部 |
+| `sweep_staleness` | `{memory_root?: str}` | `{ok, demoted: [...]}` — 同步跑一次 staleness 扫描；payload 可选追加一个 root（正常运行时 roots 从 `memory.retrieved` 事件自动收集） |
 
 ## 用途（将来）
 

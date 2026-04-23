@@ -4,11 +4,18 @@ from __future__ import annotations
 import asyncio
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from yuxu.bundled.performance_ranker.handler import (
-    NAME, PerformanceRanker, _bump_applied,
+    MEMORY_DEMOTED_TOPIC,
+    NAME,
+    PerformanceRanker,
+    _bump_applied,
+    _demote_for_staleness,
+    _demote_level,
+    _parse_date,
 )
 from yuxu.core.bus import Bus
 from yuxu.core.frontmatter import parse_frontmatter
@@ -394,3 +401,242 @@ async def test_loader_subscribes_to_memory_retrieved(bundled_dir, tmp_path: Path
     assert fm["score"]["applied"] == 3
     assert fm.get("probation") is False
     await loader.stop("performance_ranker")
+
+
+# -- staleness auto-demote (I6) --------------------------------
+
+
+import datetime as _dt
+
+
+ENTRY_VALIDATED_STALE = """---
+name: Old Validated
+description: a stale validated entry
+type: feedback
+evidence_level: validated
+updated: 2026-01-01
+---
+body
+"""
+
+ENTRY_OBSERVED_FRESH = """---
+name: Fresh Observed
+description: written yesterday
+type: feedback
+evidence_level: observed
+updated: {today}
+---
+body
+"""
+
+ENTRY_MANDATORY_STALE = """---
+name: Mandatory Rule
+description: never ages
+type: feedback
+evidence_level: validated
+tags: [mandatory]
+updated: 2026-01-01
+---
+body
+"""
+
+ENTRY_SPECULATIVE_STALE = """---
+name: Already Floor
+description: can't go lower
+type: reference
+evidence_level: speculative
+updated: 2026-01-01
+---
+body
+"""
+
+ENTRY_NO_UPDATED = """---
+name: No Date
+description: no updated field
+type: feedback
+evidence_level: observed
+---
+body
+"""
+
+
+async def test_parse_date_handles_common_shapes():
+    assert _parse_date("2026-04-24") == _dt.date(2026, 4, 24)
+    # tolerates datetime-as-str longer than 10 chars
+    assert _parse_date("2026-04-24T10:00:00") == _dt.date(2026, 4, 24)
+    assert _parse_date(_dt.date(2026, 4, 24)) == _dt.date(2026, 4, 24)
+    assert _parse_date(_dt.datetime(2026, 4, 24, 10)) == _dt.date(2026, 4, 24)
+    assert _parse_date(None) is None
+    assert _parse_date("not a date") is None
+
+
+async def test_demote_level_walks_down():
+    assert _demote_level("validated") == "consensus"
+    assert _demote_level("consensus") == "observed"
+    assert _demote_level("observed") == "speculative"
+    # floor
+    assert _demote_level("speculative") is None
+    # unknown level refuses to mutate
+    assert _demote_level("gold") is None
+    assert _demote_level(None) is None
+
+
+async def test_demote_for_staleness_demotes_validated(tmp_path: Path):
+    p = _write_entry(tmp_path, "a.md", ENTRY_VALIDATED_STALE)
+    report = _demote_for_staleness(
+        p, window_days=30, today=_dt.date(2026, 4, 24),
+    )
+    assert report is not None
+    assert report["from_level"] == "validated"
+    assert report["to_level"] == "consensus"
+    assert report["age_days"] > 30
+    fm = _fm_of(p)
+    assert fm["evidence_level"] == "consensus"
+    # updated was bumped forward to avoid immediate re-demote
+    # (yaml loader coerces YYYY-MM-DD to date; str or date both count)
+    assert _parse_date(fm["updated"]) == _dt.date(2026, 4, 24)
+
+
+async def test_demote_for_staleness_skips_fresh(tmp_path: Path):
+    today = _dt.date(2026, 4, 24)
+    p = _write_entry(tmp_path, "a.md",
+                     ENTRY_OBSERVED_FRESH.format(today=today.isoformat()))
+    report = _demote_for_staleness(p, window_days=30, today=today)
+    assert report is None
+    fm = _fm_of(p)
+    assert fm["evidence_level"] == "observed"
+
+
+async def test_demote_for_staleness_exempts_mandatory(tmp_path: Path):
+    p = _write_entry(tmp_path, "a.md", ENTRY_MANDATORY_STALE)
+    report = _demote_for_staleness(
+        p, window_days=30, today=_dt.date(2026, 4, 24),
+    )
+    assert report is None
+    fm = _fm_of(p)
+    assert fm["evidence_level"] == "validated"
+
+
+async def test_demote_for_staleness_speculative_is_floor(tmp_path: Path):
+    p = _write_entry(tmp_path, "a.md", ENTRY_SPECULATIVE_STALE)
+    report = _demote_for_staleness(
+        p, window_days=30, today=_dt.date(2026, 4, 24),
+    )
+    assert report is None
+    fm = _fm_of(p)
+    assert fm["evidence_level"] == "speculative"
+
+
+async def test_demote_for_staleness_skips_without_updated(tmp_path: Path):
+    p = _write_entry(tmp_path, "a.md", ENTRY_NO_UPDATED)
+    report = _demote_for_staleness(
+        p, window_days=30, today=_dt.date(2026, 4, 24),
+    )
+    assert report is None
+
+
+async def test_sweep_returns_empty_when_no_roots_known():
+    r = PerformanceRanker(Bus())
+    out = await r.sweep_staleness_once()
+    assert out == []
+
+
+async def test_sweep_uses_constructor_override(tmp_path: Path):
+    _write_entry(tmp_path, "a.md", ENTRY_VALIDATED_STALE)
+    _write_entry(tmp_path, "b.md",
+                 ENTRY_OBSERVED_FRESH.format(today="2026-04-24"))
+    bus = Bus()
+    r = PerformanceRanker(bus, staleness_window_days=30,
+                          memory_root=str(tmp_path))
+    # Override is registered on install, but for this unit test we add
+    # it manually to avoid spawning the background task.
+    r._known_memory_roots.add(tmp_path.resolve())
+    events: list[dict] = []
+
+    async def _capture(e):
+        events.append(e.get("payload") or {})
+    bus.subscribe(MEMORY_DEMOTED_TOPIC, _capture)
+    reports = await r.sweep_staleness_once(today=_dt.date(2026, 4, 24))
+    assert len(reports) == 1
+    assert reports[0]["from_level"] == "validated"
+    # bus dispatches subscribers via tasks — let them drain
+    for _ in range(20):
+        if events:
+            break
+        await asyncio.sleep(0.005)
+    assert events and events[0]["to_level"] == "consensus"
+    assert events[0]["path"] == "a.md"
+
+
+async def test_sweep_skips_archive_and_draft_dirs(tmp_path: Path):
+    _write_entry(tmp_path, "_archive/old.md", ENTRY_VALIDATED_STALE)
+    _write_entry(tmp_path, "_drafts/new.md", ENTRY_VALIDATED_STALE)
+    _write_entry(tmp_path, "real.md", ENTRY_VALIDATED_STALE)
+    r = PerformanceRanker(Bus(), memory_root=str(tmp_path))
+    r._known_memory_roots.add(tmp_path.resolve())
+    reports = await r.sweep_staleness_once(today=_dt.date(2026, 4, 24))
+    assert len(reports) == 1
+    assert reports[0]["path"] == "real.md"
+
+
+async def test_memory_retrieved_registers_root_for_sweep(tmp_path: Path):
+    _write_entry(tmp_path, "a.md", ENTRY_VALIDATED_STALE)
+    r = PerformanceRanker(Bus(), memory_root=None)
+    assert not r._known_memory_roots
+    await r._on_memory_retrieved({
+        "topic": "memory.retrieved",
+        "payload": {"paths": ["a.md"], "memory_root": str(tmp_path)},
+    })
+    assert tmp_path.resolve() in r._known_memory_roots
+    reports = await r.sweep_staleness_once(today=_dt.date(2026, 4, 24))
+    assert len(reports) == 1
+
+
+async def test_sweep_op_accepts_memory_root_and_runs(tmp_path: Path):
+    _write_entry(tmp_path, "a.md", ENTRY_VALIDATED_STALE)
+    r = PerformanceRanker(Bus())
+    msg = SimpleNamespace(payload={
+        "op": "sweep_staleness",
+        "memory_root": str(tmp_path),
+    })
+    resp = await r.handle(msg)
+    assert resp["ok"] is True
+    assert len(resp["demoted"]) == 1
+    assert resp["demoted"][0]["from_level"] == "validated"
+
+
+async def test_sweep_demotion_resets_updated(tmp_path: Path):
+    p = _write_entry(tmp_path, "a.md", ENTRY_VALIDATED_STALE)
+    r = PerformanceRanker(Bus(), memory_root=str(tmp_path))
+    r._known_memory_roots.add(tmp_path.resolve())
+    reports = await r.sweep_staleness_once(today=_dt.date(2026, 4, 24))
+    assert reports
+    # second pass on the same day must not demote again
+    reports2 = await r.sweep_staleness_once(today=_dt.date(2026, 4, 24))
+    assert reports2 == []
+    fm = _fm_of(p)
+    assert fm["evidence_level"] == "consensus"
+
+
+async def test_background_sweep_starts_and_can_stop(tmp_path: Path):
+    """Install spawns the background task; uninstall cancels it cleanly."""
+    bus = Bus()
+    # very short interval for deterministic test wake-up, but sweep
+    # runs only if there's something to find. We use override to
+    # preseed a root so sweep has something to scan.
+    r = PerformanceRanker(bus, sweep_interval_hours=1.0 / 3600.0,
+                          memory_root=str(tmp_path))
+    _write_entry(tmp_path, "a.md", ENTRY_VALIDATED_STALE)
+    r.install()
+    assert r._sweep_task is not None
+    # give the loop a tick to enter sleep
+    await asyncio.sleep(0.05)
+    r.uninstall()
+    # task should be cancelled / done within a short grace
+    for _ in range(20):
+        if r._sweep_task is None or (r._sweep_task is not None
+                                      and r._sweep_task.done()):
+            break
+        await asyncio.sleep(0.01)
+    # uninstall cleared the reference
+    assert r._sweep_task is None

@@ -18,13 +18,15 @@ reflection target to focus on.
 """
 from __future__ import annotations
 
+import asyncio
+import datetime as _dt
 import logging
 import os
 import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 from yuxu.bundled._shared import dump_frontmatter
 from yuxu.core.frontmatter import parse_frontmatter
@@ -44,7 +46,22 @@ DEFAULT_WEIGHT_REJECTED = 2.0
 # `PERFORMANCE_RANKER_PROBATION_CLEAR_THRESHOLD`.
 DEFAULT_PROBATION_CLEAR_THRESHOLD = 3
 
+# I6 staleness — entries whose `updated` date is older than this window
+# auto-demote one evidence level. Applied at a periodic sweep, not on
+# every access. `mandatory`-tagged entries are exempt (hard rules don't
+# age). Override via `PERFORMANCE_RANKER_STALENESS_WINDOW_DAYS` /
+# `PERFORMANCE_RANKER_SWEEP_INTERVAL_HOURS`.
+DEFAULT_STALENESS_WINDOW_DAYS = 30
+DEFAULT_SWEEP_INTERVAL_HOURS = 24.0
+
+# Evidence levels, ordered highest → lowest. Demotion moves one slot
+# toward the tail; `speculative` is the floor (no further demotion).
+EVIDENCE_LEVELS = ("validated", "consensus", "observed", "speculative")
+
+INDEX_SKIP_DIRS = {"_archive", "_drafts"}
+
 MEMORY_RETRIEVED_TOPIC = "memory.retrieved"
+MEMORY_DEMOTED_TOPIC = "memory.demoted"
 
 
 def _today() -> str:
@@ -97,6 +114,98 @@ def _bump_applied(path: Path, probation_clear_threshold: int) -> None:
     os.replace(tmp, path)
 
 
+# -- staleness sweep helpers -----------------------------------
+
+
+def _parse_date(value) -> Optional[_dt.date]:
+    """Coerce a frontmatter `updated` value to a date. Accepts date,
+    datetime, or YYYY-MM-DD str; returns None for anything else.
+    """
+    if isinstance(value, _dt.datetime):
+        return value.date()
+    if isinstance(value, _dt.date):
+        return value
+    if isinstance(value, str):
+        try:
+            return _dt.date.fromisoformat(value.strip()[:10])
+        except ValueError:
+            return None
+    return None
+
+
+def _demote_level(level: Optional[str]) -> Optional[str]:
+    """Return the next-lower evidence tier, or None if already at floor
+    (`speculative`) or at an unknown level that we refuse to mutate."""
+    if level not in EVIDENCE_LEVELS:
+        return None
+    idx = EVIDENCE_LEVELS.index(level)
+    if idx >= len(EVIDENCE_LEVELS) - 1:
+        return None
+    return EVIDENCE_LEVELS[idx + 1]
+
+
+def _iter_memory_entries(root: Path) -> Iterable[Path]:
+    if not root.exists():
+        return
+    for p in sorted(root.rglob("*.md")):
+        if not p.is_file():
+            continue
+        rel_parts = p.relative_to(root).parts
+        if any(part in INDEX_SKIP_DIRS for part in rel_parts):
+            continue
+        if p.name.startswith(".") or p.name.startswith("_"):
+            continue
+        yield p
+
+
+def _demote_for_staleness(path: Path, *,
+                            window_days: int,
+                            today: _dt.date) -> Optional[dict]:
+    """Demote `path` one evidence level if its `updated` field is older
+    than `window_days`. Returns a report dict on demotion, else None.
+
+    Exemptions: no frontmatter / no `updated` / mandatory-tagged /
+    already at floor / unparseable date / age within window.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    fm, body = parse_frontmatter(text)
+    if not isinstance(fm, dict) or not fm:
+        return None
+    tags = fm.get("tags") or []
+    if isinstance(tags, list) and "mandatory" in tags:
+        return None
+
+    updated = _parse_date(fm.get("updated"))
+    if updated is None:
+        return None
+    age = (today - updated).days
+    if age < window_days:
+        return None
+
+    current_level = fm.get("evidence_level")
+    new_level = _demote_level(current_level)
+    if new_level is None:
+        return None
+
+    fm["evidence_level"] = new_level
+    fm["updated"] = today.isoformat()
+    head = dump_frontmatter(fm)
+    tail = body if body.startswith("\n") else ("\n" + body)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(head + tail, encoding="utf-8")
+    os.replace(tmp, path)
+    return {
+        "path": str(path),
+        "from_level": current_level,
+        "to_level": new_level,
+        "age_days": age,
+        "reason": "staleness",
+    }
+
+
 @dataclass
 class _Event:
     ts: float
@@ -108,7 +217,10 @@ class PerformanceRanker:
                  window_hours: Optional[float] = None,
                  weight_error: float = DEFAULT_WEIGHT_ERROR,
                  weight_rejected: float = DEFAULT_WEIGHT_REJECTED,
-                 probation_clear_threshold: Optional[int] = None) -> None:
+                 probation_clear_threshold: Optional[int] = None,
+                 staleness_window_days: Optional[int] = None,
+                 sweep_interval_hours: Optional[float] = None,
+                 memory_root: Optional[str] = None) -> None:
         self.bus = bus
         self.window_hours = float(
             window_hours if window_hours is not None
@@ -122,7 +234,20 @@ class PerformanceRanker:
             else os.environ.get("PERFORMANCE_RANKER_PROBATION_CLEAR_THRESHOLD",
                                 DEFAULT_PROBATION_CLEAR_THRESHOLD)
         )
+        self.staleness_window_days = int(
+            staleness_window_days if staleness_window_days is not None
+            else os.environ.get("PERFORMANCE_RANKER_STALENESS_WINDOW_DAYS",
+                                DEFAULT_STALENESS_WINDOW_DAYS)
+        )
+        self.sweep_interval_hours = float(
+            sweep_interval_hours if sweep_interval_hours is not None
+            else os.environ.get("PERFORMANCE_RANKER_SWEEP_INTERVAL_HOURS",
+                                DEFAULT_SWEEP_INTERVAL_HOURS)
+        )
+        self._memory_root_override = memory_root
         self._events: dict[str, deque[_Event]] = {}
+        self._known_memory_roots: set[Path] = set()
+        self._sweep_task: Optional[asyncio.Task] = None
 
     # -- lifecycle -------------------------------------------------
 
@@ -130,11 +255,29 @@ class PerformanceRanker:
         self.bus.subscribe("*.error", self._on_error)
         self.bus.subscribe("approval_queue.rejected", self._on_rejection)
         self.bus.subscribe(MEMORY_RETRIEVED_TOPIC, self._on_memory_retrieved)
+        if self._memory_root_override:
+            try:
+                self._known_memory_roots.add(
+                    Path(self._memory_root_override).resolve())
+            except OSError:
+                pass
+        if self.sweep_interval_hours > 0:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is not None:
+                self._sweep_task = loop.create_task(
+                    self._sweep_staleness_loop(),
+                    name="performance_ranker.sweep_staleness")
 
     def uninstall(self) -> None:
         self.bus.unsubscribe("*.error", self._on_error)
         self.bus.unsubscribe("approval_queue.rejected", self._on_rejection)
         self.bus.unsubscribe(MEMORY_RETRIEVED_TOPIC, self._on_memory_retrieved)
+        if self._sweep_task is not None and not self._sweep_task.done():
+            self._sweep_task.cancel()
+        self._sweep_task = None
 
     # -- helpers ---------------------------------------------------
 
@@ -215,6 +358,9 @@ class PerformanceRanker:
             root = Path(memory_root).resolve()
         except OSError:
             return
+        # Remember the root so staleness sweep knows what to scan even
+        # without walk-up / env config.
+        self._known_memory_roots.add(root)
         for rel in paths:
             if not isinstance(rel, str) or not rel:
                 continue
@@ -230,6 +376,67 @@ class PerformanceRanker:
             except Exception:
                 log.exception("performance_ranker: score bump failed for %s",
                               abs_path)
+
+    # -- staleness sweep ------------------------------------------
+
+    async def _sweep_staleness_loop(self) -> None:
+        """Periodic background task. Sleeps the full interval before the
+        first sweep — no catch-up burst on agent startup."""
+        interval = max(60.0, self.sweep_interval_hours * 3600.0)
+        try:
+            while True:
+                try:
+                    await asyncio.sleep(interval)
+                except asyncio.CancelledError:
+                    raise
+                try:
+                    await self.sweep_staleness_once()
+                except Exception:
+                    log.exception("performance_ranker: staleness sweep failed")
+        except asyncio.CancelledError:
+            return
+
+    async def sweep_staleness_once(self, *,
+                                     today: Optional[_dt.date] = None
+                                     ) -> list[dict]:
+        """Run one staleness pass over every known memory root. Returns
+        the list of demotion reports (one per demoted entry). Publishes
+        a `memory.demoted` event for each demotion.
+        """
+        if today is None:
+            today = _dt.date.today()
+        roots = list(self._known_memory_roots)
+        if not roots:
+            return []
+        reports: list[dict] = []
+        for root in roots:
+            if not root.exists():
+                continue
+            for path in _iter_memory_entries(root):
+                try:
+                    report = _demote_for_staleness(
+                        path,
+                        window_days=self.staleness_window_days,
+                        today=today,
+                    )
+                except Exception:
+                    log.exception(
+                        "performance_ranker: demote failed for %s", path)
+                    continue
+                if report is None:
+                    continue
+                try:
+                    report["memory_root"] = str(root)
+                    report["path"] = str(path.relative_to(root))
+                except ValueError:
+                    report["path"] = str(path)
+                reports.append(report)
+                try:
+                    await self.bus.publish(MEMORY_DEMOTED_TOPIC, dict(report))
+                except Exception:
+                    log.exception(
+                        "performance_ranker: publish memory.demoted raised")
+        return reports
 
     # -- bus surface ----------------------------------------------
 
@@ -276,4 +483,16 @@ class PerformanceRanker:
             total = sum(len(dq) for dq in self._events.values())
             self._events.clear()
             return {"ok": True, "cleared": total}
+        if op == "sweep_staleness":
+            # Manual trigger (tests / operators). Runs one pass
+            # synchronously, returns the demotion report list.
+            extra_root = payload.get("memory_root")
+            if isinstance(extra_root, str) and extra_root.strip():
+                try:
+                    self._known_memory_roots.add(
+                        Path(extra_root).expanduser().resolve())
+                except OSError:
+                    pass
+            reports = await self.sweep_staleness_once()
+            return {"ok": True, "demoted": reports}
         return {"ok": False, "error": f"unknown op: {op!r}"}
