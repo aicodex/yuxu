@@ -159,9 +159,10 @@ yuxu commits to the lazy model:
   - Cross-cut `memory.search {query, limit}` — ranked top-K, not
     full index
 - **Frontmatter contract.** Every entry MUST have `name` +
-  `description` + `type`. MAY have `tags: [...]` (L1 filter) and
-  `updated: YYYY-MM-DD` (recency / decay). Missing required fields
-  → skipped from index.
+  `description` + `type`. MAY have `tags: [...]` (L1 filter),
+  `updated: YYYY-MM-DD` (recency / decay), `scope`, `evidence_level`,
+  `status`, `score`, `probation` (below). Missing required fields →
+  skipped from index.
 - **Scope-internal stratification is optional.** Within a scope,
   entries MAY be further split (e.g. durable `MEMORY.md` vs transient
   daily notes, per OpenClaw's pattern). Not mandatory for MVP; the
@@ -169,6 +170,79 @@ yuxu commits to the lazy model:
 - **Search / decay / SQLite index** are deferred to when real scale
   hits (~500+ entries). The op surface above is stable; the backend
   can change transparently.
+
+**Retention — archive, don't delete.**
+Forgotten failures repeat. Default write path is append + relocate,
+never truncate + delete. Superseded entries move to `_archive/` with
+a rationale file; rejected drafts preserve under `_archive/rejected/`;
+failed-variant dead-ends archived per I11's variant layout. Hard
+delete requires explicit user intent plus a warning.
+
+**Evidence tiers + lifecycle status.**
+Every entry MAY carry `evidence_level` ∈ `{validated, consensus,
+observed, speculative}` (default `observed` for curator-generated)
+and `status` ∈ `{current, archived}` (default `current`). Medical-
+evidence analogy:
+
+- `validated` — tournament victory or ≥ N successful signals
+  (initial N = 10)
+- `consensus` — architectural invariant / mechanism reasoning
+  (ARCHITECTURE's I1-I11 sit here)
+- `observed` — single real observation, not yet replicated
+- `speculative` — untested hypothesis / literature pattern
+
+Levels are orthogonal to `type` / `scope` / `tags`. **Schema stays
+isomorphic** — a speculative entry has the same shape as a validated
+one; only the `evidence_level` field differs. Consumers compose
+filters freely.
+
+**Retrieval modes (entropy management).**
+Per Shannon, each retrieval reduces the consumer's hypothesis
+entropy — useful for execution, hostile to exploration. Retrieval
+takes a `mode` parameter with default filter policies:
+
+- `blank`   → `[]` (clean slate)
+- `explore` → only `mandatory`-tagged entries
+- `execute` → `evidence_level ∈ {validated, consensus, observed}` +
+              `status = current`  (**default** when mode unset)
+- `reflect` → all levels, includes `status = archived`
+- `debug`   → `observed` + `status = archived`
+
+Agents declare a default in `AGENT.md` `memory_access.mode` and may
+switch mid-run (iteration_agent switches `blank` → `reflect`
+between variant generation and post-mortem phases). Mode is a
+retrieval parameter, not a memory attribute.
+
+**Mandatory tag — the only always-injected channel.**
+Entries tagged `mandatory` inject under every mode including
+`blank`. Reserved for a minimal set of hard rules (core kernel
+invariants, destructive-action boundaries, secrets handling). The
+temptation to over-add undermines the abstraction; candidates
+require explicit approval like any other memory edit.
+
+**Evidence is dynamic — scoring drives promotion / demotion.**
+Each entry carries `score: {applied, helped, hurt, last_evaluated}`.
+Weights are asymmetric (+5 helped, −1 hurt; `applied` is the
+sampling base, not a scorable event) — same convention as the
+framework-wide iteration signal. `performance_ranker` proposes
+level transitions based on accumulated score and MUST cite the
+run / tournament / session that produced the signal. No silent
+promotion.
+
+I11's tournament is the near-double-blind experiment for memory:
+when variants draw different retrieval slices, the verdict
+attributes credit to the delta memories. Approval-accept / reject
+on non-tournament traffic contributes weak signal (≤ 1/5 tournament
+weight) — correlation-only, no controlled comparison.
+
+**Updates inherit level with probation.**
+When a curated edit replaces an existing entry, the new version
+inherits the prior `evidence_level` but its `score` resets and
+`probation: true` is set. During probation: `execute` mode
+excludes the entry (unvalidated change, risk of silent
+propagation); `reflect` and `explore` include it. Probation clears
+on a helped threshold; overdue entries auto-demote one level and
+emit `memory.probation_failed` for user awareness.
 
 ### I7. User-facing messages are subscription Info Sources
 
