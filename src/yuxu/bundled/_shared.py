@@ -17,6 +17,33 @@ from typing import Any
 import yaml
 
 
+# -- frontmatter writer (shared between approval_applier + performance_ranker)
+
+def dump_frontmatter(fm: dict) -> str:
+    """Serialize a frontmatter dict to a `---`-bounded block matching the
+    convention used by bundled memory writers:
+
+    - JSON for dicts/lists (round-trippable through `yaml.safe_load`)
+    - `true` / `false` for bools, `null` for None
+    - plain repr for scalars
+    - key order preserved from dict iteration
+
+    Caller appends the entry body.
+    """
+    lines = ["---"]
+    for k, v in fm.items():
+        if isinstance(v, (dict, list)):
+            lines.append(f"{k}: {json.dumps(v, ensure_ascii=False)}")
+        elif isinstance(v, bool):
+            lines.append(f"{k}: {'true' if v else 'false'}")
+        elif v is None:
+            lines.append(f"{k}: null")
+        else:
+            lines.append(f"{k}: {v}")
+    lines.append("---")
+    return "\n".join(lines)
+
+
 # -- template text (used by create_project) ----------------------
 
 PROJECT_GITIGNORE = """# yuxu project

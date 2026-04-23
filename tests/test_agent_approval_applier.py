@@ -10,6 +10,7 @@ import pytest
 
 from yuxu.bundled.approval_applier.handler import (
     APPLIED_TOPIC,
+    GATED_TOPIC,
     REJECTED_TOPIC,
     SKIPPED_TOPIC,
     ApprovalApplier,
@@ -609,3 +610,181 @@ async def test_add_approval_does_not_stamp_probation(tmp_path):
     fm, _ = parse_frontmatter(target.read_text(encoding="utf-8"))
     # add: no probation injection
     assert fm.get("probation", False) is False
+
+
+# -- admission gate hook (I6 write-admission) -----------------
+
+
+def _register_gate(bus: Bus, *, verdict: dict):
+    """Install a stub admission_gate skill that returns `verdict`.
+
+    verdict shape: `{"ok": bool, "pass": bool, "stages": {...}, "verdict": str}`
+    """
+    async def handler(msg):
+        # Echo back whatever the test wants. Ignore payload details.
+        return verdict
+    bus.register("admission_gate", handler)
+
+
+async def test_gate_pass_lets_write_through(tmp_path):
+    bus = Bus()
+    draft = _make_draft_file(tmp_path)
+    _register_fake_aq(bus, {"A1": _fake_aq_entry("A1", draft)})
+    _register_gate(bus, verdict={
+        "ok": True, "pass": True,
+        "stages": {"surface_check": {"pass": True, "reason": "ok"}},
+        "verdict": "PASS",
+    })
+    gated = _collect_events(bus, GATED_TOPIC)
+    applied = _collect_events(bus, APPLIED_TOPIC)
+
+    applier = ApprovalApplier(_make_ctx(bus))
+    await applier.install()
+    await bus.publish("approval_queue.decided", {
+        "approval_id": "A1", "action": "memory_edit",
+        "decision": "approved", "requester": "x",
+    })
+    await _yield()
+
+    target = tmp_path / "mem" / "feedback_x.md"
+    assert target.exists()
+    assert not gated
+    assert applied
+
+
+async def test_gate_fail_archives_and_emits_event(tmp_path):
+    bus = Bus()
+    draft = _make_draft_file(tmp_path)
+    _register_fake_aq(bus, {"A1": _fake_aq_entry("A1", draft)})
+    _register_gate(bus, verdict={
+        "ok": True, "pass": False,
+        "stages": {
+            "surface_check": {"pass": False, "reason": "verbose-obvious"},
+            "golden_replay": {"pass": True, "reason": "no citation"},
+            "noop_baseline": {"pass": True, "reason": "unique"},
+        },
+        "verdict": "FAIL [surface_check=fail]",
+    })
+    gated = _collect_events(bus, GATED_TOPIC)
+    applied = _collect_events(bus, APPLIED_TOPIC)
+
+    applier = ApprovalApplier(_make_ctx(bus))
+    await applier.install()
+    await bus.publish("approval_queue.decided", {
+        "approval_id": "A1", "action": "memory_edit",
+        "decision": "approved", "requester": "x",
+    })
+    await _yield()
+
+    target = tmp_path / "mem" / "feedback_x.md"
+    assert not target.exists(), "gated draft must not be written"
+    assert not applied
+    assert gated and gated[0]["approval_id"] == "A1"
+    assert gated[0]["verdict"].startswith("FAIL")
+    archived = gated[0]["archived_path"]
+    assert archived is not None
+    archived_p = Path(archived)
+    assert archived_p.exists()
+    assert "_archive" in archived_p.parts and "gated" in archived_p.parts
+
+
+async def test_gate_missing_falls_through_as_pass(tmp_path):
+    """When admission_gate isn't loaded, write proceeds with a warning.
+
+    This matches the `optional_deps` pattern — a missing advisory circuit
+    cannot brick the memory write path.
+    """
+    bus = Bus()
+    draft = _make_draft_file(tmp_path)
+    _register_fake_aq(bus, {"A1": _fake_aq_entry("A1", draft)})
+    # NOTE: no _register_gate() — bus.request("admission_gate") → LookupError
+    applied = _collect_events(bus, APPLIED_TOPIC)
+    gated = _collect_events(bus, GATED_TOPIC)
+
+    applier = ApprovalApplier(_make_ctx(bus))
+    await applier.install()
+    await bus.publish("approval_queue.decided", {
+        "approval_id": "A1", "action": "memory_edit",
+        "decision": "approved", "requester": "x",
+    })
+    await _yield()
+
+    target = tmp_path / "mem" / "feedback_x.md"
+    assert target.exists()
+    assert applied and not gated
+
+
+async def test_gate_raises_falls_through_as_pass(tmp_path):
+    bus = Bus()
+    draft = _make_draft_file(tmp_path)
+    _register_fake_aq(bus, {"A1": _fake_aq_entry("A1", draft)})
+
+    async def broken_gate(msg):
+        raise RuntimeError("boom")
+    bus.register("admission_gate", broken_gate)
+
+    applied = _collect_events(bus, APPLIED_TOPIC)
+    applier = ApprovalApplier(_make_ctx(bus))
+    await applier.install()
+    await bus.publish("approval_queue.decided", {
+        "approval_id": "A1", "action": "memory_edit",
+        "decision": "approved", "requester": "x",
+    })
+    await _yield()
+
+    target = tmp_path / "mem" / "feedback_x.md"
+    assert target.exists()
+    assert applied
+
+
+async def test_gate_update_path_also_gated(tmp_path):
+    """Updates must go through the gate too — gate excludes self via
+    target_path."""
+    bus = Bus()
+    draft = _make_draft_file(tmp_path)
+    target = tmp_path / "mem" / "feedback_x.md"
+    target.write_text("old content", encoding="utf-8")
+    _register_fake_aq(bus, {"A1": _fake_aq_entry("A1", draft, action="update")})
+    _register_gate(bus, verdict={
+        "ok": True, "pass": False,
+        "stages": {"noop_baseline": {"pass": False,
+                                       "reason": "dup of something else"}},
+        "verdict": "FAIL [dup]",
+    })
+    gated = _collect_events(bus, GATED_TOPIC)
+    applier = ApprovalApplier(_make_ctx(bus))
+    await applier.install()
+    await bus.publish("approval_queue.decided", {
+        "approval_id": "A1", "action": "memory_edit",
+        "decision": "approved", "requester": "x",
+    })
+    await _yield()
+
+    # old content preserved — gate blocked the update
+    assert target.read_text(encoding="utf-8") == "old content"
+    assert gated
+    assert gated[0]["verdict"].startswith("FAIL")
+
+
+async def test_apply_draft_manual_bypasses_gate(tmp_path):
+    """Manual `apply_draft` op skips the gate entirely (test/debug hatch)."""
+    bus = Bus()
+    draft = _make_draft_file(tmp_path)
+
+    # Install a gate that would hard-fail everything it sees.
+    _register_gate(bus, verdict={
+        "ok": True, "pass": False,
+        "stages": {"surface_check": {"pass": False, "reason": "blocked"}},
+        "verdict": "FAIL [always]",
+    })
+
+    applier = ApprovalApplier(_make_ctx(bus))
+    r = await applier.handle(SimpleNamespace(payload={
+        "op": "apply_draft",
+        "draft_path": str(draft),
+        "proposed_target": "feedback_x.md",
+        "proposed_action": "add",
+    }))
+    assert r["ok"] is True
+    target = tmp_path / "mem" / "feedback_x.md"
+    assert target.exists()

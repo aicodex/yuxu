@@ -18,8 +18,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-import json
-
+from yuxu.bundled._shared import dump_frontmatter
 from yuxu.core.frontmatter import parse_frontmatter
 
 log = logging.getLogger(__name__)
@@ -27,6 +26,7 @@ log = logging.getLogger(__name__)
 APPLIED_TOPIC = "approval_applier.applied"
 REJECTED_TOPIC = "approval_applier.rejected"
 SKIPPED_TOPIC = "approval_applier.skipped"
+GATED_TOPIC = "approval_applier.gated"
 
 ALLOWED_ACTIONS = ("add", "update")
 
@@ -69,32 +69,22 @@ def _stamp_probation_on_update(inner: str) -> str:
         "applied": 0, "helped": 0, "hurt": 0,
         "last_evaluated": time.strftime("%Y-%m-%d", time.localtime()),
     }
-    lines = ["---"]
-    for k, v in fm.items():
-        if isinstance(v, (dict, list)):
-            lines.append(f"{k}: {json.dumps(v, ensure_ascii=False)}")
-        elif isinstance(v, bool):
-            lines.append(f"{k}: {'true' if v else 'false'}")
-        elif v is None:
-            lines.append(f"{k}: null")
-        else:
-            lines.append(f"{k}: {v}")
-    lines.append("---")
-    head = "\n".join(lines)
+    head = dump_frontmatter(fm)
     tail = rest if rest.startswith("\n") else ("\n" + rest)
     return head + tail
 
 
-def _archive_draft(draft_path: Path) -> Path:
-    """Move a rejected draft to `<memory_root>/_archive/rejected/` with a
-    timestamp prefix. Preserves the file for future reflection per I6
-    (archive, don't delete).
+def _archive_draft(draft_path: Path, *, bucket: str = "rejected") -> Path:
+    """Move a draft to `<memory_root>/_archive/<bucket>/` with a timestamp
+    prefix. Preserves the file for future reflection per I6 (archive,
+    don't delete).
 
-    Returns the archived path. `memory_root` is derived as
+    `bucket` — default `rejected` (user said no); `gated` for admission
+    gate blocks. Returns the archived path. `memory_root` is derived as
     `draft_path.parent.parent` — the same convention _apply_approval uses.
     """
     memory_root = draft_path.parent.parent
-    archive_dir = memory_root / "_archive" / "rejected"
+    archive_dir = memory_root / "_archive" / bucket
     archive_dir.mkdir(parents=True, exist_ok=True)
     ts = int(time.time())
     dest = archive_dir / f"{ts}-{draft_path.name}"
@@ -202,6 +192,29 @@ class ApprovalApplier:
         if action == "update":
             inner = _stamp_probation_on_update(inner)
 
+        # I6 write-admission gate. Hard-block on fail; archive the draft
+        # under _archive/gated/ with the gate report so future reflection
+        # can see why it didn't land. Gate unavailable → proceed with a
+        # warning (optional_deps pattern).
+        gate = await self._run_admission_gate(inner, memory_root, target_path)
+        if not gate["pass"]:
+            archived: Optional[Path] = None
+            if draft_path.exists():
+                try:
+                    archived = _archive_draft(draft_path, bucket="gated")
+                except OSError as e:
+                    log.warning("approval_applier: gate-archive %s: %s",
+                                draft_path, e)
+            await self.ctx.bus.publish(GATED_TOPIC, {
+                "approval_id": aid,
+                "target_path": str(target_path),
+                "draft_path": str(draft_path),
+                "archived_path": str(archived) if archived else None,
+                "stages": gate.get("stages", {}),
+                "verdict": gate.get("verdict", ""),
+            })
+            return
+
         try:
             _atomic_write(target_path, inner)
         except OSError as e:
@@ -245,6 +258,44 @@ class ApprovalApplier:
         await self.ctx.bus.publish(SKIPPED_TOPIC, {
             "approval_id": aid, "reason": reason,
         })
+
+    async def _run_admission_gate(self, inner: str, memory_root: Path,
+                                    target_path: Path) -> dict:
+        """Ask the admission_gate skill to vet the final entry text.
+
+        Gate unavailable (LookupError) → treat as pass with a skipped
+        note. Gate raises (network, timeout) → also pass with a note:
+        gate is an advisory circuit, it must not turn into a new
+        single-point-of-failure for writes. Gate returning `ok=false` is
+        treated the same way (the skill errored, not rejected).
+        """
+        try:
+            r = await self.ctx.bus.request("admission_gate", {
+                "op": "check",
+                "entry_body": inner,
+                "memory_root": str(memory_root),
+                "target_path": str(target_path),
+            }, timeout=120.0)
+        except LookupError:
+            return {"pass": True,
+                    "verdict": "PASS [gate not loaded]",
+                    "stages": {}}
+        except Exception as e:
+            log.warning("approval_applier: admission_gate raised: %s", e)
+            return {"pass": True,
+                    "verdict": f"PASS [gate raised: {e}]",
+                    "stages": {}}
+        if not isinstance(r, dict) or not r.get("ok"):
+            err = r.get("error") if isinstance(r, dict) else "non-dict"
+            log.warning("approval_applier: admission_gate not ok: %s", err)
+            return {"pass": True,
+                    "verdict": f"PASS [gate not ok: {err}]",
+                    "stages": {}}
+        return {
+            "pass": bool(r.get("pass")),
+            "verdict": r.get("verdict", ""),
+            "stages": r.get("stages", {}),
+        }
 
     # -- bus surface ----------------------------------------------
 

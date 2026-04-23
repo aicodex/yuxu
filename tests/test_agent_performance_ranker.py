@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import asyncio
 import time
+from pathlib import Path
 
 import pytest
 
-from yuxu.bundled.performance_ranker.handler import NAME, PerformanceRanker
+from yuxu.bundled.performance_ranker.handler import (
+    NAME, PerformanceRanker, _bump_applied,
+)
 from yuxu.core.bus import Bus
+from yuxu.core.frontmatter import parse_frontmatter
 from yuxu.core.loader import Loader
 
 pytestmark = pytest.mark.asyncio
@@ -201,3 +205,192 @@ def bundled_dir():
     import yuxu as _y
     from pathlib import Path as _P
     return str(_P(_y.__file__).parent / "bundled")
+
+
+# -- Phase 4 minimum: memory.retrieved bumps score.applied -----
+
+
+def _write_entry(root: Path, rel: str, body: str) -> Path:
+    p = root / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(body, encoding="utf-8")
+    return p
+
+
+def _fm_of(p: Path) -> dict:
+    fm, _ = parse_frontmatter(p.read_text(encoding="utf-8"))
+    return fm
+
+
+NO_SCORE_ENTRY = """---
+name: Foo
+description: something observed
+type: feedback
+evidence_level: observed
+---
+body text
+"""
+
+PROBATION_ENTRY = """---
+name: Bar
+description: recently updated
+type: feedback
+evidence_level: observed
+probation: true
+score: {"applied": 0, "helped": 0, "hurt": 0, "last_evaluated": "2026-04-20"}
+---
+body text
+"""
+
+NO_FRONTMATTER_ENTRY = "just plain text, no frontmatter block\n"
+
+
+async def test_bump_applied_initializes_score_when_missing(tmp_path: Path):
+    p = _write_entry(tmp_path, "a.md", NO_SCORE_ENTRY)
+    _bump_applied(p, probation_clear_threshold=3)
+    fm = _fm_of(p)
+    assert fm["score"]["applied"] == 1
+    assert fm["score"]["helped"] == 0
+    assert fm["score"]["hurt"] == 0
+    assert "last_evaluated" in fm["score"]
+    # body preserved
+    assert "body text" in p.read_text(encoding="utf-8")
+
+
+async def test_bump_applied_increments_existing(tmp_path: Path):
+    p = _write_entry(tmp_path, "b.md", PROBATION_ENTRY)
+    _bump_applied(p, probation_clear_threshold=3)
+    _bump_applied(p, probation_clear_threshold=3)
+    fm = _fm_of(p)
+    assert fm["score"]["applied"] == 2
+    # threshold not yet reached
+    assert fm.get("probation") is True
+
+
+async def test_bump_applied_clears_probation_at_threshold(tmp_path: Path):
+    p = _write_entry(tmp_path, "c.md", PROBATION_ENTRY)
+    for _ in range(3):
+        _bump_applied(p, probation_clear_threshold=3)
+    fm = _fm_of(p)
+    assert fm["score"]["applied"] == 3
+    assert fm.get("probation") is False
+
+
+async def test_bump_applied_no_promote_on_non_probation(tmp_path: Path):
+    p = _write_entry(tmp_path, "d.md", NO_SCORE_ENTRY)
+    for _ in range(5):
+        _bump_applied(p, probation_clear_threshold=3)
+    fm = _fm_of(p)
+    assert fm["score"]["applied"] == 5
+    # never had probation → don't invent the field just to flip it
+    assert "probation" not in fm or fm["probation"] is False
+    # evidence level untouched — Phase 4 minimum does not promote levels
+    assert fm["evidence_level"] == "observed"
+
+
+async def test_bump_applied_skips_entry_without_frontmatter(tmp_path: Path):
+    p = _write_entry(tmp_path, "e.md", NO_FRONTMATTER_ENTRY)
+    _bump_applied(p, probation_clear_threshold=3)
+    # content unchanged
+    assert p.read_text(encoding="utf-8") == NO_FRONTMATTER_ENTRY
+
+
+async def test_bump_applied_non_int_applied_coerced(tmp_path: Path):
+    p = _write_entry(tmp_path, "f.md", """---
+name: Foo
+description: d
+type: feedback
+score: {"applied": "oops", "helped": 0, "hurt": 0, "last_evaluated": "2026-04-20"}
+---
+body
+""")
+    _bump_applied(p, probation_clear_threshold=3)
+    fm = _fm_of(p)
+    assert fm["score"]["applied"] == 1
+
+
+async def test_on_memory_retrieved_bumps_each_path(tmp_path: Path):
+    r = PerformanceRanker(Bus(), probation_clear_threshold=3)
+    a = _write_entry(tmp_path, "a.md", NO_SCORE_ENTRY)
+    b = _write_entry(tmp_path, "b.md", PROBATION_ENTRY)
+    await r._on_memory_retrieved({
+        "topic": "memory.retrieved",
+        "payload": {
+            "op": "list",
+            "paths": ["a.md", "b.md"],
+            "memory_root": str(tmp_path),
+            "mode": "reflect",
+        },
+    })
+    assert _fm_of(a)["score"]["applied"] == 1
+    assert _fm_of(b)["score"]["applied"] == 1
+
+
+async def test_on_memory_retrieved_does_not_pollute_ranking(tmp_path: Path):
+    r = PerformanceRanker(Bus(), probation_clear_threshold=3)
+    _write_entry(tmp_path, "a.md", NO_SCORE_ENTRY)
+    await r._on_memory_retrieved({
+        "topic": "memory.retrieved",
+        "payload": {"paths": ["a.md"], "memory_root": str(tmp_path)},
+    })
+    # memory bookkeeping must not push anything into the sliding window
+    assert r._events == {}
+
+
+async def test_on_memory_retrieved_rejects_path_escape(tmp_path: Path):
+    r = PerformanceRanker(Bus(), probation_clear_threshold=3)
+    outside = tmp_path.parent / "outside.md"
+    outside.write_text(NO_SCORE_ENTRY, encoding="utf-8")
+    try:
+        await r._on_memory_retrieved({
+            "topic": "memory.retrieved",
+            "payload": {
+                "paths": ["../outside.md"],
+                "memory_root": str(tmp_path),
+            },
+        })
+        # file outside the root must not be mutated
+        assert _fm_of(outside).get("score") is None
+    finally:
+        outside.unlink(missing_ok=True)
+
+
+async def test_on_memory_retrieved_tolerates_missing_file(tmp_path: Path):
+    r = PerformanceRanker(Bus(), probation_clear_threshold=3)
+    # no file created; must not raise
+    await r._on_memory_retrieved({
+        "topic": "memory.retrieved",
+        "payload": {"paths": ["ghost.md"], "memory_root": str(tmp_path)},
+    })
+
+
+async def test_on_memory_retrieved_ignores_empty_payload():
+    r = PerformanceRanker(Bus(), probation_clear_threshold=3)
+    await r._on_memory_retrieved({"topic": "memory.retrieved"})
+    await r._on_memory_retrieved({"topic": "memory.retrieved",
+                                   "payload": {}})
+    await r._on_memory_retrieved({"topic": "memory.retrieved",
+                                   "payload": {"paths": [],
+                                               "memory_root": "/tmp"}})
+
+
+async def test_loader_subscribes_to_memory_retrieved(bundled_dir, tmp_path: Path):
+    bus = Bus()
+    loader = Loader(bus, dirs=[bundled_dir])
+    await loader.scan()
+    await loader.ensure_running("performance_ranker")
+
+    entry = _write_entry(tmp_path, "subject.md", PROBATION_ENTRY)
+    # Publish 3 retrievals through the real bus — hit the threshold.
+    for _ in range(3):
+        await bus.publish("memory.retrieved", {
+            "op": "list",
+            "paths": ["subject.md"],
+            "memory_root": str(tmp_path),
+            "mode": "reflect",
+        })
+    await asyncio.sleep(0.02)
+    fm = _fm_of(entry)
+    assert fm["score"]["applied"] == 3
+    assert fm.get("probation") is False
+    await loader.stop("performance_ranker")

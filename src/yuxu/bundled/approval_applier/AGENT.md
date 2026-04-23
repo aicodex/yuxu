@@ -4,6 +4,7 @@ run_mode: persistent
 scope: system
 edit_warning: true
 depends_on: [approval_queue]
+optional_deps: [admission_gate]
 ready_timeout: 5
 ---
 # approval_applier
@@ -43,8 +44,9 @@ publish 事件；事件只有在经由 `.decided` 订阅路径时才发。
 | topic | payload |
 |---|---|
 | `approval_applier.applied` | `{approval_id, target_path, action}` |
-| `approval_applier.rejected` | `{approval_id, draft_path}` |
+| `approval_applier.rejected` | `{approval_id, draft_path, archived_path}` |
 | `approval_applier.skipped` | `{approval_id, reason}` |
+| `approval_applier.gated` | `{approval_id, target_path, draft_path, archived_path, stages, verdict}` |
 
 ## v0 约束
 
@@ -54,7 +56,11 @@ publish 事件；事件只有在经由 `.decided` 订阅路径时才发。
   产物边界）；`remove` 未来再加
 - **`add` 时目标已存在 → skip + warn，不覆盖**；要覆盖发个 `update`
 - **幂等**：draft 不存在（已被处理 / 手工删）→ skip + warn，不崩
-- **不做任何 LLM 校验 / dedup**：approval_queue 的 decided 就是真值
+- **admission_gate 写入闸**：approve 后、写盘前调用 `admission_gate.check`。
+  任一 stage fail → draft 归档到 `_archive/gated/` + 发
+  `approval_applier.gated`，不写入。Gate 未加载 / 报错 → 放行并记
+  warning（gate 是优选，不是硬依赖）。手工出口 `apply_draft` 仍然跳过
+  gate（用于测试和 debug）。
 
 ## 为什么是 agent
 

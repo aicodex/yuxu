@@ -243,31 +243,56 @@ When a curated edit replaces an existing entry, the new version
 inherits the prior `evidence_level` but its `score` resets and
 `probation: true` is set. During probation: `execute` mode
 excludes the entry (unvalidated change, risk of silent
-propagation); `reflect` and `explore` include it. Probation clears
-on a helped threshold; overdue entries auto-demote one level and
-emit `memory.probation_failed` for user awareness.
+propagation); `reflect` and `explore` include it. The long-term
+clearance criterion is a `helped` threshold — the edit has to
+produce observed benefit, not just appear. While iteration_agent
+doesn't exist yet and no agent writes `helped`, probation clears
+instead on an `applied` threshold (default 3): enough reflect-mode
+retrievals for the updated content to have been read by the next
+reflection pass. This is a strictly weaker signal — intentionally
+so, because the alternative is permanent hiding — and `performance_
+ranker` is the only writer. Once outcome signals exist, `applied`
+reverts to sampling base and `helped` becomes the gate. Overdue
+entries auto-demote one level and emit `memory.probation_failed`
+for user awareness (not yet implemented).
 
-**Admission gate before promote.**
+**Admission gate on write.**
 Pure outcome-based scoring (tournament helped/hurt) is known to admit
 false positives at alarming rates — ROLL reports ~40% of agent-RL
 reward signals were false positives when no pre-filter was in place.
-Memory promotion from `speculative` to `observed` therefore requires
-passing a three-stage admission gate, adapted from ROLL's verification
-layers:
+yuxu gates **at write time**, not only at promotion: every approved
+memory edit must pass a three-stage gate before it hits disk. Adapted
+from ROLL's verification layers and reframed for the write context:
 
-1. **surface_check** — LLM-judge distinguishes semantic relevance
-   from surface pattern match: does the entry actually apply to the
-   task, or is retrieval only matching keywords?
-2. **golden_replay** — in the source session that generated the
-   entry, was the outcome driven by this memory's content, or is
-   this a retrospective label pasted on an unrelated success?
-3. **noop_baseline** — a variant without this entry cannot already
-   win the same task. If the no-memory control passes, the entry's
-   contribution is zero and it must not be promoted.
+1. **surface_check** — LLM judge decides whether the entry is an
+   actionable observation / rule / user fact, or verbose-obvious /
+   opinion-only / mis-typed / filler. Infrastructure gaps (no
+   `llm_driver`, unparseable verdict, transient raise) pass through
+   with a `skipped` note so the gate doesn't compound outages.
+2. **golden_replay** — any `originSessionId` citation in the
+   frontmatter must resolve to a real session archive under
+   `docs/experiences/sessions_raw/`. File-existence only in v0;
+   content-overlap verification is a future upgrade. Entries that
+   don't cite a session pass trivially.
+3. **noop_baseline** — the entry must not be a near-duplicate of an
+   existing entry in the target `memory_root`. v0 flags exact name
+   collisions and character-trigram Jaccard over
+   `name + description` at / above `dedup_threshold` (default 0.6);
+   self-updates are excluded by explicit `target_path`.
 
-Any stage failing → entry stays `speculative`. Gating is not a
-replacement for tournament scoring — it is a prerequisite. Quality
-is gated *before* scoring, not only corrected after.
+Any stage failing → the draft is archived under `_archive/gated/`
+with the full stage report in the emitted event; the write does not
+happen. Gate unavailable → caller (`approval_applier`) falls back to
+write with a warning — gate is advisory for the control loop, not a
+single-point-of-failure for memory writes.
+
+The original "promotion gate" framing from ROLL still applies in
+spirit: once tournament scoring exists and levels actually move,
+`surface_check` extends to task-relevance judgment and
+`noop_baseline` extends to "no-memory control variant" — both
+strictly stronger than v0. Write-admission is today's feasible
+subset, leveraging the concrete signals we already have (curator
+drafts, session archives, existing index).
 
 **Staleness as a hard threshold.**
 Entries with `updated` older than a configurable window (initial
