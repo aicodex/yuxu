@@ -246,8 +246,61 @@ does not silently fail — it surfaces the top-k candidates + a
 <project>/agents/<agent>/   # the live tree (= current winner)
 ```
 
+**Fork scope — iterate self, other agents are environment.**
+A fork only copies the iterated agent's own tree. Everything else is
+read-only environment for the duration of the run:
+
+| Object | Role | Fork treatment |
+|---|---|---|
+| Iterated agent's `AGENT.md` / `handler.py` / `memory/` | self | copy |
+| Other agents' trees | environment | read-only, not copied |
+| `data/memory/_shared/` / global scope | environment | read-only |
+| Bus event stream | environment | live, not snapshotted |
+
+During a run, the agent scope spawns ephemeral **variant sub-scopes**
+at `data/variants/<agent>/<variant_id>/memory/`. These live for the
+run's lifetime; at completion the winner's variant memory merges into
+the agent scope, losers' variant memory is archived. This is an
+extension of I6, not a new top-level scope.
+
+**Storage guard — per-file and per-tree caps, with reference fallback.**
+Bounded exploration is only bounded if one tree can't balloon storage.
+Initial thresholds (subject to revision as real usage lands):
+
+| File class | Limit | Over limit |
+|---|---|---|
+| `memory/*.md` | 100 KB each | store as reference (hardlink / symlink), not copy |
+| `handler.py` | 50 KB | warn + refuse fork (tree needs decomposition first) |
+| Attachments / embeddings / PDFs / historical session transcripts | — | never forked; read in place |
+
+A forked tree's total byte sum has an initial ceiling of 500 KB. Over
+the ceiling, `/fork` refuses and surfaces the offending file list for
+human decision (prune, split, or exempt).
+
+**Cross-agent blame — a signal, not inline intervention.**
+If variant A' concludes the root cause is in agent B, A' does **not**
+fork or modify B within its own run (that would break ceilings and
+cross fork-scope boundaries). It emits a signal:
+
+```
+iteration.cross_blame
+  payload: {from: "A#<variant>", to: "B", evidence, confidence: 0..1}
+  → appended to data/iteration/cross_blame_queue.jsonl
+  → performance_ranker weights B's "blamed-by-others" count (negative
+    signal, scaled by confidence to prevent low-quality scapegoating)
+  → B rises in the iteration priority queue via I9's normal ranking
+```
+
+This preserves fork scope (A's run touches only A), keeps ceilings
+honest (no combinatorial blowup), and routes cross-agent feedback
+through the same performance_ranker pipeline as any other negative
+signal. Low-confidence blame earns small weight; high-confidence blame
+can also be surfaced through `approval_queue` for human adjudication
+when the stakes warrant it.
+
 **Reuse of existing components:**
-- `performance_ranker` feeds fitness signals.
+- `performance_ranker` feeds fitness signals and consumes
+  `iteration.cross_blame` for cross-agent priority weighting.
 - `approval_queue` + `approval_applier` handles both the merge-winner
   commit and the on-exhaustion surfacing — no new approval mechanism.
 - `memory_curator` emits `dead-end-*.md` drafts as a variant ages out.
@@ -261,6 +314,9 @@ does not silently fail — it surfaces the top-k candidates + a
   the layout above is backend-agnostic.
 - `handler.py` variants need human approval per I6; `AGENT.md` / prompt
   variants can be agent-proposed.
+- Cross-blame queue consumer (iteration coordinator) — the queue file
+  and event are specified here; the agent that reads them comes with
+  iteration_agent v0.
 
 ## Lifecycle states
 
