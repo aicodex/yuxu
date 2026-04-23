@@ -247,6 +247,37 @@ propagation); `reflect` and `explore` include it. Probation clears
 on a helped threshold; overdue entries auto-demote one level and
 emit `memory.probation_failed` for user awareness.
 
+**Admission gate before promote.**
+Pure outcome-based scoring (tournament helped/hurt) is known to admit
+false positives at alarming rates — ROLL reports ~40% of agent-RL
+reward signals were false positives when no pre-filter was in place.
+Memory promotion from `speculative` to `observed` therefore requires
+passing a three-stage admission gate, adapted from ROLL's verification
+layers:
+
+1. **surface_check** — LLM-judge distinguishes semantic relevance
+   from surface pattern match: does the entry actually apply to the
+   task, or is retrieval only matching keywords?
+2. **golden_replay** — in the source session that generated the
+   entry, was the outcome driven by this memory's content, or is
+   this a retrospective label pasted on an unrelated success?
+3. **noop_baseline** — a variant without this entry cannot already
+   win the same task. If the no-memory control passes, the entry's
+   contribution is zero and it must not be promoted.
+
+Any stage failing → entry stays `speculative`. Gating is not a
+replacement for tournament scoring — it is a prerequisite. Quality
+is gated *before* scoring, not only corrected after.
+
+**Staleness as a hard threshold.**
+Entries with `updated` older than a configurable window (initial
+30 days) auto-demote one level unless recently touched by a
+successful retrieval. Adapted from Slime's sample-level staleness
+check in off-policy RL: when the underlying behavior distribution
+has drifted, prior validation is no longer reliable evidence. A
+stale `validated` entry that hasn't been exercised in a month
+cannot be trusted at validated tier just because it once was.
+
 ### I7. User-facing messages are subscription Info Sources
 
 Any stream to the user (reply, reasoning, tool trace, dashboard,
