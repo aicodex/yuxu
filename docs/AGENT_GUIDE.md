@@ -35,6 +35,17 @@ but pause and check if you're about to violate one:
   `performance_ranker`; (3) token inefficiency — value per token
   consumed. The top-scoring agent gets the next iteration slot. Unused
   budget goes to background exploration, never to idle.
+- **Don't work in isolation (闭门造车)** — before proposing a new
+  design or mechanism, actively check reference implementations:
+  Claude Code, OpenClaw, Hermes, and established internet patterns.
+  Memory summaries of those projects are a hint, not a substitute for
+  reading the source. This applies especially to iteration agents and
+  agent creators that design on behalf of the user.
+  **Corollary — challenge rather than comply**: if a reference
+  implementation contradicts the user's (or your own initial) design,
+  surface the conflict explicitly — state the reference, the conflict,
+  and alternatives. Silent compliance with a suboptimal choice is
+  worse than a clarifying pushback.
 
 These principles are **injected into the system prompts of agent-creation
 skills** (`generate_agent_md`, `classify_intent`, and `harness_pro_max`)
