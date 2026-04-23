@@ -655,3 +655,111 @@ async def test_slash_explicit_hint_does_not_query_ranker(tmp_path):
     })
     await asyncio.sleep(0.02)
     assert ranker_called[0] is False
+
+
+# -- JSONL transcript rendering at session.ended -------------------
+
+
+def _write_jsonl_transcript(path: Path, *, with_reasoning: bool = True,
+                             filler_lines: int = 25) -> None:
+    """Create a synthetic session JSONL long enough to pass MIN_SOURCE_CHARS."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entries = [
+        {"ts": 1714000000.0, "event": "lifecycle", "state": "ready"},
+        {"ts": 1714000001.0, "event": "message", "role": "user",
+         "content": "the user asked a non-trivial question about how yuxu "
+                    "handles transcript persistence across agent restarts"},
+    ]
+    if with_reasoning:
+        entries.append({"ts": 1714000002.0, "event": "message",
+                         "role": "assistant", "kind": "reasoning",
+                         "content": "let me think about this carefully: "
+                                    "transcripts are per-agent, append-only, "
+                                    "lifecycle lines separate runs",
+                         "iteration": 1})
+    entries.append({"ts": 1714000003.0, "event": "message",
+                     "role": "assistant",
+                     "content": "Transcripts persist across restarts because "
+                                "the JSONL is append-only and lifecycle "
+                                "lines mark run boundaries",
+                     "iteration": 1})
+    # pad with filler so we comfortably clear MIN_SOURCE_CHARS
+    for i in range(filler_lines):
+        entries.append({"ts": 1714000010.0 + i, "event": "message",
+                         "role": "user", "content":
+                            f"follow-up question {i} about transcript "
+                            "persistence in long-running agents"})
+    entries.append({"ts": 1714000099.0, "event": "lifecycle",
+                     "state": "stopped", "reason": "normal"})
+    path.write_text("\n".join(json.dumps(e) for e in entries) + "\n",
+                    encoding="utf-8")
+
+
+async def test_session_ended_jsonl_path_is_rendered_not_raw(tmp_path):
+    """When session.ended carries a .jsonl transcript_path, curator must
+    feed the LLM the formatted readable text, not raw JSONL lines."""
+    bus = Bus()
+    ctx = _make_ctx(tmp_path, bus)
+    seen = _register_llm(bus, _llm_payload(improvements=["learned something"],
+                                             edits=[]))
+    _register_aq(bus)
+
+    jsonl_path = tmp_path / "proj" / "data" / "sessions" / "alpha.jsonl"
+    _write_jsonl_transcript(jsonl_path)
+
+    curator = MemoryCurator(ctx)
+    await curator.install()
+    got: list[dict] = []
+    bus.subscribe("memory_curator.curated",
+                  lambda e: got.append(e.get("payload") or {}))
+
+    await bus.publish(SESSION_ENDED_TOPIC, {
+        "agent": "alpha", "state": "stopped", "reason": "normal",
+        "transcript_path": str(jsonl_path),
+    })
+    for _ in range(30):
+        await asyncio.sleep(0)
+        if got:
+            break
+    assert got, "curator should have fired"
+
+    # The LLM received a user message with transcript text — NOT raw JSONL
+    assert seen, "curator must have called llm_driver"
+    payload = seen[0]
+    user_msg = payload["messages"][-1]["content"]
+    # Readable rendering markers from format_jsonl_transcript
+    assert "lifecycle: ready" in user_msg
+    assert "USER" in user_msg
+    assert "ASSISTANT" in user_msg
+    assert "ASSISTANT reasoning" in user_msg
+    # Raw JSONL would have leaked these braces everywhere; tolerate some
+    # escaping but verify the per-line JSON shape is gone
+    assert '"event":' not in user_msg, (
+        "transcript must be rendered, not fed as raw JSON lines"
+    )
+
+
+async def test_session_ended_jsonl_missing_file_falls_through(tmp_path):
+    """Race: session.ended arrives before the transcript write lands,
+    or path points somewhere non-existent. Curator must not crash."""
+    bus = Bus()
+    ctx = _make_ctx(tmp_path, bus)
+    _register_llm(bus, _llm_payload())
+
+    curator = MemoryCurator(ctx)
+    await curator.install()
+    skipped: list[dict] = []
+    bus.subscribe("memory_curator.skipped",
+                  lambda e: skipped.append(e.get("payload") or {}))
+
+    await bus.publish(SESSION_ENDED_TOPIC, {
+        "agent": "ghost", "state": "stopped",
+        "transcript_path": str(tmp_path / "nonexistent.jsonl"),
+    })
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if skipped:
+            break
+    # With no readable transcript, curator should have published skipped
+    # (either "no readable sources" or "transcript too short") — never raise
+    assert skipped

@@ -32,6 +32,7 @@ from yuxu.bundled.reflection_agent.handler import (
     _slugify,
     _truncate_bytes,
 )
+from yuxu.core.session_log import format_jsonl_transcript
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +51,7 @@ MAX_LOG_BYTES = 10_240         # improvement_log.md cap; roll-trim when over
 MAX_DRAFT_BYTES = 4_096        # per proposed memory entry body
 MAX_IMPROVEMENTS = 5           # per curate call
 MAX_MEMORY_EDITS = 3           # per curate call
+MAX_TRANSCRIPT_CHARS = 32_768  # per transcript file, after JSONL → readable render
 SESSION_ENDED_TOPIC = "session.ended"
 
 # --------------------------------------------------------------
@@ -246,7 +248,25 @@ class MemoryCurator:
             return
         transcript = payload.get("transcript")
         transcript_path = payload.get("transcript_path")
-        sources = [transcript_path] if transcript_path else None
+        sources = None
+        # Prefer rendering the JSONL transcript into readable text at the
+        # boundary so the LLM doesn't have to parse JSON lines. `.jsonl`
+        # paths that don't exist yet (race condition: curator called before
+        # the last append lands) gracefully fall through as empty.
+        if not transcript and transcript_path:
+            try:
+                if str(transcript_path).endswith(".jsonl"):
+                    transcript = format_jsonl_transcript(
+                        transcript_path, max_chars=MAX_TRANSCRIPT_CHARS,
+                    ) or None
+                else:
+                    sources = [transcript_path]
+            except Exception:
+                log.exception(
+                    "memory_curator: format_jsonl_transcript(%s) failed",
+                    transcript_path,
+                )
+                sources = [transcript_path]  # fall back to raw read
         context_hint = payload.get("context_hint") or \
             f"auto-curated on {SESSION_ENDED_TOPIC}"
         result = await self.curate(
