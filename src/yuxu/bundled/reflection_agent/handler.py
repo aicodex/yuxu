@@ -61,6 +61,7 @@ EXTRACTOR_SYSTEM = """You are a reflection assistant for the yuxu agent framewor
 
 You will receive:
 - A user need / focus area
+- (optional) An index of existing memory entries already in the store
 - One or more session transcripts (markdown)
 - A specific lens to use
 
@@ -85,8 +86,12 @@ Rules:
 - The `body` field must be a complete file ready to drop on disk; it should
   start with `---` frontmatter (name / description / type), then the body.
 - Keep each `body` under {max_body} characters.
-- For `update`, `target` MUST be an existing memory file. For `add`, pick a
-  new snake_case filename you have NOT seen referenced in the transcripts.
+- For `update`, `target` MUST match an existing entry's path from the
+  "Existing memory" index if one was provided. For `add`, pick a new
+  snake_case filename that does NOT collide with any existing entry.
+- **Prefer `update` over `add`** when the existing memory index shows a
+  related entry — amend the current entry instead of creating a parallel
+  one. Only `add` when no existing entry covers the insight.
 - Don't propose edits that contradict an explicit user preference visible in
   the transcripts.
 - If you find nothing high-signal under this lens, return {{"edits": [], "summary": "..."}}.
@@ -130,6 +135,27 @@ def _truncate_bytes(text: str, limit: int) -> str:
     if len(b) <= limit:
         return text
     return b[:limit].decode("utf-8", errors="ignore") + "\n[...truncated]"
+
+
+def _format_memory_index(entries: list[dict], *, max_lines: int = 100) -> str:
+    """Render memory index entries as a compact text block for LLM prompts.
+
+    One line per entry: `- path (tier, type) — description`. Capped at
+    max_lines to prevent prompt bloat on large memory stores; if truncated,
+    the final line notes how many entries were dropped.
+    """
+    if not entries:
+        return ""
+    lines: list[str] = []
+    for e in entries[:max_lines]:
+        path = e.get("path") or "?"
+        level = e.get("evidence_level") or "?"
+        typ = e.get("type") or "?"
+        desc = (e.get("description") or "").strip()
+        lines.append(f"- {path} ({level}, {typ}) — {desc}")
+    if len(entries) > max_lines:
+        lines.append(f"- [+{len(entries) - max_lines} more entries omitted]")
+    return "\n".join(lines)
 
 
 def _load_sources(sources: Optional[list[str]],
@@ -295,6 +321,34 @@ class ReflectionAgent:
                 return cand / "data" / "sessions"
         return Path.cwd() / "data" / "sessions"
 
+    async def _fetch_memory_index(self, memory_root: Path
+                                    ) -> tuple[list[dict], Optional[str]]:
+        """Ask the `memory` skill for existing entries so the LLM can
+        propose `update` over `add` when a related entry already exists.
+
+        Per I6 discipline — do not rglob memory files directly. Returns
+        ([], warning) when the skill is unavailable; reflection proceeds
+        memory-unaware rather than failing hard.
+        """
+        try:
+            r = await self.ctx.bus.request("memory", {
+                "op": "list",
+                "mode": "reflect",
+                "memory_root": str(memory_root),
+            }, timeout=5.0)
+        except LookupError:
+            return [], ("memory skill not loaded; reflection will "
+                        "propose without memory-index awareness")
+        except Exception as e:
+            return [], f"memory.list raised: {e}"
+        if not isinstance(r, dict) or not r.get("ok"):
+            err = r.get("error") if isinstance(r, dict) else "non-dict response"
+            return [], f"memory.list not ok: {err}"
+        entries = r.get("entries") or []
+        if not isinstance(entries, list):
+            return [], "memory.list entries is not a list"
+        return entries, None
+
     async def _resolve_auto_target(self) -> tuple[Optional[str], Optional[dict]]:
         """Query performance_ranker for the worst-performing agent and
         synthesize a `need` string focused on that agent. Returns
@@ -364,6 +418,14 @@ class ReflectionAgent:
                     "warnings": warnings,
                     **({"auto_target": auto_target} if auto_target else {})}
 
+        # Memory-aware context: query the memory skill for existing entries
+        # so hypotheses can prefer `update` over `add` when a related entry
+        # exists. Best-effort — failure becomes a warning, not a hard stop.
+        memory_entries, mem_warn = await self._fetch_memory_index(memory_root_path)
+        if mem_warn:
+            warnings.append(mem_warn)
+        memory_index_block = _format_memory_index(memory_entries)
+
         n = max(1, min(n_hypotheses, len(FRAMINGS)))
         framings = list(FRAMINGS[:n])
 
@@ -376,6 +438,7 @@ class ReflectionAgent:
         sources_block = _format_sources(loaded)
         hyp_results = await asyncio.gather(*[
             self._explore(need=need, framing=fr, sources_block=sources_block,
+                          memory_index_block=memory_index_block,
                           pool=pool, model=model)
             for fr in framings
         ], return_exceptions=True)
@@ -473,16 +536,24 @@ class ReflectionAgent:
     # -- LLM steps -------------------------------------------------
 
     async def _explore(self, *, need: str, framing: dict,
-                       sources_block: str, pool: str, model: str) -> dict:
+                       sources_block: str, pool: str, model: str,
+                       memory_index_block: str = "") -> dict:
         prompt = EXTRACTOR_SYSTEM.format(
             max_body=MAX_DRAFT_BYTES, lens=framing["lens"],
         )
+        user_parts = [f"User need:\n{need}"]
+        if memory_index_block:
+            user_parts.append(
+                "Existing memory (prefer `update` if a relevant entry "
+                f"is already present):\n{memory_index_block}"
+            )
+        user_parts.append(f"Transcripts:\n{sources_block}")
+        user_content = "\n\n".join(user_parts)
         try:
             resp = await self.ctx.bus.request("llm_driver", {
                 "op": "run_turn",
                 "system_prompt": prompt,
-                "messages": [{"role": "user", "content":
-                              f"User need:\n{need}\n\nTranscripts:\n{sources_block}"}],
+                "messages": [{"role": "user", "content": user_content}],
                 "pool": pool, "model": model,
                 "temperature": 0.5, "json_mode": True,
                 "max_iterations": 1,

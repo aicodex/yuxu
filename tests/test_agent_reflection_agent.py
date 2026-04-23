@@ -735,3 +735,117 @@ async def test_slash_command_explicit_need_does_not_call_ranker(tmp_path):
     })
     await asyncio.sleep(0.02)
     assert ranker_called[0] is False
+
+
+# -- Phase 3c: memory-skill integration --------------------------
+
+
+def _register_memory_skill(bus: Bus, entries: list[dict] | None = None,
+                             ok: bool = True):
+    """Fake memory skill handler. Returns captured input payloads."""
+    seen: list[dict] = []
+
+    async def handler(msg):
+        seen.append(dict(msg.payload) if isinstance(msg.payload, dict) else {})
+        if not ok:
+            return {"ok": False, "error": "simulated memory failure"}
+        return {"ok": True, "memory_root": "test", "mode": "reflect",
+                "entries": entries or []}
+
+    bus.register("memory", handler)
+    return seen
+
+
+async def test_reflect_queries_memory_skill_before_hypothesize(tmp_path):
+    bus = Bus()
+    ctx = _make_ctx(tmp_path, bus)
+    src = tmp_path / "s.md"; src.write_text("user said X")
+    mem_calls = _register_memory_skill(bus, entries=[
+        {"path": "feedback_terse.md", "name": "Terse",
+         "description": "prefer short replies", "type": "feedback",
+         "evidence_level": "consensus", "status": "current",
+         "tags": [], "probation": False, "updated": "2026-04-20", "bytes": 200},
+    ])
+    llm_seen = _wire_llm_driver(bus,
+        extractor_payloads=[{"edits": [], "summary": ""}] * 3,
+        ranker_payload={"chosen": [], "rejected_summary": ""},
+    )
+    a = ReflectionAgent(ctx)
+    r = await a.reflect(need="review terse style", sources=[str(src)])
+
+    # memory.list was called with mode=reflect per I6
+    assert mem_calls, "memory skill was not queried"
+    assert mem_calls[0]["op"] == "list"
+    assert mem_calls[0]["mode"] == "reflect"
+
+    # Extractor LLM calls received the memory index in the user message
+    extractor_calls = [c for c in llm_seen
+                       if "reflection assistant" in c.get("system_prompt", "")]
+    assert extractor_calls, "no extractor LLM calls captured"
+    user_msg = extractor_calls[0]["messages"][-1]["content"]
+    assert "Existing memory" in user_msg
+    assert "feedback_terse.md" in user_msg
+    assert "prefer short replies" in user_msg
+    # hypothesize then fails (empty edits) — expected
+    assert r["ok"] is False
+    assert r["stage"] == "hypothesize"
+
+
+async def test_reflect_proceeds_when_memory_skill_unavailable(tmp_path):
+    """Memory skill not loaded → reflection warns but still runs."""
+    bus = Bus()
+    ctx = _make_ctx(tmp_path, bus)
+    src = tmp_path / "s.md"; src.write_text("user said X")
+    # No memory skill registered
+    llm_seen = _wire_llm_driver(bus,
+        extractor_payloads=[{"edits": [], "summary": ""}] * 3,
+        ranker_payload={"chosen": [], "rejected_summary": ""},
+    )
+    a = ReflectionAgent(ctx)
+    r = await a.reflect(need="x", sources=[str(src)])
+
+    # Extractor called without a memory-index block
+    extractor_calls = [c for c in llm_seen
+                       if "reflection assistant" in c.get("system_prompt", "")]
+    assert extractor_calls
+    user_msg = extractor_calls[0]["messages"][-1]["content"]
+    assert "Existing memory" not in user_msg
+    assert r["stage"] == "hypothesize"  # fails because empty edits, not load
+    # Warning was recorded for the missing memory skill
+    assert any("memory skill" in w for w in r.get("warnings", []))
+
+
+async def test_reflect_warns_on_memory_skill_error(tmp_path):
+    """Memory skill returns ok=False → warning recorded, reflection continues."""
+    bus = Bus()
+    ctx = _make_ctx(tmp_path, bus)
+    src = tmp_path / "s.md"; src.write_text("user said X")
+    _register_memory_skill(bus, ok=False)
+    _wire_llm_driver(bus,
+        extractor_payloads=[{"edits": [], "summary": ""}] * 3,
+        ranker_payload={"chosen": [], "rejected_summary": ""},
+    )
+    a = ReflectionAgent(ctx)
+    r = await a.reflect(need="x", sources=[str(src)])
+
+    assert any("memory.list not ok" in w for w in r.get("warnings", []))
+
+
+def test_format_memory_index_caps_at_max_lines():
+    from yuxu.bundled.reflection_agent.handler import _format_memory_index
+    entries = [
+        {"path": f"e{i}.md", "name": f"N{i}",
+         "description": f"desc {i}", "type": "feedback",
+         "evidence_level": "observed"}
+        for i in range(150)
+    ]
+    rendered = _format_memory_index(entries, max_lines=100)
+    lines = rendered.splitlines()
+    # 100 rendered + 1 truncation note
+    assert len(lines) == 101
+    assert "[+50 more entries omitted]" in lines[-1]
+
+
+def test_format_memory_index_empty_returns_empty_string():
+    from yuxu.bundled.reflection_agent.handler import _format_memory_index
+    assert _format_memory_index([]) == ""

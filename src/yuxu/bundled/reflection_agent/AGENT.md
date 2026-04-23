@@ -4,7 +4,7 @@ run_mode: persistent
 scope: system
 edit_warning: true
 depends_on: [gateway, llm_driver]
-optional_deps: [approval_queue, performance_ranker]
+optional_deps: [approval_queue, performance_ranker, memory]
 ready_timeout: 5
 ---
 # reflection_agent
@@ -17,7 +17,10 @@ that the user must approve** before they hit live memory.
 ```
 /reflect <need>
   ├─ load sources (default: <project>/data/sessions/**/*.md, or --sources arg)
+  ├─ query `memory` skill for existing-entry index (I6 discipline — never
+  │    rglob memory files directly; best-effort, missing skill is a warning)
   ├─ N parallel hypotheses (different framings: pattern / anti-pattern / synthesizer)
+  │    — each gets the memory index in-prompt so it can prefer `update` over `add`
   ├─ LLM-rank + merge → chosen edit list
   ├─ stage drafts at <memory_root>/_drafts/reflection_<run_id>_<n>.md
   └─ enqueue each via approval_queue (best-effort, optional dep)
