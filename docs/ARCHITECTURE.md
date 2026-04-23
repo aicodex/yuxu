@@ -118,6 +118,25 @@ These combine into one score; the top-ranked agent gets the next
 iteration slot. Unused headroom is spent on background exploration
 (research, corpus build-up, memory consolidation) — never left idle.
 
+### I10. Practice is the criterion for trustworthiness
+
+Principles, methods, reference implementations, and design choices
+earn trust only through verified practical effect. "Reference" means
+"interesting to inspect", not "automatically correct". Initial
+adoption is tentative; trust accumulates through observed outcomes.
+
+Scoring (consistent with Asymmetric Iteration Signals in AGENT_GUIDE):
+a principle / method that leads to better outcomes gains +5; one that
+leads to worse outcomes gains −1. "Better" and "worse" are measured
+by observable signals: execution errors (did it run?), user feedback
+(acceptance, rejection, revision), and downstream agent performance
+(error / rejection rate, quality). The weighting may be revised —
+these are initial numbers, not fixed constants.
+
+The scoring method itself is subject to the same test. If scores
+fail to predict useful references, the scoring changes. This is
+turtles all the way down — and the pattern is deliberate.
+
 ## Lifecycle states
 
 ```

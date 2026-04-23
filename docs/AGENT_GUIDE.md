@@ -25,9 +25,11 @@ but pause and check if you're about to violate one:
 - **User-facing streams flow through Feed** — don't call `gateway.send`
   directly from business logic. Register an Info Source; the main reply is
   a `forced` subscription. See `docs/subscription_model.md`.
-- **Asymmetric iteration signals** — for any agent that scores itself or
-  another agent, weight success higher than failure (e.g. +5 vs −1).
-  Failure is common; rare success is the load-bearing signal.
+- **Asymmetric iteration signals** — for any agent, principle, method,
+  or reference being scored, weight success higher than failure (e.g.
+  +5 vs −1). Applies to agents (via performance_ranker) and, per
+  ARCHITECTURE §I10, to principles and references themselves. Failure
+  is common; rare success is the load-bearing signal.
 - **Iteration priority** — when an orchestrator (or an agent itself)
   picks what to improve next, compute a weighted score with factors in
   this order of weight: (1) user attention — complaints, `/improve`,
