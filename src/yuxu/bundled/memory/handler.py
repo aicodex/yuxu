@@ -36,6 +36,13 @@ SKIP_FILES = {"_improvement_log.md"}
 
 DEFAULT_MODE = "execute"
 
+# Topic for retrieval signal events. Phase 4 scoring infrastructure
+# (performance_ranker extension, consumed by future iteration_agent) will
+# subscribe here to credit / debit retrieved memory entries per session
+# outcome. Publishing is best-effort — skill stays functional if the bus
+# can't dispatch (no subscribers, missing attr, etc.).
+RETRIEVED_TOPIC = "memory.retrieved"
+
 # Mode → default filter policy. User-provided filters override the mode's
 # corresponding field; mode fills the gaps.
 MODE_POLICIES: dict[str, dict[str, Any]] = {
@@ -170,6 +177,24 @@ def _entry_passes(entry: dict, *, mode: str, user_filters: dict) -> bool:
     return True
 
 
+async def _publish_retrieved(ctx, op: str, paths: list[str],
+                              extras: Optional[dict] = None) -> None:
+    """Best-effort emission of memory.retrieved. Phase 4 foundation — no
+    hard consumer today; iteration_agent / performance_ranker will credit
+    retrieved entries against session outcome signals once they exist.
+    """
+    bus = getattr(ctx, "bus", None)
+    if bus is None or not paths:
+        return
+    payload: dict[str, Any] = {"op": op, "paths": list(paths)}
+    if extras:
+        payload.update(extras)
+    try:
+        await bus.publish(RETRIEVED_TOPIC, payload)
+    except Exception:
+        log.exception("memory: publish %s raised", RETRIEVED_TOPIC)
+
+
 def _collect_user_filters(input: dict) -> tuple[Optional[dict], Optional[str]]:
     """Parse user filter params; return (filters_dict, error_message)."""
     # Accept both `types` (list) and `type` (str) for backward compat
@@ -210,6 +235,10 @@ async def _op_list(input: dict, ctx) -> dict:
         if not _entry_passes(summary, mode=mode, user_filters=filters):
             continue
         entries.append(summary)
+    await _publish_retrieved(ctx, "list",
+                              [e["path"] for e in entries],
+                              extras={"mode": mode,
+                                      "memory_root": str(root)})
     return {"ok": True, "memory_root": str(root), "mode": mode, "entries": entries}
 
 
@@ -304,6 +333,10 @@ async def _op_search(input: dict, ctx) -> dict:
             scored.append((s, summary))
     scored.sort(key=lambda x: x[0], reverse=True)
     top = [entry for _, entry in scored[:limit]]
+    await _publish_retrieved(ctx, "search",
+                              [e["path"] for e in top],
+                              extras={"mode": mode, "query": query,
+                                      "memory_root": str(root)})
     return {"ok": True, "memory_root": str(root), "query": query,
             "mode": mode, "entries": top}
 
@@ -329,9 +362,12 @@ async def _op_get(input: dict, ctx) -> dict:
     except OSError as e:
         return {"ok": False, "error": f"read failed: {e}"}
     fm, body = parse_frontmatter(text)
+    rel_path = str(p.relative_to(root.resolve()))
+    await _publish_retrieved(ctx, "get", [rel_path],
+                              extras={"memory_root": str(root)})
     return {
         "ok": True,
-        "path": str(p.relative_to(root.resolve())),
+        "path": rel_path,
         "frontmatter": fm,
         "body": body,
         "bytes": len(text.encode("utf-8", errors="replace")),

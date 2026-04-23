@@ -544,3 +544,129 @@ async def test_via_bus_request_roundtrip(tmp_path, monkeypatch, bundled_dir):
     )
     assert get_r["ok"] is True
     assert get_r["frontmatter"]["name"] == "Terse"
+
+
+# ---------- Phase 4: memory.retrieved event emission ----------
+
+
+async def test_retrieved_event_on_list(tmp_path):
+    from yuxu.bundled.memory.handler import RETRIEVED_TOPIC
+    from yuxu.core.bus import Bus
+    bus = Bus()
+    seen: list[dict] = []
+
+    async def cap(event):
+        seen.append(event.get("payload") or {})
+
+    bus.subscribe(RETRIEVED_TOPIC, cap)
+
+    project = tmp_path
+    (project / "yuxu.json").write_text("{}\n")
+    mem = project / "data" / "memory"
+    mem.mkdir(parents=True)
+    _write_entry(mem, "a.md", name="A", description="d",
+                  type_="feedback", evidence_level="consensus")
+    _write_entry(mem, "b.md", name="B", description="d",
+                  type_="feedback", evidence_level="consensus")
+
+    ctx = SimpleNamespace(bus=bus, agent_dir=str(project / "agents" / "fake"))
+    r = await execute({"op": "list", "memory_root": str(mem)}, ctx)
+    assert r["ok"] is True
+    # Yield once so subscribers run
+    import asyncio as _a
+    await _a.sleep(0)
+    assert seen, "memory.retrieved should fire on list"
+    p = seen[0]
+    assert p["op"] == "list"
+    assert set(p["paths"]) == {"a.md", "b.md"}
+    assert p["mode"] == "execute"
+
+
+async def test_retrieved_event_on_get(tmp_path):
+    from yuxu.bundled.memory.handler import RETRIEVED_TOPIC
+    from yuxu.core.bus import Bus
+    bus = Bus()
+    seen: list[dict] = []
+    bus.subscribe(RETRIEVED_TOPIC, lambda e: seen.append(e.get("payload") or {}))
+
+    project = tmp_path
+    (project / "yuxu.json").write_text("{}\n")
+    mem = project / "data" / "memory"
+    mem.mkdir(parents=True)
+    _write_entry(mem, "a.md", name="A", description="d",
+                  type_="feedback", evidence_level="consensus")
+
+    ctx = SimpleNamespace(bus=bus, agent_dir=str(project / "agents" / "fake"))
+    r = await execute({"op": "get", "path": "a.md",
+                       "memory_root": str(mem)}, ctx)
+    assert r["ok"] is True
+    import asyncio as _a
+    await _a.sleep(0)
+    assert seen and seen[0]["op"] == "get"
+    assert seen[0]["paths"] == ["a.md"]
+
+
+async def test_retrieved_event_on_search(tmp_path):
+    from yuxu.bundled.memory.handler import RETRIEVED_TOPIC
+    from yuxu.core.bus import Bus
+    bus = Bus()
+    seen: list[dict] = []
+    bus.subscribe(RETRIEVED_TOPIC, lambda e: seen.append(e.get("payload") or {}))
+
+    project = tmp_path
+    (project / "yuxu.json").write_text("{}\n")
+    mem = project / "data" / "memory"
+    mem.mkdir(parents=True)
+    _write_entry(mem, "a.md", name="Kernel",
+                  description="core invariants",
+                  type_="feedback", evidence_level="consensus")
+
+    ctx = SimpleNamespace(bus=bus, agent_dir=str(project / "agents" / "fake"))
+    r = await execute({"op": "search", "query": "kernel",
+                       "memory_root": str(mem)}, ctx)
+    assert r["ok"] is True
+    import asyncio as _a
+    await _a.sleep(0)
+    assert seen and seen[0]["op"] == "search"
+    assert seen[0]["query"] == "kernel"
+    assert seen[0]["paths"] == ["a.md"]
+
+
+async def test_no_retrieved_event_when_empty_result(tmp_path):
+    """When a query returns zero hits, no event fires (nothing was retrieved)."""
+    from yuxu.bundled.memory.handler import RETRIEVED_TOPIC
+    from yuxu.core.bus import Bus
+    bus = Bus()
+    seen: list[dict] = []
+    bus.subscribe(RETRIEVED_TOPIC, lambda e: seen.append(e.get("payload") or {}))
+
+    project = tmp_path
+    (project / "yuxu.json").write_text("{}\n")
+    mem = project / "data" / "memory"
+    mem.mkdir(parents=True)
+    _write_entry(mem, "a.md", name="A", description="d",
+                  type_="feedback", evidence_level="consensus")
+    ctx = SimpleNamespace(bus=bus, agent_dir=str(project / "agents" / "fake"))
+
+    r = await execute({"op": "search", "query": "nonmatching term",
+                       "memory_root": str(mem)}, ctx)
+    assert r["ok"] is True
+    assert r["entries"] == []
+    import asyncio as _a
+    await _a.sleep(0)
+    assert not seen
+
+
+async def test_retrieval_gracefully_handles_no_bus(tmp_path):
+    """ctx without a bus → retrieval still works, just no event fired."""
+    project = tmp_path
+    (project / "yuxu.json").write_text("{}\n")
+    mem = project / "data" / "memory"
+    mem.mkdir(parents=True)
+    _write_entry(mem, "a.md", name="A", description="d",
+                  type_="feedback", evidence_level="consensus")
+    # No bus on ctx
+    ctx = SimpleNamespace(agent_dir=str(project / "agents" / "fake"))
+    r = await execute({"op": "list", "memory_root": str(mem)}, ctx)
+    assert r["ok"] is True
+    assert len(r["entries"]) == 1

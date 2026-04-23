@@ -18,6 +18,8 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+import json
+
 from yuxu.core.frontmatter import parse_frontmatter
 
 log = logging.getLogger(__name__)
@@ -48,6 +50,39 @@ def _atomic_write(path: Path, text: str) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
+
+
+def _stamp_probation_on_update(inner: str) -> str:
+    """For `update` actions: the new version inherits the prior
+    evidence_level but must be re-validated before trusted. Per I6:
+    score resets, `probation: true` is set. execute mode filters
+    probation entries until a helped-threshold clears them.
+
+    If the entry has no frontmatter, return it unchanged — downstream
+    readers will skip it from the index anyway.
+    """
+    fm, rest = parse_frontmatter(inner or "")
+    if not isinstance(fm, dict) or not fm:
+        return inner
+    fm["probation"] = True
+    fm["score"] = {
+        "applied": 0, "helped": 0, "hurt": 0,
+        "last_evaluated": time.strftime("%Y-%m-%d", time.localtime()),
+    }
+    lines = ["---"]
+    for k, v in fm.items():
+        if isinstance(v, (dict, list)):
+            lines.append(f"{k}: {json.dumps(v, ensure_ascii=False)}")
+        elif isinstance(v, bool):
+            lines.append(f"{k}: {'true' if v else 'false'}")
+        elif v is None:
+            lines.append(f"{k}: null")
+        else:
+            lines.append(f"{k}: {v}")
+    lines.append("---")
+    head = "\n".join(lines)
+    tail = rest if rest.startswith("\n") else ("\n" + rest)
+    return head + tail
 
 
 def _archive_draft(draft_path: Path) -> Path:
@@ -161,6 +196,12 @@ class ApprovalApplier:
                              "propose an add instead")
             return
 
+        # Updates enter probation per I6: new version inherits the prior
+        # evidence_level but score resets and filters exclude it from
+        # execute mode until a helped-threshold clears the flag.
+        if action == "update":
+            inner = _stamp_probation_on_update(inner)
+
         try:
             _atomic_write(target_path, inner)
         except OSError as e:
@@ -235,6 +276,9 @@ class ApprovalApplier:
             return {"ok": False, "error": f"add refused: {target_path} exists"}
         if action == "update" and not target_path.exists():
             return {"ok": False, "error": f"update refused: {target_path} missing"}
+
+        if action == "update":
+            inner = _stamp_probation_on_update(inner)
 
         _atomic_write(target_path, inner)
         try:

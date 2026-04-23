@@ -493,3 +493,119 @@ async def test_end_to_end_with_real_approval_queue_and_checkpoint(tmp_path,
     assert "Real memory body." in target.read_text(encoding="utf-8")
     assert not draft.exists()
     assert applied and applied[0]["approval_id"] == aid
+
+
+# -- Phase 5: probation on update ------------------------------
+
+
+def test_stamp_probation_injects_flag_and_resets_score():
+    from yuxu.bundled.approval_applier.handler import _stamp_probation_on_update
+    from yuxu.core.frontmatter import parse_frontmatter
+    inner = (
+        "---\n"
+        "name: feedback_testing\n"
+        "description: old value\n"
+        "type: feedback\n"
+        "evidence_level: consensus\n"
+        "status: current\n"
+        "score:\n"
+        "  applied: 12\n"
+        "  helped: 8\n"
+        "  hurt: 1\n"
+        "  last_evaluated: 2026-04-01\n"
+        "---\n\n"
+        "body\n"
+    )
+    out = _stamp_probation_on_update(inner)
+    fm, _ = parse_frontmatter(out)
+    assert fm["probation"] is True
+    assert fm["score"]["applied"] == 0
+    assert fm["score"]["helped"] == 0
+    assert fm["score"]["hurt"] == 0
+    # evidence_level inherited, not wiped
+    assert fm["evidence_level"] == "consensus"
+    # name / description preserved
+    assert fm["name"] == "feedback_testing"
+
+
+def test_stamp_probation_passthrough_on_no_frontmatter():
+    from yuxu.bundled.approval_applier.handler import _stamp_probation_on_update
+    raw = "plain text, no frontmatter\n"
+    assert _stamp_probation_on_update(raw) == raw
+
+
+async def test_update_approval_writes_probation_to_target(tmp_path):
+    """Full update flow: approved update lands on disk with probation=true."""
+    from yuxu.core.frontmatter import parse_frontmatter
+    bus = Bus()
+    # Seed an existing target
+    memory_root = tmp_path / "mem"
+    drafts = memory_root / "_drafts"
+    drafts.mkdir(parents=True)
+    target_rel = "feedback_x.md"
+    target_abs = memory_root / target_rel
+    target_abs.write_text(
+        "---\nname: feedback_x\ndescription: v1\ntype: feedback\n"
+        "evidence_level: consensus\n---\n\nold body\n",
+        encoding="utf-8",
+    )
+
+    # Create a draft proposing an update
+    draft = drafts / "curator_upd.md"
+    draft.write_text(
+        "---\n"
+        f"status: \"draft\"\nproposed_target: \"{target_rel}\"\n"
+        "proposed_action: \"update\"\nreflection_run_id: \"u1\"\n"
+        "---\n"
+        "---\n"
+        "name: feedback_x\n"
+        "description: v2 updated\n"
+        "type: feedback\n"
+        "evidence_level: consensus\n"
+        "status: current\n"
+        "---\n\nnew body\n",
+        encoding="utf-8",
+    )
+
+    _register_fake_aq(bus, {"A1": _fake_aq_entry(
+        "A1", draft, target=target_rel, action="update")})
+    _collect_events(bus, "approval_applier.applied")
+
+    applier = ApprovalApplier(_make_ctx(bus))
+    await applier.install()
+    await bus.publish("approval_queue.decided", {
+        "approval_id": "A1", "action": "memory_edit",
+        "decision": "approved", "requester": "x",
+    })
+    await _yield()
+
+    # Target now has probation=true and score reset
+    landed = target_abs.read_text(encoding="utf-8")
+    fm, _ = parse_frontmatter(landed)
+    assert fm["probation"] is True
+    assert fm["score"]["applied"] == 0
+    assert fm["evidence_level"] == "consensus"  # inherited from proposal
+    assert fm["description"] == "v2 updated"    # real content applied
+
+
+async def test_add_approval_does_not_stamp_probation(tmp_path):
+    """Only updates enter probation; a brand-new `add` lands as-is."""
+    from yuxu.core.frontmatter import parse_frontmatter
+    bus = Bus()
+    draft = _make_draft_file(tmp_path)  # defaults to add on feedback_x.md
+    _register_fake_aq(bus, {"A1": _fake_aq_entry("A1", draft)})
+    _collect_events(bus, "approval_applier.applied")
+
+    applier = ApprovalApplier(_make_ctx(bus))
+    await applier.install()
+    await bus.publish("approval_queue.decided", {
+        "approval_id": "A1", "action": "memory_edit",
+        "decision": "approved", "requester": "x",
+    })
+    await _yield()
+
+    target = tmp_path / "mem" / "feedback_x.md"
+    assert target.exists()
+    fm, _ = parse_frontmatter(target.read_text(encoding="utf-8"))
+    # add: no probation injection
+    assert fm.get("probation", False) is False
