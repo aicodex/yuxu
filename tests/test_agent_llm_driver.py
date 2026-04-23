@@ -625,3 +625,98 @@ async def test_agent_and_cost_hint_forwarded_to_llm_service():
     )
     assert seen[0]["agent"] == "reflection_agent"
     assert seen[0]["cost_hint"] == 1234
+
+
+# -- session transcript logging ---------------------------------
+
+
+class _FakeLoader:
+    """Just enough for LlmDriver._log_message to resolve a sender's dir."""
+    def __init__(self, specs: dict):
+        self.specs = specs
+
+
+async def test_run_turn_logs_messages_to_transcript(tmp_path):
+    import json
+    from types import SimpleNamespace
+
+    # Make tmp_path a yuxu project with an agent dir.
+    (tmp_path / "yuxu.json").write_text("{}\n")
+    agent_dir = tmp_path / "agents" / "caller"
+    agent_dir.mkdir(parents=True)
+
+    bus = Bus()
+    _register_llm(bus, [
+        {"ok": True, "content": "response-1", "tool_calls": [],
+         "stop_reason": "end_turn", "usage": {}},
+    ])
+    loader = _FakeLoader({"caller": SimpleNamespace(path=agent_dir)})
+    driver = LlmDriver(bus, loader=loader)
+    await driver.run_turn(
+        system_prompt="sys",
+        messages=[{"role": "user", "content": "hi"}],
+        pool="p", model="m",
+        agent="caller",
+    )
+    log_path = tmp_path / "data" / "sessions" / "caller.jsonl"
+    assert log_path.exists()
+    entries = [json.loads(ln) for ln in log_path.read_text(encoding="utf-8").splitlines()]
+    roles = [(e["event"], e.get("role")) for e in entries]
+    assert ("message", "user") in roles
+    assert ("message", "assistant") in roles
+
+
+async def test_run_turn_logs_tool_messages(tmp_path):
+    import json
+    from types import SimpleNamespace
+
+    (tmp_path / "yuxu.json").write_text("{}\n")
+    agent_dir = tmp_path / "agents" / "caller"
+    agent_dir.mkdir(parents=True)
+
+    bus = Bus()
+    _register_llm(bus, [
+        {"ok": True, "content": None,
+         "tool_calls": [{"id": "c1", "name": "ping", "input": {}}],
+         "stop_reason": "tool_use", "usage": {}},
+        {"ok": True, "content": "done", "tool_calls": [],
+         "stop_reason": "end_turn", "usage": {}},
+    ])
+
+    async def ping(msg):
+        return {"output": "pong"}
+    bus.register("ping", ping)
+
+    loader = _FakeLoader({"caller": SimpleNamespace(path=agent_dir)})
+    driver = LlmDriver(bus, loader=loader)
+    await driver.run_turn(
+        system_prompt="sys",
+        messages=[{"role": "user", "content": "ping please"}],
+        pool="p", model="m",
+        tools=[{"name": "ping", "description": "", "parameters": {}}],
+        agent="caller",
+    )
+    log_path = tmp_path / "data" / "sessions" / "caller.jsonl"
+    entries = [json.loads(ln) for ln in log_path.read_text(encoding="utf-8").splitlines()]
+    roles = [e.get("role") for e in entries if e["event"] == "message"]
+    # user, assistant (tool_use), tool, assistant (final)
+    assert roles == ["user", "assistant", "tool", "assistant"]
+    tool_entry = next(e for e in entries if e.get("role") == "tool")
+    assert tool_entry.get("tool_name") == "ping"
+    assert tool_entry.get("iteration") == 1
+
+
+async def test_run_turn_no_logging_without_loader(tmp_path):
+    # Backward compat: LlmDriver with no loader must still work (unit tests
+    # mostly don't pass one).
+    bus = Bus()
+    _register_llm(bus, [{"ok": True, "content": "ok", "tool_calls": [],
+                         "stop_reason": "end_turn", "usage": {}}])
+    driver = LlmDriver(bus)  # no loader
+    r = await driver.run_turn(
+        system_prompt="s", messages=[{"role": "user", "content": "x"}],
+        pool="p", model="m", agent="caller",
+    )
+    assert r["ok"] is True
+    # no sessions dir should appear under tmp_path
+    assert not (tmp_path / "data" / "sessions").exists()

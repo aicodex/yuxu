@@ -94,7 +94,9 @@ class ProjectSupervisor:
         dq.append(now)
         log.info("supervisor: restarting %s (attempt %d)", agent, len(dq))
         try:
-            status = await self.loader.restart(agent)
+            status = await self.loader.restart(
+                agent, reason=f"supervisor_restart_attempt_{len(dq)}",
+            )
         except Exception as e:
             log.exception("supervisor: restart of %s failed", agent)
             await self.bus.publish(f"{NAME}.restart_failed", {

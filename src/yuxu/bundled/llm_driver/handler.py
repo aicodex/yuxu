@@ -12,6 +12,8 @@ import json
 import logging
 from typing import Any, Optional
 
+from yuxu.core import session_log
+
 log = logging.getLogger(__name__)
 
 DEFAULT_MAX_ITERATIONS = 32
@@ -81,8 +83,22 @@ class LlmDriver:
     RETRY_BACKOFF_BASE_SEC = 1.0
     RETRY_BACKOFF_MAX_SEC = 30.0
 
-    def __init__(self, bus) -> None:
+    def __init__(self, bus, loader=None) -> None:
         self.bus = bus
+        self.loader = loader
+
+    async def _log_message(self, sender: Optional[str], entry: dict) -> None:
+        """Append a message line to sender's session transcript. No-op if
+        loader isn't wired (e.g. unit tests) or sender is unknown."""
+        if not sender or self.loader is None:
+            return
+        spec = self.loader.specs.get(sender)
+        if spec is None:
+            return
+        try:
+            await session_log.append(spec.path, sender, {"event": "message", **entry})
+        except Exception:
+            log.exception("llm_driver: session_log.append(%s) raised", sender)
 
     async def run_turn(
         self,
@@ -113,6 +129,12 @@ class LlmDriver:
         stop_reason = "max_iter"
         error_msg: Optional[str] = None
         iterations_done = 0
+
+        # Log the input messages (treat this run_turn call as one turn). Each
+        # subsequent run_turn call from the same sender will append its own
+        # input + outputs to the same JSONL; lifecycle lines separate runs.
+        for m in messages:
+            await self._log_message(agent, m)
 
         for it in range(max_iterations):
             iterations_done = it + 1
@@ -155,7 +177,9 @@ class LlmDriver:
             total_completion += usage.get("completion_tokens") or 0
             total_elapsed_ms += float(resp.get("elapsed_ms") or 0.0)
 
-            messages.append(_assistant_message(resp))
+            asst_msg = _assistant_message(resp)
+            messages.append(asst_msg)
+            await self._log_message(agent, {**asst_msg, "iteration": it + 1})
 
             tool_calls = resp.get("tool_calls") or []
             if not tool_calls:
@@ -185,11 +209,14 @@ class LlmDriver:
                 except Exception as e:
                     body = {"error": f"tool {name}: {e}"}
                 content = _cap(_tool_result_content(body), max_output_bytes)
-                messages.append({
+                tool_msg = {
                     "role": "tool",
                     "tool_call_id": tc.get("id"),
                     "content": content,
-                })
+                }
+                messages.append(tool_msg)
+                await self._log_message(agent, {**tool_msg, "tool_name": name,
+                                                 "iteration": it + 1})
 
         # Aggregate throughput across iterations. elapsed_ms sums only the
         # llm_service call time (excludes tool dispatch + local work), so

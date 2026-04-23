@@ -474,3 +474,143 @@ async def test_filter_by_surface(tmp_path):
     await loader.scan()
     assert {s.name for s in loader.filter(surface="menu")} == {"menu_skill"}
     assert {s.name for s in loader.filter(surface="command")} == {"menu_skill"}
+
+
+# -- session transcript + session.ended hook --------------------------
+
+
+def _write_yuxu_project(root: Path) -> Path:
+    """Make `root` a yuxu project with an `agents/` subdir; return agents root."""
+    (root / "yuxu.json").write_text("{}\n")
+    agents = root / "agents"
+    agents.mkdir()
+    return agents
+
+
+def _read_jsonl(path: Path) -> list[dict]:
+    import json
+    return [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines()]
+
+
+async def test_lifecycle_written_on_persistent_start(tmp_path):
+    agents = _write_yuxu_project(tmp_path)
+    init = """
+        async def start(ctx):
+            await ctx.ready()
+    """
+    _write_agent(agents, "alpha", fm={"run_mode": "persistent"}, init_src=init)
+    bus = Bus()
+    loader = Loader(bus, [str(agents)])
+    await loader.scan()
+    await loader.ensure_running("alpha")
+    jsonl = tmp_path / "data" / "sessions" / "alpha.jsonl"
+    assert jsonl.exists()
+    entries = _read_jsonl(jsonl)
+    assert entries[-1]["event"] == "lifecycle"
+    assert entries[-1]["state"] == "ready"
+
+
+async def test_session_ended_published_on_stop(tmp_path):
+    agents = _write_yuxu_project(tmp_path)
+    init = """
+        import asyncio
+        async def start(ctx):
+            async def _loop():
+                await ctx.ready()
+                await asyncio.sleep(10)
+            asyncio.create_task(_loop())
+    """
+    _write_agent(agents, "svc", fm={"run_mode": "persistent"}, init_src=init)
+    bus = Bus()
+    captured: list[dict] = []
+
+    async def on_end(event):
+        captured.append(event["payload"])
+
+    bus.subscribe("session.ended", on_end)
+    loader = Loader(bus, [str(agents)])
+    await loader.scan()
+    await loader.ensure_running("svc")
+    await loader.stop("svc", reason="test")
+    await asyncio.sleep(0)  # let subscribers run
+    assert captured, "session.ended must fire on stop"
+    payload = captured[-1]
+    assert payload["agent"] == "svc"
+    assert payload["state"] == "stopped"
+    assert payload["reason"] == "test"
+    assert payload["transcript_path"] is not None
+    entries = _read_jsonl(Path(payload["transcript_path"]))
+    states = [e.get("state") for e in entries if e.get("event") == "lifecycle"]
+    assert states == ["ready", "stopped"]
+
+
+async def test_one_shot_completion_emits_session_ended(tmp_path):
+    agents = _write_yuxu_project(tmp_path)
+    init = """
+        async def start(ctx):
+            await ctx.ready()
+    """
+    _write_agent(agents, "once", fm={"run_mode": "one_shot"}, init_src=init)
+    bus = Bus()
+    captured: list[dict] = []
+
+    async def on_end(event):
+        captured.append(event["payload"])
+
+    bus.subscribe("session.ended", on_end)
+    loader = Loader(bus, [str(agents)])
+    await loader.scan()
+    await loader.ensure_running("once")
+    await asyncio.sleep(0)
+    assert captured, "one_shot completion must emit session.ended"
+    assert captured[-1]["state"] == "completed"
+    assert captured[-1]["agent"] == "once"
+
+
+async def test_crash_emits_session_ended_with_reason(tmp_path):
+    agents = _write_yuxu_project(tmp_path)
+    # start() itself is the loader-tracked task; raising here crashes it so
+    # _on_task_done fires and session.ended is emitted with reason.
+    init = """
+        import asyncio
+        async def start(ctx):
+            await ctx.ready()
+            await asyncio.sleep(0)
+            raise RuntimeError("boom")
+    """
+    _write_agent(agents, "crasher", fm={"run_mode": "persistent"}, init_src=init)
+    bus = Bus()
+    captured: list[dict] = []
+
+    async def on_end(event):
+        captured.append(event["payload"])
+
+    bus.subscribe("session.ended", on_end)
+    loader = Loader(bus, [str(agents)])
+    await loader.scan()
+    await loader.ensure_running("crasher")
+    # Crash path: _on_task_done -> create_task(_handle_task_crash) -> publish.
+    # We need several yields for the crash task + subscriber fan-out.
+    for _ in range(30):
+        if captured:
+            break
+        await asyncio.sleep(0.05)
+    assert captured, "crash must emit session.ended"
+    payload = captured[-1]
+    assert payload["state"] == "failed"
+    assert "boom" in (payload.get("reason") or "")
+
+
+async def test_no_transcript_when_no_yuxu_json(tmp_path):
+    # tmp_path has no yuxu.json: session_log should no-op; session.ended still
+    # fires but with transcript_path=None
+    _write_agent(tmp_path, "alpha", fm={"run_mode": "one_shot"},
+                 init_src="async def start(ctx): await ctx.ready()\n")
+    bus = Bus()
+    captured: list[dict] = []
+    bus.subscribe("session.ended", lambda e: captured.append(e["payload"]))
+    loader = Loader(bus, [str(tmp_path)])
+    await loader.scan()
+    await loader.ensure_running("alpha")
+    await asyncio.sleep(0)
+    assert captured and captured[-1]["transcript_path"] is None

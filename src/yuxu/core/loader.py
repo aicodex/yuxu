@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from . import session_log
 from .bus import Bus
 from .context import AgentContext
 from .frontmatter import parse_frontmatter
@@ -231,15 +232,15 @@ class Loader:
             if not spec.has_init:
                 # LLM-only agent: kernel just marks it ready; llm_driver handles it.
                 await self.bus.publish_status(spec.name, "ready")
+                await self._write_lifecycle(spec, "ready")
                 return
 
             mod = self._import_agent_module(spec)
             self.modules[spec.name] = mod
             entry_fn = getattr(mod, spec.entry, None)
             if entry_fn is None:
-                # Empty __init__.py or no start() — auto-ready. Handler can
-                # register lazily via get_handle / other agents.
                 await self.bus.publish_status(spec.name, "ready")
+                await self._write_lifecycle(spec, "ready")
                 return
 
             ctx = self._build_context(spec)
@@ -250,20 +251,27 @@ class Loader:
                     self.tasks[spec.name] = task
                     task.add_done_callback(lambda t, n=spec.name: self._on_task_done(n, t))
                     await self.bus.wait_for_service(spec.name, timeout=spec.ready_timeout)
+                    await self._write_lifecycle(spec, "ready")
                 else:
+                    # one_shot / scheduled / triggered / spawned: awaiting start()
+                    # until it returns IS the "session". Emit session.ended after.
                     await asyncio.wait_for(result, timeout=spec.ready_timeout)
                     if self.bus.query_status(spec.name) not in ("ready", "running", "stopped"):
                         await self.bus.publish_status(spec.name, "ready")
+                    await self._emit_session_end(spec, state="completed")
             else:
                 if self.bus.query_status(spec.name) not in ("ready", "running"):
                     await self.bus.publish_status(spec.name, "ready")
+                await self._write_lifecycle(spec, "ready")
         except asyncio.TimeoutError:
             log.error("loader: %s ready_timeout after %.1fs", spec.name, spec.ready_timeout)
             await self.bus.publish_status(spec.name, "failed")
+            await self._emit_session_end(spec, state="failed", reason="ready_timeout")
             raise
-        except Exception:
+        except Exception as e:
             log.exception("loader: %s failed to start", spec.name)
             await self.bus.publish_status(spec.name, "failed")
+            await self._emit_session_end(spec, state="failed", reason=f"start_error: {e}")
             raise
 
     def _build_context(self, spec: AgentSpec) -> AgentContext:
@@ -357,15 +365,24 @@ class Loader:
         exc = task.exception()
         if exc is not None:
             log.exception("agent %s task crashed", name, exc_info=exc)
-            asyncio.create_task(self.bus.publish_status(name, "failed"))
+            spec = self.specs.get(name)
+            asyncio.create_task(self._handle_task_crash(name, spec, exc))
+
+    async def _handle_task_crash(self, name: str, spec: Optional[AgentSpec],
+                                  exc: BaseException) -> None:
+        await self.bus.publish_status(name, "failed")
+        if spec is not None:
+            await self._emit_session_end(spec, state="failed",
+                                          reason=f"crashed: {exc}")
 
     STOP_HOOK_TIMEOUT = 10.0  # seconds an agent's stop(ctx) has before we cancel
 
-    async def stop(self, name: str, cascade: bool = False) -> None:
+    async def stop(self, name: str, cascade: bool = False,
+                   *, reason: Optional[str] = None) -> None:
         if cascade:
             dependents = [n for n, s in self.specs.items() if name in s.depends_on]
             for d in dependents:
-                await self.stop(d, cascade=True)
+                await self.stop(d, cascade=True, reason=reason)
 
         # Call optional async def stop(ctx) BEFORE cancelling its task.
         mod = self.modules.get(name)
@@ -391,10 +408,53 @@ class Loader:
                 pass
         self.bus.unregister(name)
         await self.bus.publish_status(name, "stopped")
+        if spec is not None:
+            await self._emit_session_end(spec, state="stopped", reason=reason)
 
-    async def restart(self, name: str) -> str:
-        await self.stop(name)
+    async def restart(self, name: str, *, reason: Optional[str] = None) -> str:
+        await self.stop(name, reason=reason or "restart")
         return await self.ensure_running(name)
+
+    # -- session transcript helpers ---------------------------------
+
+    async def _write_lifecycle(self, spec: AgentSpec, state: str,
+                                reason: Optional[str] = None) -> None:
+        """Append a lifecycle JSONL line; do not publish session.ended.
+
+        Used for non-terminal transitions (ready) so readers can see when a
+        run *started*, independent of when it ends.
+        """
+        entry: dict[str, Any] = {"event": "lifecycle", "state": state}
+        if reason:
+            entry["reason"] = reason
+        try:
+            await session_log.append(spec.path, spec.name, entry)
+        except Exception:
+            log.exception("loader: session_log.append(%s, %s) raised",
+                          spec.name, state)
+
+    async def _emit_session_end(self, spec: AgentSpec, *, state: str,
+                                 reason: Optional[str] = None) -> None:
+        """Append a terminal lifecycle line AND publish session.ended."""
+        entry: dict[str, Any] = {"event": "lifecycle", "state": state}
+        if reason:
+            entry["reason"] = reason
+        transcript_path: Optional[Path] = None
+        try:
+            transcript_path = await session_log.append(spec.path, spec.name, entry)
+        except Exception:
+            log.exception("loader: session_log.append(%s, %s) raised",
+                          spec.name, state)
+        try:
+            await self.bus.publish("session.ended", {
+                "agent": spec.name,
+                "state": state,
+                "reason": reason,
+                "transcript_path": str(transcript_path) if transcript_path else None,
+            })
+        except Exception:
+            log.exception("loader: publish session.ended for %s raised",
+                          spec.name)
 
     def get_state(self, name: Optional[str] = None):
         if name is not None:
