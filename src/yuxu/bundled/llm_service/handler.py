@@ -14,7 +14,23 @@ from typing import Any, Callable, Optional
 
 import httpx
 
+from .anthropic_adapter import (
+    build_anthropic_request,
+    parse_anthropic_response,
+)
+
 log = logging.getLogger(__name__)
+
+# Provider API dialect. Each rate_limit_service account can declare its dialect
+# in `extra.api`; defaults to "openai" for backward compat.
+VALID_APIS = {"openai", "anthropic-messages"}
+
+# Anthropic (and MiniMax's Anthropic endpoint) require max_tokens on every
+# request; OpenAI treats it as optional. This default matches OpenClaw's
+# common settings and is well within MiniMax M2.7's 131072 max.
+DEFAULT_ANTHROPIC_MAX_TOKENS = 4096
+
+ANTHROPIC_VERSION = "2023-06-01"
 
 # Match <think>...</think>, <thinking>...</thinking>, with optional attributes,
 # case-insensitive, dotall (spans newlines). Also greedy-tolerant: strips a
@@ -75,6 +91,54 @@ class ProviderRateLimitError(LLMServiceError):
 MINIMAX_RATE_LIMIT_CODES = {1002, 1039, 1027}  # 1002 RPM, 1039 concurrent, 1027 overload
 
 
+def _classify_http_error(resp: "httpx.Response") -> None:
+    """Convert HTTP-level errors into yuxu's exception types.
+
+    Used by both OpenAI and Anthropic code paths.
+    """
+    if resp.status_code == 429:
+        retry_after = resp.headers.get("Retry-After")
+        ra_sec: Optional[float] = None
+        if retry_after:
+            try:
+                ra_sec = float(retry_after)
+            except ValueError:
+                ra_sec = None
+        raise ProviderRateLimitError(
+            f"HTTP 429 rate-limited by provider: {resp.text[:200]}",
+            retry_after_sec=ra_sec, code="http_429",
+        )
+    if resp.status_code >= 400:
+        raise LLMServiceError(f"HTTP {resp.status_code}: {resp.text[:300]}")
+
+
+def _classify_minimax_base_resp(api_resp: Any) -> None:
+    """MiniMax uses an in-body `base_resp` error envelope even on HTTP 200.
+
+    Shared between OpenAI-compatible and Anthropic-compatible MiniMax relays
+    since MiniMax sometimes wraps errors on both.
+    """
+    if not isinstance(api_resp, dict):
+        return
+    base_resp = api_resp.get("base_resp")
+    if not isinstance(base_resp, dict):
+        return
+    code = base_resp.get("status_code")
+    try:
+        code_i = int(code) if code is not None else 0
+    except (TypeError, ValueError):
+        code_i = 0
+    if code_i in MINIMAX_RATE_LIMIT_CODES:
+        raise ProviderRateLimitError(
+            f"MiniMax {code_i}: {base_resp.get('status_msg', '')}",
+            code=f"minimax_{code_i}",
+        )
+    if code_i != 0:
+        raise LLMServiceError(
+            f"MiniMax base_resp {code_i}: {base_resp.get('status_msg', '')}"
+        )
+
+
 class LLMService:
     DEFAULT_TIMEOUT = 60.0
     COMPLETION_TOPIC = "llm_service.request_completed"
@@ -108,7 +172,9 @@ class LLMService:
                    strip_thinking_blocks: bool = False,
                    agent: Optional[str] = None,
                    cost_hint: Optional[float] = None,
-                   priority: str = "normal") -> dict:
+                   priority: str = "normal",
+                   thinking: Any = None,
+                   max_tokens: Optional[int] = None) -> dict:
         # Pass identity + budget + priority downstream so rate_limit_service
         # can do weighted admission (DWRR) + retry priority lane. All optional
         # for backwards compat — rate_limiters that don't accept these kwargs
@@ -128,6 +194,12 @@ class LLMService:
             extra = ctx.get("extra") or {}
             api_key = extra.get("api_key")
             base_url = extra.get("base_url", "")
+            api_kind = extra.get("api", "openai")
+            if api_kind not in VALID_APIS:
+                raise LLMServiceError(
+                    f"account {ctx.get('account')!r} in pool {pool!r} has "
+                    f"unknown api={api_kind!r} (valid: {sorted(VALID_APIS)})"
+                )
             if not api_key:
                 raise LLMServiceError(
                     f"account {ctx.get('account')!r} in pool {pool!r} has no api_key"
@@ -136,65 +208,25 @@ class LLMService:
                 raise LLMServiceError(
                     f"account {ctx.get('account')!r} in pool {pool!r} has no base_url"
                 )
-            url = base_url.rstrip("/") + "/chat/completions"
-            body: dict[str, Any] = {"model": model, "messages": messages}
-            if temperature is not None:
-                body["temperature"] = temperature
-            if tools:
-                body["tools"] = tools
-            if json_mode:
-                body["response_format"] = {"type": "json_object"}
-            if extra_body:
-                body.update(extra_body)
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            }
             client = self._get_client()
-            t0 = time.perf_counter()
-            try:
-                resp = await client.post(url, json=body, headers=headers,
-                                         timeout=timeout or self.default_timeout)
-            except httpx.RequestError as e:
-                raise LLMServiceError(f"request error: {e}") from e
-            elapsed_ms = (time.perf_counter() - t0) * 1000.0
-            if resp.status_code == 429:
-                retry_after = resp.headers.get("Retry-After")
-                ra_sec: Optional[float] = None
-                if retry_after:
-                    try:
-                        ra_sec = float(retry_after)
-                    except ValueError:
-                        ra_sec = None
-                raise ProviderRateLimitError(
-                    f"HTTP 429 rate-limited by provider: {resp.text[:200]}",
-                    retry_after_sec=ra_sec, code="http_429",
+            req_timeout = timeout or self.default_timeout
+
+            if api_kind == "anthropic-messages":
+                normalized, elapsed_ms = await self._request_anthropic(
+                    client=client, base_url=base_url, api_key=api_key,
+                    model=model, messages=messages, tools=tools,
+                    temperature=temperature, thinking=thinking,
+                    max_tokens=max_tokens, extra_body=extra_body,
+                    timeout=req_timeout,
                 )
-            if resp.status_code >= 400:
-                text = resp.text
-                raise LLMServiceError(f"HTTP {resp.status_code}: {text[:300]}")
-            try:
-                api_resp = resp.json()
-            except json.JSONDecodeError as e:
-                raise LLMServiceError(f"non-JSON response: {e}") from e
-            # MiniMax uses an in-body error envelope even on HTTP 200.
-            base_resp = api_resp.get("base_resp") if isinstance(api_resp, dict) else None
-            if isinstance(base_resp, dict):
-                code = base_resp.get("status_code")
-                try:
-                    code_i = int(code) if code is not None else 0
-                except (TypeError, ValueError):
-                    code_i = 0
-                if code_i in MINIMAX_RATE_LIMIT_CODES:
-                    raise ProviderRateLimitError(
-                        f"MiniMax {code_i}: {base_resp.get('status_msg', '')}",
-                        code=f"minimax_{code_i}",
-                    )
-                if code_i != 0:
-                    raise LLMServiceError(
-                        f"MiniMax base_resp {code_i}: {base_resp.get('status_msg', '')}"
-                    )
-            normalized = self._normalize(api_resp)
+            else:
+                normalized, elapsed_ms = await self._request_openai(
+                    client=client, base_url=base_url, api_key=api_key,
+                    model=model, messages=messages, tools=tools,
+                    temperature=temperature, json_mode=json_mode,
+                    extra_body=extra_body, timeout=req_timeout,
+                )
+
             if strip_thinking_blocks:
                 normalized["content"] = _strip_thinking_blocks(
                     normalized.get("content")
@@ -219,12 +251,93 @@ class LLMService:
                 ctx["actual_cost"] = total_tokens
             return normalized
 
+    async def _request_openai(self, *, client: httpx.AsyncClient, base_url: str,
+                              api_key: str, model: str, messages: list[dict],
+                              tools: Optional[list[dict]],
+                              temperature: Optional[float], json_mode: bool,
+                              extra_body: Optional[dict],
+                              timeout: float) -> tuple[dict, float]:
+        url = base_url.rstrip("/") + "/chat/completions"
+        body: dict[str, Any] = {"model": model, "messages": messages}
+        if temperature is not None:
+            body["temperature"] = temperature
+        if tools:
+            body["tools"] = tools
+        if json_mode:
+            body["response_format"] = {"type": "json_object"}
+        if extra_body:
+            body.update(extra_body)
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        t0 = time.perf_counter()
+        try:
+            resp = await client.post(url, json=body, headers=headers,
+                                     timeout=timeout)
+        except httpx.RequestError as e:
+            raise LLMServiceError(f"request error: {e}") from e
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        _classify_http_error(resp)
+        try:
+            api_resp = resp.json()
+        except json.JSONDecodeError as e:
+            raise LLMServiceError(f"non-JSON response: {e}") from e
+        _classify_minimax_base_resp(api_resp)
+        return self._normalize(api_resp), elapsed_ms
+
+    async def _request_anthropic(self, *, client: httpx.AsyncClient,
+                                  base_url: str, api_key: str, model: str,
+                                  messages: list[dict],
+                                  tools: Optional[list[dict]],
+                                  temperature: Optional[float],
+                                  thinking: Any, max_tokens: Optional[int],
+                                  extra_body: Optional[dict],
+                                  timeout: float) -> tuple[dict, float]:
+        # MiniMax's Anthropic endpoint leaks thinking blocks as visible content
+        # when thinking is enabled in streaming. We don't stream in v0, and
+        # default to disabled unless the caller opts in — matches OpenClaw's
+        # `minimax-stream-wrappers.ts:53-76` defensive injection.
+        effective_thinking = thinking if thinking is not None else "off"
+        body = build_anthropic_request(
+            model=model,
+            messages=messages,
+            max_tokens=int(max_tokens or DEFAULT_ANTHROPIC_MAX_TOKENS),
+            tools=tools,
+            temperature=temperature,
+            thinking=effective_thinking,
+            extra_body=extra_body,
+        )
+        url = base_url.rstrip("/") + "/v1/messages"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "anthropic-version": ANTHROPIC_VERSION,
+            "MM-API-Source": "yuxu",  # opt-in attribution per OpenClaw pattern
+        }
+        t0 = time.perf_counter()
+        try:
+            resp = await client.post(url, json=body, headers=headers,
+                                     timeout=timeout)
+        except httpx.RequestError as e:
+            raise LLMServiceError(f"request error: {e}") from e
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        _classify_http_error(resp)
+        try:
+            api_resp = resp.json()
+        except json.JSONDecodeError as e:
+            raise LLMServiceError(f"non-JSON response: {e}") from e
+        # Some MiniMax relays still wrap Anthropic-path errors in base_resp.
+        _classify_minimax_base_resp(api_resp)
+        return parse_anthropic_response(api_resp), elapsed_ms
+
     def _normalize(self, api_resp: dict) -> dict:
         choices = api_resp.get("choices") or []
         if not choices:
             return {
                 "content": None,
                 "tool_calls": [],
+                "reasoning": None,
                 "stop_reason": "end_turn",
                 "usage": api_resp.get("usage") or {},
             }
@@ -246,9 +359,16 @@ class LLMService:
         stop_reason = "tool_use" if tool_calls else (
             "end_turn" if finish in ("stop", "end_turn") else finish
         )
+        # DeepSeek-style reasoning_content on the message (OpenAI-compat does
+        # not standardize this; surface it if present). MiniMax's OpenAI path
+        # embeds thinking inside content as <think> tags; those are only
+        # stripped out via strip_thinking_blocks — we do not reconstruct them
+        # here, since they'd duplicate the cleaned content.
+        reasoning = msg.get("reasoning_content") or None
         return {
             "content": msg.get("content"),
             "tool_calls": tool_calls,
+            "reasoning": reasoning,
             "stop_reason": stop_reason,
             "usage": api_resp.get("usage") or {},
         }
@@ -285,6 +405,12 @@ class LLMService:
                       or getattr(msg, "sender", None) or None,
                 cost_hint=payload.get("cost_hint"),
                 priority=payload.get("priority", "normal"),
+                # v0.3: Anthropic Messages API support (MiniMax /anthropic).
+                # thinking accepts str preset (off/low/medium/high/xhigh) or
+                # raw dict. max_tokens required for Anthropic path; defaulted
+                # when absent.
+                thinking=payload.get("thinking"),
+                max_tokens=payload.get("max_tokens"),
             )
         except ProviderRateLimitError as e:
             # Surface as a structured error the caller can classify without

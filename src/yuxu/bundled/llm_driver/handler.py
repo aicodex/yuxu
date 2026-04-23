@@ -119,6 +119,8 @@ class LlmDriver:
         max_total_tokens: Optional[int] = DEFAULT_MAX_TOTAL_TOKENS,
         agent: Optional[str] = None,
         cost_hint: Optional[float] = None,
+        thinking: Any = None,
+        max_tokens: Optional[int] = None,
     ) -> dict:
         dispatch = tool_dispatch or {}
         total_prompt = 0
@@ -126,6 +128,7 @@ class LlmDriver:
         total_elapsed_ms = 0.0
         total_retries = 0
         final_content: Optional[str] = None
+        final_reasoning: Optional[str] = None
         stop_reason = "max_iter"
         error_msg: Optional[str] = None
         iterations_done = 0
@@ -156,6 +159,10 @@ class LlmDriver:
                 base_req["agent"] = agent
             if cost_hint is not None:
                 base_req["cost_hint"] = cost_hint
+            if thinking is not None:
+                base_req["thinking"] = thinking
+            if max_tokens is not None:
+                base_req["max_tokens"] = max_tokens
 
             resp, retries, fatal_error = await self._call_with_retry(
                 base_req, llm_timeout, agent,
@@ -172,10 +179,29 @@ class LlmDriver:
                 break
 
             final_content = resp.get("content")
+            # Keep the most recent non-empty reasoning for callers that want
+            # a quick summary without reading the full transcript.
+            iter_reasoning = resp.get("reasoning")
+            if iter_reasoning:
+                final_reasoning = iter_reasoning
             usage = resp.get("usage") or {}
             total_prompt += usage.get("prompt_tokens") or 0
             total_completion += usage.get("completion_tokens") or 0
             total_elapsed_ms += float(resp.get("elapsed_ms") or 0.0)
+
+            # Log reasoning (Anthropic thinking blocks / DeepSeek
+            # reasoning_content) BEFORE the assistant message so the
+            # transcript reads in temporal order: user -> reasoning ->
+            # assistant -> tool. Reasoning is NOT appended to `messages`
+            # because most providers either bury it in content (MiniMax
+            # OpenAI-path) or need it only for interleaved-thinking
+            # multi-turn — which yuxu doesn't do yet.
+            reasoning = resp.get("reasoning")
+            if reasoning:
+                await self._log_message(agent, {
+                    "role": "assistant", "kind": "reasoning",
+                    "content": reasoning, "iteration": it + 1,
+                })
 
             asst_msg = _assistant_message(resp)
             messages.append(asst_msg)
@@ -227,6 +253,7 @@ class LlmDriver:
         return {
             "ok": stop_reason == "complete",
             "content": final_content,
+            "reasoning": final_reasoning,
             "iterations": iterations_done,
             "stop_reason": stop_reason,
             "usage": {"prompt_tokens": total_prompt, "completion_tokens": total_completion},
@@ -322,6 +349,8 @@ class LlmDriver:
             max_total_tokens=payload.get("max_total_tokens", DEFAULT_MAX_TOTAL_TOKENS),
             agent=payload.get("agent") or original_sender,
             cost_hint=payload.get("cost_hint"),
+            thinking=payload.get("thinking"),
+            max_tokens=payload.get("max_tokens"),
         )
         result["messages"] = messages
         return result

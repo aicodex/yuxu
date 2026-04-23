@@ -720,3 +720,101 @@ async def test_run_turn_no_logging_without_loader(tmp_path):
     assert r["ok"] is True
     # no sessions dir should appear under tmp_path
     assert not (tmp_path / "data" / "sessions").exists()
+
+
+# -- reasoning (Anthropic thinking blocks) pipeline -----------------
+
+
+async def test_run_turn_forwards_thinking_and_max_tokens():
+    bus = Bus()
+    seen = _register_llm_capture(bus, {
+        "ok": True, "content": "ok", "tool_calls": [], "reasoning": None,
+        "stop_reason": "end_turn", "usage": {},
+    })
+    driver = LlmDriver(bus)
+    await driver.run_turn(
+        system_prompt="s", messages=[{"role": "user", "content": "x"}],
+        pool="p", model="m", thinking="medium", max_tokens=2048,
+    )
+    assert seen[0]["thinking"] == "medium"
+    assert seen[0]["max_tokens"] == 2048
+
+
+async def test_run_turn_returns_reasoning_when_provider_emits_it():
+    bus = Bus()
+    _register_llm(bus, [{
+        "ok": True, "content": "the answer is 42", "tool_calls": [],
+        "reasoning": "step 1 ... step 2 ... step 3",
+        "stop_reason": "end_turn", "usage": {},
+    }])
+    driver = LlmDriver(bus)
+    r = await driver.run_turn(
+        system_prompt="s", messages=[{"role": "user", "content": "x"}],
+        pool="p", model="m",
+    )
+    assert r["ok"] is True
+    assert r["content"] == "the answer is 42"
+    assert r["reasoning"] == "step 1 ... step 2 ... step 3"
+
+
+async def test_run_turn_logs_reasoning_as_separate_transcript_event(tmp_path):
+    import json
+    from types import SimpleNamespace
+
+    (tmp_path / "yuxu.json").write_text("{}\n")
+    agent_dir = tmp_path / "agents" / "caller"
+    agent_dir.mkdir(parents=True)
+
+    bus = Bus()
+    _register_llm(bus, [{
+        "ok": True, "content": "final answer", "tool_calls": [],
+        "reasoning": "deliberation here",
+        "stop_reason": "end_turn", "usage": {},
+    }])
+    loader = _FakeLoader({"caller": SimpleNamespace(path=agent_dir)})
+    driver = LlmDriver(bus, loader=loader)
+    await driver.run_turn(
+        system_prompt="sys",
+        messages=[{"role": "user", "content": "hard question"}],
+        pool="p", model="m", agent="caller",
+    )
+    log_path = tmp_path / "data" / "sessions" / "caller.jsonl"
+    entries = [json.loads(ln) for ln in log_path.read_text(encoding="utf-8").splitlines()]
+    # Should see: user message, reasoning (kind=reasoning), assistant message
+    roles = [(e["event"], e.get("role"), e.get("kind")) for e in entries]
+    assert ("message", "user", None) in roles
+    # reasoning event shape
+    reasoning_entries = [e for e in entries if e.get("kind") == "reasoning"]
+    assert len(reasoning_entries) == 1
+    assert reasoning_entries[0]["content"] == "deliberation here"
+    assert reasoning_entries[0]["iteration"] == 1
+    # reasoning ordering: must appear BEFORE the final assistant message
+    r_idx = next(i for i, e in enumerate(entries) if e.get("kind") == "reasoning")
+    a_idx = next(i for i, e in enumerate(entries)
+                 if e.get("role") == "assistant" and e.get("kind") != "reasoning")
+    assert r_idx < a_idx
+
+
+async def test_run_turn_no_reasoning_event_when_provider_omits_it(tmp_path):
+    import json
+    from types import SimpleNamespace
+
+    (tmp_path / "yuxu.json").write_text("{}\n")
+    agent_dir = tmp_path / "agents" / "caller"
+    agent_dir.mkdir(parents=True)
+
+    bus = Bus()
+    _register_llm(bus, [{
+        "ok": True, "content": "plain", "tool_calls": [], "reasoning": None,
+        "stop_reason": "end_turn", "usage": {},
+    }])
+    loader = _FakeLoader({"caller": SimpleNamespace(path=agent_dir)})
+    driver = LlmDriver(bus, loader=loader)
+    await driver.run_turn(
+        system_prompt="sys",
+        messages=[{"role": "user", "content": "simple"}],
+        pool="p", model="m", agent="caller",
+    )
+    log_path = tmp_path / "data" / "sessions" / "caller.jsonl"
+    entries = [json.loads(ln) for ln in log_path.read_text(encoding="utf-8").splitlines()]
+    assert not any(e.get("kind") == "reasoning" for e in entries)
