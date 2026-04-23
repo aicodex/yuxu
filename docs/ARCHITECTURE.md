@@ -74,6 +74,15 @@ doubt, it's probably an agent.
 
 ### I6. Four-layer scope for behavior-shaping data
 
+**Primary purpose** — yuxu memory stores **workflows** (reusable
+operational patterns for agents) and **iteration outcomes** (what
+worked, what didn't, on which agent). **Primary consumer: the
+iteration agent.** User is a secondary consumer. This distinguishes
+yuxu memory from Claude Code's (a coding-environment profile focused
+on files + user prefs) and OpenClaw's (a user-facts database aimed
+at remembering *the user*). yuxu memory is aimed at remembering
+*how agents get work done well*.
+
 "Memory" is a convenient word but **deliberately not formalized** —
 edge cases are fuzzy (is `handler.py` memory? AGENT.md body? session
 transcript? `rate_limits.yaml`?). yuxu formalizes **where to go to
