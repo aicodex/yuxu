@@ -27,6 +27,12 @@ class AgentContext:
     bus: "Bus"                             # message bus
     loader: "Loader"                       # use sparingly: introspection / cross-agent handles
     logger: logging.Logger                 # pre-bound logger (`agent.{name}`)
+    # Per-agent persistent memory (CC port of AgentTool's `memory:` frontmatter).
+    # None when the agent's AGENT.md didn't declare a `memory:` scope.
+    # Present → Loader has ensured the file exists with empty seed content; the
+    # handler owns read/write semantics (pattern: read on start, write on close
+    # or when observation warrants).
+    agent_memory_path: Optional[Path] = None
 
     # -- shortcuts: these are stable sugar over bus/loader, safe to rely on -----
 

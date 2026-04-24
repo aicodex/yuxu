@@ -39,6 +39,47 @@ log = logging.getLogger(__name__)
 VALID_DRIVERS = {"llm", "python", "hybrid"}
 VALID_RUN_MODES = {"persistent", "scheduled", "triggered", "one_shot", "spawned"}
 VALID_KINDS = {"agent", "skill"}
+# Port of Claude Code 2.1.88 `tools/AgentTool/agentMemory.ts:12-13` scope enum.
+# yuxu adapts CC paths to its own layout (project → `<project>/data/agent-memory/`;
+# local → `<project>/.yuxu/local/agent-memory/` gitignored by convention; user →
+# `~/.yuxu/agent-memory/`). An agent whose AGENT.md omits `memory:` gets None.
+VALID_MEMORY_SCOPES = {"user", "project", "local"}
+
+
+def resolve_agent_memory_path(
+    scope: Optional[str],
+    agent_name: str,
+    project_root: Optional[Path],
+) -> Optional[Path]:
+    """Per-scope MEMORY.md path for an agent (CC AgentTool `memory:` port).
+
+    Returns None when the scope is invalid, or when a project-scoped / local-
+    scoped agent is loaded outside a yuxu project (no `yuxu.json` ancestor).
+    Does NOT create the file — caller (Loader._start) does that.
+    """
+    if scope not in VALID_MEMORY_SCOPES:
+        return None
+    if scope == "user":
+        return Path.home() / ".yuxu" / "agent-memory" / agent_name / "MEMORY.md"
+    if project_root is None:
+        return None
+    if scope == "project":
+        return project_root / "data" / "agent-memory" / agent_name / "MEMORY.md"
+    if scope == "local":
+        return project_root / ".yuxu" / "local" / "agent-memory" / agent_name / "MEMORY.md"
+    return None
+
+
+_AGENT_MEMORY_SEED = """---
+agent: {name}
+scope: {scope}
+---
+# {name} — agent memory
+
+Persistent notes this agent keeps across sessions. The handler owns
+read/write semantics; see `reference_cc_agent_protocol.md` for the
+port of Claude Code's convention.
+"""
 
 
 @dataclass
@@ -61,6 +102,9 @@ class AgentSpec:
     has_agent_md: bool = False
     has_skill_md: bool = False
     has_handler: bool = False
+    # CC port: agent-scoped persistent MEMORY.md. Value = "user" | "project" |
+    # "local" when AGENT.md declares it, else None.
+    memory_scope: Optional[str] = None
 
 
 class Loader:
@@ -140,6 +184,24 @@ class Loader:
             run_mode = run_mode_default
 
         entry_default = "execute" if kind == "skill" else "start"
+
+        # CC port: AGENT.md `memory:` field declares per-agent persistent
+        # MEMORY.md scope. Unknown / missing values are silently dropped to
+        # None (Loader logs a warning; downstream treats None = no agent
+        # memory). Only `agent` kind honours this — skills are stateless.
+        memory_scope: Optional[str] = None
+        raw_memory = fm.get("memory")
+        if raw_memory is not None:
+            if kind == "skill":
+                log.warning("loader: %s has memory=%r but is a skill; ignoring "
+                             "(skills are stateless)", agent_dir.name, raw_memory)
+            elif isinstance(raw_memory, str) and raw_memory in VALID_MEMORY_SCOPES:
+                memory_scope = raw_memory
+            else:
+                log.warning("loader: %s has invalid memory=%r (expected one of "
+                             "%s); treating as None", agent_dir.name, raw_memory,
+                             sorted(VALID_MEMORY_SCOPES))
+
         return AgentSpec(
             name=agent_dir.name,
             path=agent_dir,
@@ -159,6 +221,7 @@ class Loader:
             has_agent_md=agent_md.exists(),
             has_skill_md=skill_md.exists(),
             has_handler=has_handler,
+            memory_scope=memory_scope,
         )
 
     # -- dep graph ---------------------------------------------------
@@ -275,6 +338,32 @@ class Loader:
             raise
 
     def _build_context(self, spec: AgentSpec) -> AgentContext:
+        agent_memory_path: Optional[Path] = None
+        if spec.memory_scope is not None:
+            project_root = session_log.find_project_root(spec.path)
+            agent_memory_path = resolve_agent_memory_path(
+                spec.memory_scope, spec.name, project_root,
+            )
+            if agent_memory_path is not None:
+                # Create file with seed content on first lookup. Lifecycle start
+                # is the natural moment — the handler can read it immediately.
+                try:
+                    agent_memory_path.parent.mkdir(parents=True, exist_ok=True)
+                    if not agent_memory_path.exists():
+                        agent_memory_path.write_text(
+                            _AGENT_MEMORY_SEED.format(
+                                name=spec.name, scope=spec.memory_scope,
+                            ),
+                            encoding="utf-8",
+                        )
+                except OSError as e:
+                    log.warning("loader: could not init agent_memory_path %s: %s",
+                                 agent_memory_path, e)
+                    agent_memory_path = None
+            elif spec.memory_scope in ("project", "local"):
+                log.info("loader: %s declares memory=%s but no yuxu.json found "
+                          "above %s — agent_memory_path will be None",
+                          spec.name, spec.memory_scope, spec.path)
         return AgentContext(
             name=spec.name,
             agent_dir=spec.path,
@@ -283,6 +372,7 @@ class Loader:
             bus=self.bus,
             loader=self,
             logger=logging.getLogger(f"agent.{spec.name}"),
+            agent_memory_path=agent_memory_path,
         )
 
     def get_handle(self, name: str) -> Any:

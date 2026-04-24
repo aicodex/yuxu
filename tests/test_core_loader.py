@@ -614,3 +614,183 @@ async def test_no_transcript_when_no_yuxu_json(tmp_path):
     await loader.ensure_running("alpha")
     await asyncio.sleep(0)
     assert captured and captured[-1]["transcript_path"] is None
+
+
+# ----------------------------------------------------------------------------
+# CC port: per-agent MEMORY.md scope  (memory_scope + ctx.agent_memory_path)
+# ----------------------------------------------------------------------------
+
+
+async def test_memory_scope_parsed_from_frontmatter(tmp_path):
+    _write_agent(tmp_path, "foo",
+                  fm={"run_mode": "persistent", "memory": "project"})
+    bus = Bus()
+    loader = Loader(bus, [str(tmp_path)])
+    await loader.scan()
+    assert loader.specs["foo"].memory_scope == "project"
+
+
+async def test_memory_scope_invalid_value_becomes_none(tmp_path, caplog):
+    _write_agent(tmp_path, "bar",
+                  fm={"run_mode": "persistent", "memory": "garbage"})
+    bus = Bus()
+    loader = Loader(bus, [str(tmp_path)])
+    with caplog.at_level("WARNING"):
+        await loader.scan()
+    assert loader.specs["bar"].memory_scope is None
+    assert any("invalid memory" in r.message for r in caplog.records)
+
+
+async def test_memory_scope_ignored_on_skills(tmp_path, caplog):
+    # Skill (has handler.py, no __init__.py) — memory is meaningless.
+    d = tmp_path / "my_skill"
+    d.mkdir()
+    (d / "handler.py").write_text(
+        "async def execute(input, ctx): return {'ok': True}\n"
+    )
+    (d / "SKILL.md").write_text(
+        "---\nname: my_skill\ndescription: x\nmemory: project\n---\nbody\n"
+    )
+    bus = Bus()
+    loader = Loader(bus, [str(tmp_path)])
+    with caplog.at_level("WARNING"):
+        await loader.scan()
+    assert loader.specs["my_skill"].kind == "skill"
+    assert loader.specs["my_skill"].memory_scope is None
+    assert any("is a skill; ignoring" in r.message for r in caplog.records)
+
+
+async def test_memory_scope_omitted_means_none(tmp_path):
+    _write_agent(tmp_path, "bare", fm={"run_mode": "persistent"})
+    bus = Bus()
+    loader = Loader(bus, [str(tmp_path)])
+    await loader.scan()
+    assert loader.specs["bare"].memory_scope is None
+
+
+async def test_resolve_agent_memory_path_user_scope():
+    from yuxu.core.loader import resolve_agent_memory_path
+    p = resolve_agent_memory_path("user", "foo", project_root=None)
+    assert p is not None
+    assert p.name == "MEMORY.md"
+    # Contains the agent name and is under ~/.yuxu/agent-memory/
+    assert "agent-memory/foo" in str(p)
+    assert ".yuxu" in str(p)
+
+
+async def test_resolve_agent_memory_path_project_scope(tmp_path):
+    from yuxu.core.loader import resolve_agent_memory_path
+    p = resolve_agent_memory_path("project", "foo", project_root=tmp_path)
+    assert p == tmp_path / "data" / "agent-memory" / "foo" / "MEMORY.md"
+
+
+async def test_resolve_agent_memory_path_local_scope(tmp_path):
+    from yuxu.core.loader import resolve_agent_memory_path
+    p = resolve_agent_memory_path("local", "foo", project_root=tmp_path)
+    assert p == tmp_path / ".yuxu" / "local" / "agent-memory" / "foo" / "MEMORY.md"
+
+
+async def test_resolve_agent_memory_path_unknown_scope():
+    from yuxu.core.loader import resolve_agent_memory_path
+    assert resolve_agent_memory_path("garbage", "foo", project_root=None) is None
+    assert resolve_agent_memory_path(None, "foo", project_root=None) is None
+
+
+async def test_resolve_agent_memory_path_project_without_root():
+    from yuxu.core.loader import resolve_agent_memory_path
+    # project / local scopes require a project root — missing → None
+    assert resolve_agent_memory_path("project", "foo", project_root=None) is None
+    assert resolve_agent_memory_path("local", "foo", project_root=None) is None
+
+
+async def test_ctx_agent_memory_path_seeded_on_start(tmp_path):
+    """With memory=project + a yuxu.json ancestor, Loader should seed the
+    file on lifecycle start and the running handler should see the path."""
+    (tmp_path / "yuxu.json").write_text("{}\n")
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    _write_agent(
+        agents_dir, "pers",
+        fm={"run_mode": "persistent", "memory": "project"},
+        init_src=(
+            "async def start(ctx):\n"
+            "    from pathlib import Path\n"
+            "    Path(ctx.agent_dir / 'captured.txt').write_text(\n"
+            "        str(ctx.agent_memory_path)\n"
+            "    )\n"
+            "    await ctx.ready()\n"
+        ),
+    )
+    bus = Bus()
+    loader = Loader(bus, [str(agents_dir)])
+    await loader.scan()
+    await loader.ensure_running("pers")
+    captured = (agents_dir / "pers" / "captured.txt").read_text()
+    expected = tmp_path / "data" / "agent-memory" / "pers" / "MEMORY.md"
+    assert Path(captured) == expected
+    # File was created with seed frontmatter.
+    assert expected.exists()
+    text = expected.read_text(encoding="utf-8")
+    assert "agent: pers" in text
+    assert "scope: project" in text
+
+
+async def test_ctx_agent_memory_path_none_when_no_scope(tmp_path):
+    (tmp_path / "yuxu.json").write_text("{}\n")
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    _write_agent(
+        agents_dir, "nomem",
+        fm={"run_mode": "persistent"},   # no memory: field
+        init_src=(
+            "async def start(ctx):\n"
+            "    from pathlib import Path\n"
+            "    Path(ctx.agent_dir / 'captured.txt').write_text(\n"
+            "        'NONE' if ctx.agent_memory_path is None else 'SOMETHING'\n"
+            "    )\n"
+            "    await ctx.ready()\n"
+        ),
+    )
+    bus = Bus()
+    loader = Loader(bus, [str(agents_dir)])
+    await loader.scan()
+    await loader.ensure_running("nomem")
+    assert (agents_dir / "nomem" / "captured.txt").read_text() == "NONE"
+
+
+async def test_ctx_agent_memory_path_none_when_no_project_root(tmp_path):
+    """memory: project but no yuxu.json anywhere above — resolve returns None."""
+    _write_agent(tmp_path, "orphan",
+                  fm={"run_mode": "persistent", "memory": "project"},
+                  init_src=(
+                      "async def start(ctx):\n"
+                      "    from pathlib import Path\n"
+                      "    Path(ctx.agent_dir / 'captured.txt').write_text(\n"
+                      "        'NONE' if ctx.agent_memory_path is None else str(ctx.agent_memory_path)\n"
+                      "    )\n"
+                      "    await ctx.ready()\n"
+                  ))
+    bus = Bus()
+    loader = Loader(bus, [str(tmp_path)])
+    await loader.scan()
+    await loader.ensure_running("orphan")
+    assert (tmp_path / "orphan" / "captured.txt").read_text() == "NONE"
+
+
+async def test_agent_memory_seed_not_overwritten(tmp_path):
+    """Subsequent starts must not overwrite existing MEMORY.md content."""
+    (tmp_path / "yuxu.json").write_text("{}\n")
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    mem_file = tmp_path / "data" / "agent-memory" / "keeper" / "MEMORY.md"
+    mem_file.parent.mkdir(parents=True)
+    mem_file.write_text("---\nagent: keeper\nscope: project\n---\nPRE-EXISTING\n",
+                         encoding="utf-8")
+    _write_agent(agents_dir, "keeper",
+                  fm={"run_mode": "persistent", "memory": "project"},
+                  init_src="async def start(ctx): await ctx.ready()\n")
+    bus = Bus()
+    loader = Loader(bus, [str(agents_dir)])
+    await loader.scan()
+    await loader.ensure_running("keeper")
+    assert "PRE-EXISTING" in mem_file.read_text(encoding="utf-8")
