@@ -19,6 +19,8 @@ Environment
     YUXU_MEMORY_SOCK   socket path        (default /tmp/yuxu_memory.sock)
     YUXU_MEMORY_ROOT   memory directory   (default Claude Code auto-memory
                                            path for theme-flow-engine)
+    YUXU_MEMORY_QLOG   query log path     (default <memory_root>/_queries.jsonl)
+                                           Set to empty string to disable.
     LOG_LEVEL          log level          (default INFO)
 
 Usage
@@ -34,6 +36,7 @@ import logging
 import os
 import signal
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -41,6 +44,8 @@ HERE = Path(__file__).resolve().parent
 SRC = HERE.parent / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
+
+from typing import Optional
 
 from yuxu.bundled.memory.handler import execute as memory_execute
 from yuxu.core.bus import Bus
@@ -53,20 +58,84 @@ DEFAULT_MEMORY_ROOT = os.environ.get(
     str(Path.home() / ".claude" / "projects"
          / "-home-xzp-project-theme-flow-engine" / "memory"),
 )
+# YUXU_MEMORY_QLOG: explicit path overrides. `""` (empty env) disables
+# logging; `None` (env unset) → default under memory_root.
+_ENV_QLOG = os.environ.get("YUXU_MEMORY_QLOG", None)
+
+
+def _result_summary(op: Optional[str], resp: dict) -> dict:
+    """Extract a compact result fingerprint for the query log.
+
+    Deliberately small: just enough to let a later validation pass
+    spot patterns like 'searched N times, 0 hits' or 'asked for section
+    X which didn't exist'. Full request args and full response stay in
+    the daemon memory only; we don't bloat the log with them.
+    """
+    out: dict = {}
+    if not isinstance(resp, dict):
+        return out
+    if op == "search":
+        entries = resp.get("entries") or []
+        out["hit_count"] = len(entries)
+        out["top_paths"] = [e.get("path") for e in entries[:3] if isinstance(e, dict)]
+    elif op == "list":
+        entries = resp.get("entries") or []
+        out["hit_count"] = len(entries)
+        out["mode"] = resp.get("mode")
+    elif op == "get":
+        out["path"] = resp.get("path")
+        if resp.get("section") is not None:
+            out["section"] = resp.get("section")
+            out["section_hit"] = resp.get("section_body") is not None
+        out["bytes"] = resp.get("bytes")
+    elif op == "stats":
+        out["total"] = resp.get("total")
+    return out
+
+
+def _write_qlog(path: Optional[Path], *, op: Optional[str], req: dict,
+                  resp: dict, elapsed_ms: float) -> None:
+    """Append one JSONL line. Best-effort: log-write failure never
+    impacts the request response."""
+    if path is None:
+        return
+    try:
+        record = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),
+            "op": op,
+            "query": req.get("query") if op == "search" else None,
+            "path": req.get("path") if op == "get" else None,
+            "mode": req.get("mode"),
+            "ok": bool(resp.get("ok")),
+            "elapsed_ms": round(elapsed_ms, 2),
+            "error": resp.get("error") if not resp.get("ok") else None,
+            "result": _result_summary(op, resp),
+        }
+        line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:  # noqa: BLE001
+        log.exception("qlog write failed")
 
 
 async def _handle_client(reader: asyncio.StreamReader,
                           writer: asyncio.StreamWriter,
-                          *, memory_root: str, ctx) -> None:
+                          *, memory_root: str, ctx,
+                          qlog_path: Optional[Path]) -> None:
     peer = writer.get_extra_info("peername") or "?"
+    req: dict = {}
+    op: Optional[str] = None
+    t0 = time.monotonic()
     try:
         raw = await asyncio.wait_for(reader.readline(), timeout=5.0)
         if not raw:
             return
         try:
-            req = json.loads(raw.decode("utf-8"))
-            if not isinstance(req, dict):
+            parsed = json.loads(raw.decode("utf-8"))
+            if not isinstance(parsed, dict):
                 raise ValueError("top-level JSON must be object")
+            req = parsed
+            op = req.get("op")
         except (json.JSONDecodeError, ValueError) as e:
             resp = {"ok": False, "error": f"bad request: {e}"}
         else:
@@ -78,9 +147,10 @@ async def _handle_client(reader: asyncio.StreamReader,
                 resp = {"ok": False, "error": f"{type(e).__name__}: {e}"}
         writer.write((json.dumps(resp, ensure_ascii=False, default=str) + "\n").encode("utf-8"))
         await writer.drain()
-        log.info("req op=%s from=%s ok=%s",
-                  (req.get("op") if isinstance(req, dict) else "?"),
-                  peer, resp.get("ok"))
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+        log.info("req op=%s from=%s ok=%s elapsed=%.1fms",
+                  op, peer, resp.get("ok"), elapsed_ms)
+        _write_qlog(qlog_path, op=op, req=req, resp=resp, elapsed_ms=elapsed_ms)
     except asyncio.TimeoutError:
         log.warning("client %s timed out reading request", peer)
     except Exception:  # noqa: BLE001
@@ -105,6 +175,18 @@ async def _run() -> int:
         log.error("memory_root does not exist: %s", memory_root)
         return 1
 
+    # Resolve query-log path.
+    # - env unset  → default to <memory_root>/_queries.jsonl
+    # - env == ""  → explicitly disabled
+    # - env set    → use verbatim
+    qlog_path: Optional[Path]
+    if _ENV_QLOG is None:
+        qlog_path = Path(memory_root) / "_queries.jsonl"
+    elif _ENV_QLOG == "":
+        qlog_path = None
+    else:
+        qlog_path = Path(_ENV_QLOG).expanduser().resolve()
+
     # Minimal ctx: memory skill touches ctx.bus (best-effort publish) and
     # ctx.agent_dir (only when memory_root isn't passed — we always pass it).
     bus = Bus()
@@ -119,13 +201,15 @@ async def _run() -> int:
             return 1
 
     server = await asyncio.start_unix_server(
-        lambda r, w: _handle_client(r, w, memory_root=memory_root, ctx=ctx),
+        lambda r, w: _handle_client(r, w, memory_root=memory_root,
+                                      ctx=ctx, qlog_path=qlog_path),
         path=sock_path,
     )
     os.chmod(sock_path, 0o600)  # owner-only
 
     banner = (f"[memory_daemon] listening on {sock_path}\n"
-               f"[memory_daemon] memory_root = {memory_root}")
+               f"[memory_daemon] memory_root = {memory_root}\n"
+               f"[memory_daemon] qlog        = {qlog_path or '(disabled)'}")
     log.info(banner.replace("\n", " | "))
     print(banner, flush=True)
 

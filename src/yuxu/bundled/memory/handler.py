@@ -8,8 +8,14 @@ Ops:
             of total entry count, so cheap at any scale.
 - `list`:   L1 — filtered index (frontmatter only). Accepts `mode` + explicit
             filter params; mode sets defaults, explicit params override.
-- `get`:    L2 — full body + parsed frontmatter for one entry.
-- `search`: cross-cut — keyword match on name + description, ranked top-K.
+- `get`:    L2 — full body + parsed frontmatter for one entry. Optional
+            `section=<label>` returns only the inline-bold-labeled paragraph
+            (CC port: `**Why:**` / `**How to apply:**` + yuxu `**Evidence:**`
+            / `**Score:**` / `**Source:**`; see `project_memory_section_convention`).
+- `search`: cross-cut — keyword match on name + description + body, ranked
+            top-K. Body match has lower weight than metadata; a snippet of
+            body context around the first hit is returned so the caller can
+            eyeball why each entry ranked.
 
 Modes (per I6 Memory access discipline):
 - `blank`   → only entries tagged `mandatory` (I6 reserved tag)
@@ -24,6 +30,7 @@ Mirrors Claude Code skill loading and OpenClaw's 2-layer memory convention.
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -278,11 +285,16 @@ async def _op_stats(input: dict, ctx) -> dict:
     return result
 
 
-def _match_score(entry: dict, query_lower: str) -> int:
-    """Keyword relevance: name match weighs higher than description.
+def _match_score(entry: dict, query_lower: str,
+                    body_lower: str = "") -> int:
+    """Keyword relevance: name match weighs higher than description, body
+    lowest. Body is optional — if empty, score matches the old name+desc
+    behaviour exactly (regression-safe).
 
-    Phrase hit: name +10 / desc +3. Per-token hit (lowercased whitespace
-    split): name +2 / desc +1. Deterministic, no external index.
+    Phrase hit: name +10 / desc +3 / body +2.
+    Per-token hit (whitespace split): name +2 / desc +1 / body per-hit +1
+    capped at 3 (prevents a memory that accidentally repeats a common token
+    many times from dominating rankings).
     """
     name = (entry.get("name") or "").lower()
     desc = (entry.get("description") or "").lower()
@@ -291,6 +303,8 @@ def _match_score(entry: dict, query_lower: str) -> int:
         score += 10
     if query_lower in desc:
         score += 3
+    if body_lower and query_lower in body_lower:
+        score += 2
     for token in query_lower.split():
         if not token:
             continue
@@ -298,7 +312,79 @@ def _match_score(entry: dict, query_lower: str) -> int:
             score += 2
         if token in desc:
             score += 1
+        if body_lower:
+            hits = body_lower.count(token)
+            if hits > 0:
+                score += min(hits, 3)
     return score
+
+
+def _body_snippet(body: str, query_lower: str,
+                    ctx_chars: int = 180) -> Optional[str]:
+    """Return a short excerpt of `body` around the first query hit.
+
+    Tries the whole phrase first, then falls back to the longest query
+    token (≥3 chars). Returns None if nothing hits. Ellipses mark
+    truncation on either end; the whole result is single-line.
+    """
+    if not body:
+        return None
+    body_lower = body.lower()
+    idx = body_lower.find(query_lower)
+    if idx < 0:
+        tokens = [t for t in query_lower.split() if len(t) >= 3]
+        tokens.sort(key=len, reverse=True)
+        for t in tokens:
+            idx = body_lower.find(t)
+            if idx >= 0:
+                break
+        else:
+            return None
+    half = max(20, ctx_chars // 2)
+    start = max(0, idx - half)
+    end = min(len(body), idx + len(query_lower) + half)
+    snip = body[start:end].replace("\n", " ").strip()
+    if start > 0:
+        snip = "…" + snip
+    if end < len(body):
+        snip = snip + "…"
+    return snip
+
+
+# Matches the CC + yuxu inline-bold-label convention:
+# `**Why:**`, `**How to apply:**`, `**Evidence:**`, `**Score:**`, `**Source:**`.
+# A label caps the paragraph that follows until the next label or end-of-body.
+_SECTION_LABEL_RE = re.compile(r'\*\*([^:*\n]+?):\*\*')
+
+
+def _extract_section(body: str, section: str) -> Optional[str]:
+    """Return the paragraph that follows `**<section>:**` in body, or None
+    if no such label exists. Case-insensitive; accepts underscored
+    (`how_to_apply`) or spaced (`how to apply`) form for the same label.
+    """
+    if not body or not section:
+        return None
+    target_variants = {
+        section.lower(),
+        section.lower().replace("_", " "),
+        section.lower().replace(" ", "_"),
+        section.lower().replace("-", " "),
+    }
+    matches = list(_SECTION_LABEL_RE.finditer(body))
+    if not matches:
+        return None
+    for i, m in enumerate(matches):
+        label = m.group(1).strip().lower()
+        label_variants = {
+            label,
+            label.replace(" ", "_"),
+            label.replace("_", " "),
+        }
+        if label_variants & target_variants:
+            content_start = m.end()
+            content_end = matches[i + 1].start() if i + 1 < len(matches) else len(body)
+            return body[content_start:content_end].strip()
+    return None
 
 
 async def _op_search(input: dict, ctx) -> dict:
@@ -321,6 +407,7 @@ async def _op_search(input: dict, ctx) -> dict:
                 "mode": mode, "entries": []}
 
     query_lower = query.lower().strip()
+    search_body = bool(input.get("search_body", True))
     scored: list[tuple[int, dict]] = []
     for p in _iter_memory_files(root):
         summary = _read_entry_summary(p, root)
@@ -328,9 +415,22 @@ async def _op_search(input: dict, ctx) -> dict:
             continue
         if not _entry_passes(summary, mode=mode, user_filters=filters):
             continue
-        s = _match_score(summary, query_lower)
+        body_text = ""
+        if search_body:
+            try:
+                text = p.read_text(encoding="utf-8")
+                _, body_text = parse_frontmatter(text)
+            except OSError as e:
+                log.warning("memory: could not read body %s: %s", p, e)
+                body_text = ""
+        body_lower = body_text.lower() if body_text else ""
+        s = _match_score(summary, query_lower, body_lower)
         if s > 0:
-            scored.append((s, summary))
+            snippet = _body_snippet(body_text, query_lower) if body_text else None
+            entry = dict(summary)
+            if snippet:
+                entry["body_snippet"] = snippet
+            scored.append((s, entry))
     scored.sort(key=lambda x: x[0], reverse=True)
     top = [entry for _, entry in scored[:limit]]
     await _publish_retrieved(ctx, "search",
@@ -345,6 +445,9 @@ async def _op_get(input: dict, ctx) -> dict:
     raw_path = input.get("path")
     if not isinstance(raw_path, str) or not raw_path.strip():
         return {"ok": False, "error": "missing or empty field: path"}
+    section = input.get("section")
+    if section is not None and (not isinstance(section, str) or not section.strip()):
+        return {"ok": False, "error": "section must be a non-empty string"}
     root = _resolve_memory_root(input.get("memory_root"), ctx)
     p = Path(raw_path).expanduser()
     if not p.is_absolute():
@@ -364,14 +467,30 @@ async def _op_get(input: dict, ctx) -> dict:
     fm, body = parse_frontmatter(text)
     rel_path = str(p.relative_to(root.resolve()))
     await _publish_retrieved(ctx, "get", [rel_path],
-                              extras={"memory_root": str(root)})
-    return {
+                              extras={"memory_root": str(root),
+                                       "section": section})
+
+    result = {
         "ok": True,
         "path": rel_path,
         "frontmatter": fm,
         "body": body,
         "bytes": len(text.encode("utf-8", errors="replace")),
     }
+    if section is not None:
+        section_body = _extract_section(body, section.strip())
+        if section_body is None:
+            # Caller asked for a specific section that doesn't exist — still
+            # return ok=True with full body so they can decide, but surface
+            # the miss via `section_body=None` + available_sections list.
+            available = [m.group(1).strip() for m in _SECTION_LABEL_RE.finditer(body)]
+            result["section"] = section
+            result["section_body"] = None
+            result["available_sections"] = available
+        else:
+            result["section"] = section
+            result["section_body"] = section_body
+    return result
 
 
 async def execute(input: dict, ctx) -> dict:

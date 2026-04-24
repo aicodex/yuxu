@@ -670,3 +670,211 @@ async def test_retrieval_gracefully_handles_no_bus(tmp_path):
     r = await execute({"op": "list", "memory_root": str(mem)}, ctx)
     assert r["ok"] is True
     assert len(r["entries"]) == 1
+
+
+# ----------------------------------------------------------------------------
+# Body FTS  (search across body text, not just name + description)
+# ----------------------------------------------------------------------------
+
+
+def _write_entry_raw(root: Path, path: str, *, name: str, description: str,
+                       type_: str, body: str,
+                       evidence_level: str = "consensus",
+                       status: str | None = "current") -> None:
+    """Like _write_entry, but lets the test inject a custom body verbatim."""
+    p = root / path
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fm = [
+        "---",
+        f"name: {name}",
+        f"description: {description}",
+        f"type: {type_}",
+        f"evidence_level: {evidence_level}",
+    ]
+    if status:
+        fm.append(f"status: {status}")
+    fm.append("---")
+    p.write_text("\n".join(fm) + f"\n\n# {name}\n\n{body}\n", encoding="utf-8")
+
+
+async def test_search_matches_body_when_name_and_desc_miss(tmp_path):
+    """Body contains the keyword, name+desc don't — must still hit."""
+    project = tmp_path
+    (project / "yuxu.json").write_text("{}\n")
+    mem = project / "data" / "memory"
+    mem.mkdir(parents=True)
+    _write_entry_raw(
+        mem, "a.md", name="Memory Body FTS", description="body search test",
+        type_="reference",
+        body="This note mentions invoke_skill fishing behavior seen in demo 1.",
+    )
+    _write_entry_raw(
+        mem, "b.md", name="Unrelated", description="nothing relevant here",
+        type_="reference",
+        body="line 1\nline 2\nline 3",
+    )
+    r = await execute({"op": "search", "query": "fishing"}, _ctx(mem))
+    assert r["ok"] is True
+    names = [e["name"] for e in r["entries"]]
+    assert names == ["Memory Body FTS"]
+
+
+async def test_search_returns_body_snippet_around_hit(tmp_path):
+    project = tmp_path
+    (project / "yuxu.json").write_text("{}\n")
+    mem = project / "data" / "memory"
+    mem.mkdir(parents=True)
+    _write_entry_raw(
+        mem, "a.md", name="Plain", description="plain",
+        type_="reference",
+        body="alpha beta gamma INVOKE_SKILL delta epsilon zeta",
+    )
+    r = await execute({"op": "search", "query": "invoke_skill"}, _ctx(mem))
+    assert r["ok"] is True
+    entry = r["entries"][0]
+    snip = entry.get("body_snippet") or ""
+    assert "INVOKE_SKILL" in snip
+    # snippet is a short single-line context, not the whole body
+    assert "\n" not in snip
+    assert len(snip) < 400
+
+
+async def test_search_body_disabled_regresses_to_name_desc_only(tmp_path):
+    project = tmp_path
+    (project / "yuxu.json").write_text("{}\n")
+    mem = project / "data" / "memory"
+    mem.mkdir(parents=True)
+    _write_entry_raw(
+        mem, "a.md", name="BodyOnly", description="irrelevant",
+        type_="reference",
+        body="the secret token is frobnicate",
+    )
+    # With body FTS (default): hits
+    r_on = await execute({"op": "search", "query": "frobnicate"}, _ctx(mem))
+    assert [e["name"] for e in r_on["entries"]] == ["BodyOnly"]
+    # Without body FTS: misses
+    r_off = await execute(
+        {"op": "search", "query": "frobnicate", "search_body": False},
+        _ctx(mem),
+    )
+    assert r_off["entries"] == []
+
+
+async def test_search_name_desc_still_outrank_body(tmp_path):
+    """Ordering invariant: a name match still ranks above a body-only
+    match (protects against over-weighting body hits). This is the
+    regression test for the body-FTS addition — without capping, a body
+    with many keyword repeats could outrank a clean name hit."""
+    project = tmp_path
+    (project / "yuxu.json").write_text("{}\n")
+    mem = project / "data" / "memory"
+    mem.mkdir(parents=True)
+    # Body-only match: name / desc have no "kernel", body repeats it heavily.
+    _write_entry_raw(
+        mem, "a.md", name="Unrelated Talk", description="xyz",
+        type_="reference",
+        body="this body mentions kernel many many many many times kernel kernel kernel",
+    )
+    # Metadata match: name has "kernel", body doesn't.
+    _write_entry_raw(
+        mem, "b.md", name="All about Kernel Invariants", description="core rules",
+        type_="feedback",
+        body="no match text",
+    )
+    r = await execute({"op": "search", "query": "kernel"}, _ctx(mem))
+    assert r["ok"] is True
+    names = [e["name"] for e in r["entries"]]
+    assert names[0] == "All about Kernel Invariants"
+    assert names[1] == "Unrelated Talk"
+
+
+# ----------------------------------------------------------------------------
+# section-aware get  (**<label>:** paragraphs per memory_section_convention)
+# ----------------------------------------------------------------------------
+
+
+async def test_get_section_returns_why_paragraph(tmp_path):
+    project = tmp_path
+    (project / "yuxu.json").write_text("{}\n")
+    mem = project / "data" / "memory"
+    mem.mkdir(parents=True)
+    body = (
+        "Lead sentence stating the rule.\n\n"
+        "**Why:** the reason this matters, a few words.\n"
+        "**How to apply:** when and where this kicks in.\n"
+        "**Evidence:** observed in demo X on 2026-04-24.\n"
+    )
+    _write_entry_raw(mem, "a.md", name="With Sections",
+                      description="has labeled sections",
+                      type_="feedback", body=body)
+    r = await execute({"op": "get", "path": "a.md", "section": "why"},
+                       _ctx(mem))
+    assert r["ok"] is True
+    assert r["section"] == "why"
+    assert r["section_body"] is not None
+    assert "reason this matters" in r["section_body"]
+    # Must NOT bleed into the next label's content
+    assert "when and where" not in r["section_body"]
+
+
+async def test_get_section_accepts_underscored_form(tmp_path):
+    project = tmp_path
+    (project / "yuxu.json").write_text("{}\n")
+    mem = project / "data" / "memory"
+    mem.mkdir(parents=True)
+    body = (
+        "lead\n\n**Why:** w\n**How to apply:** h\n**Evidence:** e\n"
+    )
+    _write_entry_raw(mem, "a.md", name="X", description="d",
+                      type_="feedback", body=body)
+    r1 = await execute({"op": "get", "path": "a.md",
+                         "section": "how_to_apply"}, _ctx(mem))
+    r2 = await execute({"op": "get", "path": "a.md",
+                         "section": "How To Apply"}, _ctx(mem))
+    assert r1["section_body"] == "h"
+    assert r2["section_body"] == "h"
+
+
+async def test_get_section_not_found_lists_available(tmp_path):
+    project = tmp_path
+    (project / "yuxu.json").write_text("{}\n")
+    mem = project / "data" / "memory"
+    mem.mkdir(parents=True)
+    body = "lead\n\n**Why:** w\n**Evidence:** e\n"
+    _write_entry_raw(mem, "a.md", name="X", description="d",
+                      type_="feedback", body=body)
+    r = await execute({"op": "get", "path": "a.md",
+                       "section": "how_to_apply"}, _ctx(mem))
+    # Still ok=True (caller chose the wrong section, not an error); but
+    # section_body is None and available_sections lists what IS present.
+    assert r["ok"] is True
+    assert r["section_body"] is None
+    assert set(r["available_sections"]) == {"Why", "Evidence"}
+
+
+async def test_get_without_section_returns_full_body_unchanged(tmp_path):
+    project = tmp_path
+    (project / "yuxu.json").write_text("{}\n")
+    mem = project / "data" / "memory"
+    mem.mkdir(parents=True)
+    body = "lead\n\n**Why:** w\n"
+    _write_entry_raw(mem, "a.md", name="X", description="d",
+                      type_="feedback", body=body)
+    r = await execute({"op": "get", "path": "a.md"}, _ctx(mem))
+    assert r["ok"] is True
+    assert "section" not in r
+    assert "section_body" not in r
+    assert "**Why:**" in r["body"]
+
+
+async def test_get_section_rejects_empty_string(tmp_path):
+    project = tmp_path
+    (project / "yuxu.json").write_text("{}\n")
+    mem = project / "data" / "memory"
+    mem.mkdir(parents=True)
+    _write_entry_raw(mem, "a.md", name="X", description="d",
+                      type_="feedback", body="b")
+    r = await execute({"op": "get", "path": "a.md", "section": "   "},
+                       _ctx(mem))
+    assert r["ok"] is False
+    assert "section" in r["error"]
