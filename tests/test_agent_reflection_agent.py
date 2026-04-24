@@ -1123,3 +1123,67 @@ async def test_append_agent_memory_run_no_path_is_noop(tmp_path):
     agent._append_agent_memory_run(
         need="x", framings=[], n_hyp_ok=0, n_drafts=0, run_id="r",
     )
+
+
+# ----------------------------------------------------------------------------
+# #4 cross-run dedup (_load_existing_draft_hashes)
+# ----------------------------------------------------------------------------
+
+
+async def test_load_existing_draft_hashes_empty_dir(tmp_path):
+    from yuxu.bundled.reflection_agent.handler import _load_existing_draft_hashes
+    assert _load_existing_draft_hashes(tmp_path) == set()
+
+
+async def test_load_existing_draft_hashes_extracts_from_filenames(tmp_path):
+    from yuxu.bundled.reflection_agent.handler import _load_existing_draft_hashes
+    # Both naming conventions: reflection_ and curator_
+    (tmp_path / "reflection_123_abc_target_deadbeef.md").write_text("")
+    (tmp_path / "curator_456_def_other_cafebabe.md").write_text("")
+    # Non-matching files ignored
+    (tmp_path / "README.md").write_text("")
+    (tmp_path / "reflection_no_hash.md").write_text("")
+    hashes = _load_existing_draft_hashes(tmp_path)
+    assert hashes == {"deadbeef", "cafebabe"}
+
+
+async def test_load_existing_draft_hashes_missing_dir(tmp_path):
+    from yuxu.bundled.reflection_agent.handler import _load_existing_draft_hashes
+    assert _load_existing_draft_hashes(tmp_path / "does_not_exist") == set()
+
+
+# ----------------------------------------------------------------------------
+# #7 originSessionId injection (_inject_origin_session_id)
+# ----------------------------------------------------------------------------
+
+
+async def test_inject_origin_session_id_adds_field():
+    from yuxu.bundled.reflection_agent.handler import _inject_origin_session_id
+    body = "---\nname: foo\ndescription: bar\ntype: feedback\n---\nbody text\n"
+    out = _inject_origin_session_id(body, "harness_pro_max")
+    assert "originSessionId: harness_pro_max" in out
+    assert "name: foo" in out
+    assert "body text" in out
+
+
+async def test_inject_origin_session_id_preserves_existing():
+    """If the LLM already cited a session, don't clobber."""
+    from yuxu.bundled.reflection_agent.handler import _inject_origin_session_id
+    body = ("---\nname: foo\ndescription: bar\ntype: feedback\n"
+             "originSessionId: already-cited-uuid\n---\nbody\n")
+    out = _inject_origin_session_id(body, "should_be_ignored")
+    assert "originSessionId: already-cited-uuid" in out
+    assert "should_be_ignored" not in out
+
+
+async def test_inject_origin_session_id_no_session_id_is_passthrough():
+    from yuxu.bundled.reflection_agent.handler import _inject_origin_session_id
+    body = "---\nname: foo\n---\nbody\n"
+    assert _inject_origin_session_id(body, None) == body
+    assert _inject_origin_session_id(body, "") == body
+
+
+async def test_inject_origin_session_id_no_frontmatter_is_passthrough():
+    from yuxu.bundled.reflection_agent.handler import _inject_origin_session_id
+    body = "no frontmatter here just body text\n"
+    assert _inject_origin_session_id(body, "x") == body

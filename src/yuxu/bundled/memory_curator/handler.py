@@ -30,6 +30,7 @@ from yuxu.bundled.reflection_agent.handler import (
     _content_hash,
     _extract_json,
     _format_sources,
+    _load_existing_draft_hashes,
     _load_sources,
     _slugify,
     _truncate_bytes,
@@ -171,7 +172,8 @@ def _append_improvements(log_path: Path, entries: list[str],
     return len(to_append), dupes
 
 
-def _ensure_inner_frontmatter_defaults(body: str) -> str:
+def _ensure_inner_frontmatter_defaults(body: str,
+                                          session_id: Optional[str] = None) -> str:
     """Inject I6 default fields into a memory entry's inner frontmatter.
 
     Curator-produced entries land at evidence_level `observed` (single real
@@ -179,6 +181,14 @@ def _ensure_inner_frontmatter_defaults(body: str) -> str:
     `updated` date. If the LLM already provided these fields we leave them
     alone. If the body has no frontmatter at all, pass through untouched
     (approval_applier will reject it downstream).
+
+    `session_id` populates `originSessionId` when the LLM didn't already
+    cite one. admission_gate's golden_replay stage requires this field to
+    resolve a real session JSONL archive; without it the gate soft-passes,
+    effectively disabling that stage for curator-produced memories.
+    yuxu's `session_id` is typically the agent name whose transcript
+    sourced the curate call (derived by caller from the first source's
+    basename).
     """
     fm, rest = parse_frontmatter(body or "")
     if not isinstance(fm, dict) or not fm:
@@ -192,6 +202,9 @@ def _ensure_inner_frontmatter_defaults(body: str) -> str:
         changed = True
     if "updated" not in fm:
         fm["updated"] = time.strftime("%Y-%m-%d", time.localtime())
+        changed = True
+    if session_id and "originSessionId" not in fm:
+        fm["originSessionId"] = session_id
         changed = True
     if not changed:
         return body
@@ -216,13 +229,20 @@ def _ensure_inner_frontmatter_defaults(body: str) -> str:
 
 def _stage_edit_draft(*, drafts_dir: Path, run_id: str, edit: dict,
                       score: Optional[float] = None,
-                      body: Optional[str] = None) -> dict:
+                      body: Optional[str] = None,
+                      session_id: Optional[str] = None) -> dict:
     """Mirror reflection_agent._stage_draft format so approval_applier
-    handles curator drafts identically. Curator omits ranker metadata."""
+    handles curator drafts identically. Curator omits ranker metadata.
+
+    `session_id` is forwarded to _ensure_inner_frontmatter_defaults so the
+    inner frontmatter gets `originSessionId` populated — admission_gate's
+    golden_replay needs it to resolve to a real session archive. Pass None
+    when the caller doesn't know the session (golden_replay will soft-pass).
+    """
     drafts_dir.mkdir(parents=True, exist_ok=True)
     ts = int(time.time())
     body = _truncate_bytes(body or edit.get("body", ""), MAX_DRAFT_BYTES)
-    body = _ensure_inner_frontmatter_defaults(body)
+    body = _ensure_inner_frontmatter_defaults(body, session_id=session_id)
     body_hash = _content_hash(body)[:8]
     slug = _slugify(edit.get("target", "") or edit.get("title", ""))
     fname = f"curator_{ts}_{run_id}_{slug}_{body_hash}.md"
@@ -511,18 +531,44 @@ class MemoryCurator:
             async with self._log_lock:
                 appended, dupes = _append_improvements(log_path, improvements)
 
-        # Stage edits as drafts
+        # Stage edits as drafts. Per-run dedup (this call's edits) + cross-run
+        # dedup (drafts already pending under _drafts/ from earlier curator or
+        # reflection runs). Cross-run key is the 8-char hash prefix encoded
+        # in the draft filename (`*_<hash8>.md`); curator's _content_hash
+        # returns 12 chars so we slice to align. Without cross-run dedup,
+        # repeated `/curate` on similar sources flooded approval_queue and
+        # admission_gate's noop_baseline was the only backstop.
         drafts: list[dict] = []
-        seen_bodies: set[str] = set()
+        seen_hashes: set[str] = {h for h in _load_existing_draft_hashes(drafts_dir)}
+        cross_run_skipped = 0
+        # Derive originSessionId from the first source's basename (e.g.
+        # `data/sessions/harness_pro_max.jsonl` → `harness_pro_max`). In
+        # yuxu a "session" is an agent's transcript, so the agent name is
+        # the canonical citation. admission_gate's golden_replay prefix-
+        # matches this against `*.jsonl` filenames under session_root.
+        session_id: Optional[str] = None
+        if loaded:
+            try:
+                first_path = loaded[0].get("path") or ""
+                if first_path and first_path != "<inline>":
+                    session_id = Path(first_path).stem or None
+            except Exception:
+                session_id = None
         for e in memory_edits:
             body = _truncate_bytes(e.get("body", ""), MAX_DRAFT_BYTES)
-            h = _content_hash(body)
-            if h in seen_bodies:
+            h8 = _content_hash(body)[:8]
+            if h8 in seen_hashes:
+                cross_run_skipped += 1
                 continue
-            seen_bodies.add(h)
+            seen_hashes.add(h8)
             drafts.append(_stage_edit_draft(
                 drafts_dir=drafts_dir, run_id=run_id, edit=e, body=body,
+                session_id=session_id,
             ))
+
+        if cross_run_skipped:
+            warnings.append(f"cross-run dedup skipped {cross_run_skipped} "
+                            "draft(s) already staged in _drafts/")
 
         approval_ids = await self._enqueue_approvals(drafts, run_id, context_hint)
 

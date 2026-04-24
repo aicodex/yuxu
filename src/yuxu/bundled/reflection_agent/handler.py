@@ -280,6 +280,73 @@ def _slugify(s: str, max_len: int = 30) -> str:
     return (s[:max_len] or "edit")
 
 
+# Cross-run draft dedup (pairs with the per-run dedup in memory_curator /
+# reflection_agent). Both agents encode `_content_hash(body)[:8]` as the
+# trailing field of the draft filename (`reflection_…_<hash8>.md` and
+# `curator_…_<hash8>.md`). Extracting that prefix from existing drafts
+# gives us an O(1) membership set that survives across processes without
+# any sidecar index file. Used by `_load_existing_draft_hashes()` below.
+_DRAFT_HASH_RE = re.compile(r"_([0-9a-f]{8})\.md$")
+
+
+def _load_existing_draft_hashes(drafts_dir: Path) -> set[str]:
+    """Return the set of 8-char body-hash prefixes already staged in
+    `drafts_dir`. Empty when the dir doesn't exist or nothing matches.
+
+    Used by curator and reflection_agent to skip staging a draft whose
+    content matches one that's already pending approval (or approved-
+    then-dangling). Prevents approval_queue flooding across repeated
+    `/curate` or `/reflect` invocations — the pre-existing per-run dedup
+    only handled collisions within a single invocation.
+    """
+    if not drafts_dir.exists() or not drafts_dir.is_dir():
+        return set()
+    hashes: set[str] = set()
+    try:
+        for p in drafts_dir.iterdir():
+            if not p.is_file() or p.suffix != ".md":
+                continue
+            m = _DRAFT_HASH_RE.search(p.name)
+            if m:
+                hashes.add(m.group(1))
+    except OSError:
+        log.exception("reflection: could not scan drafts dir %s", drafts_dir)
+    return hashes
+
+
+def _inject_origin_session_id(body: str, session_id: Optional[str]) -> str:
+    """If `body` starts with `---` frontmatter and lacks `originSessionId`,
+    inject it. Returns the body unchanged when session_id is falsy, the
+    body has no frontmatter, or the field already exists.
+
+    admission_gate's golden_replay stage requires originSessionId to
+    resolve a session JSONL archive. Without injection, reflection-
+    produced drafts soft-passed the stage silently.
+    """
+    if not session_id:
+        return body
+    fm, rest = parse_frontmatter(body or "")
+    if not isinstance(fm, dict) or not fm:
+        return body
+    if "originSessionId" in fm:
+        return body
+    fm["originSessionId"] = session_id
+    lines = ["---"]
+    for k, v in fm.items():
+        if isinstance(v, (dict, list)):
+            lines.append(f"{k}: {json.dumps(v, ensure_ascii=False)}")
+        elif isinstance(v, bool):
+            lines.append(f"{k}: {'true' if v else 'false'}")
+        elif v is None:
+            lines.append(f"{k}: null")
+        else:
+            lines.append(f"{k}: {v}")
+    lines.append("---")
+    head = "\n".join(lines)
+    tail = rest if rest.startswith("\n") else ("\n" + rest)
+    return head + tail
+
+
 # -- main class --------------------------------------------------
 
 
@@ -611,10 +678,31 @@ class ReflectionAgent:
             chosen = rank_resp["chosen"]
             rejected_summary = rank_resp.get("rejected_summary", "")
 
-        # Phase 3: stage drafts on disk
+        # Phase 3: stage drafts on disk.
+        # Seed seen_hashes with hashes of drafts already present under
+        # drafts_dir (from prior reflect or curate runs that didn't clean
+        # up). The filename encodes `_content_hash(body)[:8]`; match on that
+        # prefix. Per-run dedup (already there) handles collisions inside
+        # this invocation; cross-run dedup handles the case where repeated
+        # reflects on similar sources regenerate the same observation.
+        #
+        # originSessionId comes from the first loaded source — yuxu's
+        # "session" is an agent's transcript, and the filename stem is the
+        # agent name (e.g. `harness_pro_max.jsonl` → `harness_pro_max`).
+        # admission_gate's golden_replay prefix-matches this against
+        # `*.jsonl` filenames under session_root.
         drafts_dir.mkdir(parents=True, exist_ok=True)
         drafts: list[dict] = []
-        seen_hashes: set[str] = set()
+        seen_hashes: set[str] = {h for h in _load_existing_draft_hashes(drafts_dir)}
+        cross_run_skipped = 0
+        session_id: Optional[str] = None
+        if loaded:
+            try:
+                first_path = loaded[0].get("path") or ""
+                if first_path and first_path != "<inline>":
+                    session_id = Path(first_path).stem or None
+            except Exception:
+                session_id = None
         for c in chosen:
             edit = self._lookup_edit(hypotheses, c.get("framing_id"),
                                      c.get("edit_index"))
@@ -623,16 +711,24 @@ class ReflectionAgent:
                                 f"{c.get('framing_id')}#{c.get('edit_index')}")
                 continue
             body = _truncate_bytes(edit.get("body", ""), MAX_DRAFT_BYTES)
-            h = _content_hash(body)
-            if h in seen_hashes:
-                continue  # dedup by content
-            seen_hashes.add(h)
+            # Inject BEFORE hashing so cross-run dedup is stable across
+            # invocations that share the same source/content.
+            body = _inject_origin_session_id(body, session_id)
+            h8 = _content_hash(body)[:8]
+            if h8 in seen_hashes:
+                cross_run_skipped += 1
+                continue  # dedup by content (per-run OR cross-run)
+            seen_hashes.add(h8)
             draft = self._stage_draft(
                 drafts_dir=drafts_dir, run_id=run_id, edit=edit,
                 framing_id=c.get("framing_id"), score=c.get("score"),
                 reason=c.get("reason"), body=body,
             )
             drafts.append(draft)
+
+        if cross_run_skipped:
+            warnings.append(f"cross-run dedup skipped {cross_run_skipped} "
+                            "draft(s) already staged in _drafts/")
 
         # Phase 4: enqueue approvals (best-effort)
         approval_ids = await self._enqueue_approvals(drafts, run_id, need)

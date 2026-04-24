@@ -12,7 +12,15 @@ One JSON request per connection, one JSON response, then close.
     Response: whatever `memory.execute()` returns, unchanged.
 
 No truncation here — truncation is an LLM-budget concern; the shell
-client (`bin/yum`) applies it.
+client (`bin/yuxu-memory`) applies it.
+
+TODO(yuxu/memory-#5): this daemon runs bare — it doesn't load
+performance_ranker, so retrievals via `yuxu-memory` don't bump
+`score.applied` in memory frontmatter. For that, the daemon would need
+to publish `memory.retrieved` events to the running yuxu process (or
+load performance_ranker in-process). Fine for now: daemon is an
+observation tool, not a canonical retrieval path. When daemon-sourced
+retrievals need to count toward promotion, wire bus.publish here.
 
 Environment
 -----------

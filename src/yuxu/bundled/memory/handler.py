@@ -52,9 +52,22 @@ RETRIEVED_TOPIC = "memory.retrieved"
 
 # Mode → default filter policy. User-provided filters override the mode's
 # corresponding field; mode fills the gaps.
+#
+# `blank` and `explore` currently share the same policy (mandatory-only) —
+# `blank` is the cold-start "you know nothing" mode, `explore` is the
+# "scouting a new topic" mode; docs treat them distinctly but the code
+# hasn't differentiated them yet. Shared-reference so any future divergence
+# is one explicit edit rather than two silent drifts.
+#
+# TODO(yuxu/memory-ticket): differentiate `explore` from `blank` when a real
+# use case emerges — e.g. `explore` also includes the user's current working
+# files' tags, or pulls top-K by applied count. For now they behave
+# identically and that's deliberate.
+_MANDATORY_ONLY: dict[str, Any] = {"only_mandatory": True}
+
 MODE_POLICIES: dict[str, dict[str, Any]] = {
-    "blank":   {"only_mandatory": True},
-    "explore": {"only_mandatory": True},
+    "blank":   _MANDATORY_ONLY,
+    "explore": _MANDATORY_ONLY,
     "execute": {
         "evidence_levels": {"validated", "consensus", "observed"},
         "statuses": {"current"},
@@ -295,6 +308,15 @@ def _match_score(entry: dict, query_lower: str,
     Per-token hit (whitespace split): name +2 / desc +1 / body per-hit +1
     capped at 3 (prevents a memory that accidentally repeats a common token
     many times from dominating rankings).
+
+    TODO(yuxu/memory-#2): replace this substring scorer with a proper
+      retrieval stack once dogfooding exposes misses:
+        - semantic / embedding similarity (local model; no external API)
+        - retrieval-count weighting: entries retrieved often → higher rank
+          (frontmatter `score.applied` is already tracked by performance_ranker)
+        - time-decay on `updated` field
+        - multi-field joint rank (type/scope/evidence_level filters stay)
+      Keep this trivially-simple baseline until a real gap forces the upgrade.
     """
     name = (entry.get("name") or "").lower()
     desc = (entry.get("description") or "").lower()

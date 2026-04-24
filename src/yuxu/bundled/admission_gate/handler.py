@@ -308,13 +308,29 @@ async def _op_check(input: dict, ctx) -> dict:
             "verdict": "FAIL [no-frontmatter]",
         }
 
-    stages: dict[str, Any] = {}
-    stages["surface_check"] = await _surface_check(ctx, fm, body, pool, model)
-    stages["golden_replay"] = _golden_replay(fm, memory_root,
-                                              input.get("session_root"))
-    stages["noop_baseline"] = _noop_baseline(fm, memory_root, target_path,
-                                              threshold)
+    # Run cheap CPU stages first. If either fails, skip surface_check — it's
+    # the only LLM call in the gate (1-2s, real tokens). AND-semantic means
+    # one failure fails the gate; no need to spend the LLM budget confirming.
+    # Stages dict keeps the canonical insertion order (surface / golden /
+    # noop) for consumers that iterate; the `skipped` field flags the
+    # short-circuit so callers can distinguish "failed" from "not reached".
+    golden = _golden_replay(fm, memory_root, input.get("session_root"))
+    noop = _noop_baseline(fm, memory_root, target_path, threshold)
+    cheap_failed = not golden.get("pass") or not noop.get("pass")
+    if cheap_failed:
+        surface = {
+            "pass": False,
+            "reason": "skipped — cheap stage already failed; LLM call short-circuited",
+            "skipped": True,
+        }
+    else:
+        surface = await _surface_check(ctx, fm, body, pool, model)
 
+    stages: dict[str, Any] = {
+        "surface_check": surface,
+        "golden_replay": golden,
+        "noop_baseline": noop,
+    }
     overall = all(bool(s.get("pass")) for s in stages.values())
     return {
         "ok": True,

@@ -277,7 +277,10 @@ async def test_check_unknown_op_errors():
 
 
 async def test_check_combines_stages_AND(tmp_path: Path):
-    # surface passes but noop_baseline fails → overall fail
+    # Cheap stage (noop_baseline) fails → surface_check is short-circuited
+    # (LLM call not wasted) and the overall gate fails. Post-2026-04-24:
+    # the old behaviour ran all three serially; new behaviour runs CPU
+    # stages first, skips the LLM when any fails.
     root = _mk_memory_root(tmp_path, [
         ("existing.md", """---
 name: Kernel Invariants
@@ -293,8 +296,53 @@ type: feedback
         "memory_root": str(root),
     }, _ctx(bus))
     assert r["pass"] is False
-    assert r["stages"]["surface_check"]["pass"] is True
     assert r["stages"]["noop_baseline"]["pass"] is False
+    # surface_check was skipped — pass=False with a `skipped` marker, so
+    # callers can distinguish "LLM rejected it" from "we didn't ask LLM"
+    assert r["stages"]["surface_check"]["pass"] is False
+    assert r["stages"]["surface_check"].get("skipped") is True
+    # StubBus reply was NEVER consumed — if short-circuit failed, the
+    # LLM mock would have been invoked.
+    assert bus.calls == []  # no llm_driver request at all
+
+
+async def test_check_short_circuit_preserved_on_golden_replay_fail(tmp_path: Path):
+    """If golden_replay fails (originSessionId cited but archive missing),
+    surface_check should also be skipped. Pre-2026-04-24 all three ran."""
+    root = _mk_memory_root(tmp_path, [])  # no session archives
+    entry_body_with_session = ENTRY_OK.replace(
+        "---\n",
+        "---\noriginSessionId: missing-session-uuid\n",
+        1,
+    )
+    bus = _StubBus(reply={"ok": True, "content": '{"pass": true, "reason": "ok"}'})
+    r = await execute({
+        "op": "check",
+        "entry_body": entry_body_with_session,
+        "memory_root": str(root),
+        "session_root": str(root / "sessions_that_do_not_exist"),
+    }, _ctx(bus))
+    assert r["pass"] is False
+    assert r["stages"]["golden_replay"]["pass"] is False
+    assert r["stages"]["surface_check"].get("skipped") is True
+    assert bus.calls == []
+
+
+async def test_check_short_circuit_not_triggered_when_all_cheap_pass(tmp_path: Path):
+    """If both cheap stages pass, surface_check DOES run (no regression of
+    the happy path)."""
+    root = _mk_memory_root(tmp_path, [])
+    bus = _StubBus(reply={"ok": True, "content": '{"pass": true, "reason": "ok"}'})
+    r = await execute({
+        "op": "check",
+        "entry_body": ENTRY_OK,
+        "memory_root": str(root),
+    }, _ctx(bus))
+    assert r["pass"] is True
+    # surface_check actually called — no skipped marker, pass=True.
+    assert r["stages"]["surface_check"]["pass"] is True
+    assert "skipped" not in r["stages"]["surface_check"]
+    assert len(bus.calls) == 1  # exactly one LLM call
 
 
 # -- integration via Loader -------------------------------------

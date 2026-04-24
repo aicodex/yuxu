@@ -79,6 +79,18 @@ def _bump_applied(path: Path, probation_clear_threshold: int) -> None:
     - No frontmatter / parse error → skip silently (same policy as
       memory skill's indexer).
     - Write is atomic via tmp + os.replace.
+
+    TODO(yuxu/memory-#5): `score.applied` is tracked but no downstream
+      consumer uses it for search ranking. See `memory/handler._match_score`
+      TODO — add applied-count weighting when the search upgrade happens.
+    TODO(yuxu/memory-#6): no observed→validated promotion. Frequent
+      retrieval is a signal the entry is useful; once we define a
+      threshold (e.g. `applied >= 5 AND helped >= 2`), promote the
+      evidence_level here (peer to `_demote_level`, `_promote_level`).
+      Blocked on: (a) what counts as "helped" — needs iteration_agent or
+      explicit user signal; (b) tournament-style promotion vs threshold —
+      which is more useful in practice? Wait for real usage data before
+      picking.
     """
     try:
         text = path.read_text(encoding="utf-8")
