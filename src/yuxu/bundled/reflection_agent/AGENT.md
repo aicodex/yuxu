@@ -6,6 +6,12 @@ edit_warning: true
 depends_on: [gateway, llm_driver]
 optional_deps: [approval_queue, performance_ranker, memory]
 ready_timeout: 5
+# CC port (tools/AgentTool/agentMemory.ts:12-13): per-agent persistent
+# MEMORY.md. The `## Observations` section is cached at install() and
+# injected into every hypothesis prompt; the `## Runs` section is
+# append-only — reflect() logs one bullet per successful run so future
+# iteration passes can see what's been tried.
+memory: project
 ---
 # reflection_agent
 

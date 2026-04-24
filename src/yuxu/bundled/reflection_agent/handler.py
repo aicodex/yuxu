@@ -19,6 +19,8 @@ from glob import glob
 from pathlib import Path
 from typing import Any, Optional
 
+from yuxu.core.frontmatter import parse_frontmatter
+
 log = logging.getLogger(__name__)
 
 COMMAND = "/reflect"
@@ -285,9 +287,18 @@ class ReflectionAgent:
     def __init__(self, ctx) -> None:
         self.ctx = ctx
         self._registered_command = False
+        # CC port: per-agent MEMORY.md observations are the persistent carry-over
+        # between runs. Loaded at install() and cached — reflect() uses them to
+        # bias hypotheses. Runs get appended at the end of each reflect().
+        self._agent_memory_observations: str = ""
 
     async def install(self) -> None:
         self.ctx.bus.subscribe("gateway.command_invoked", self._on_command)
+        # Load persistent observations once per process. If Loader didn't wire
+        # agent_memory_path (no `memory:` in frontmatter, no project root, or
+        # init error), stays empty string — reflection silently degrades to
+        # the pre-port behaviour.
+        self._agent_memory_observations = self._load_agent_memory_observations()
         try:
             r = await self.ctx.bus.request("gateway", {
                 "op": "register_command",
@@ -315,6 +326,78 @@ class ReflectionAgent:
             except Exception:
                 pass
             self._registered_command = False
+
+    # -- agent memory (CC AgentTool `memory:` port) ----------------
+
+    def _load_agent_memory_observations(self) -> str:
+        """Read ctx.agent_memory_path, return the body text under `## Observations`.
+
+        Returns "" when no agent_memory_path is wired, the file hasn't been
+        seeded yet, or the Observations heading is absent. The ## Runs log is
+        never injected back into prompts — past run metadata would waste
+        tokens without improving hypothesis quality.
+        """
+        path = getattr(self.ctx, "agent_memory_path", None)
+        if path is None or not path.exists():
+            return ""
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as e:
+            log.warning("reflection_agent: could not read agent_memory_path %s: %s",
+                         path, e)
+            return ""
+        _, body = parse_frontmatter(text)
+        # Strip the ## Observations section (up to next ## heading / EOF).
+        lines = body.splitlines()
+        out: list[str] = []
+        inside = False
+        for line in lines:
+            if line.strip().startswith("## "):
+                if inside:
+                    break
+                if line.strip().lower() == "## observations":
+                    inside = True
+                continue
+            if inside:
+                out.append(line)
+        return "\n".join(out).strip()
+
+    def _append_agent_memory_run(self, *, need: str, framings: list[dict],
+                                    n_hyp_ok: int, n_drafts: int,
+                                    run_id: str) -> None:
+        """Append one bullet under `## Runs` in ctx.agent_memory_path. Creates
+        the section if absent. Best-effort — any IO error is logged and
+        swallowed; reflect() must not fail because of memory logging."""
+        path = getattr(self.ctx, "agent_memory_path", None)
+        if path is None:
+            return
+        ts = time.strftime("%Y-%m-%dT%H:%M")
+        framing_ids = ",".join(f.get("id", "?") for f in framings)
+        # Trim `need` on the log line so huge prompts don't bloat the file.
+        need_short = need.strip().replace("\n", " ")
+        if len(need_short) > 120:
+            need_short = need_short[:119] + "\u2026"
+        bullet = (f"- {ts} / run={run_id} / need=\"{need_short}\" / "
+                   f"hypotheses={n_hyp_ok} / drafts={n_drafts} / "
+                   f"framings=[{framing_ids}]")
+        try:
+            text = path.read_text(encoding="utf-8") if path.exists() else ""
+            if "\n## Runs" in text or text.startswith("## Runs"):
+                # Append at the END of the file — simpler than inserting at
+                # the end of the Runs section, and a ##-heading-ended file
+                # reads the same either way.
+                if not text.endswith("\n"):
+                    text += "\n"
+                text += bullet + "\n"
+            else:
+                if not text.endswith("\n"):
+                    text += "\n"
+                text += "\n## Runs\n\n" + bullet + "\n"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+        except OSError as e:
+            log.warning("reflection_agent: could not append run log to %s: %s",
+                         path, e)
 
     # -- event handlers --------------------------------------------
 
@@ -570,6 +653,16 @@ class ReflectionAgent:
         overall_tps = (total_completion / (total_elapsed_ms / 1000.0)
                        if total_elapsed_ms > 0 and total_completion > 0 else None)
 
+        # CC port: log the run outcome to per-agent MEMORY.md. Only success
+        # path — early-return failures are already surfaced via `warnings`
+        # / reply; adding them to MEMORY.md pollutes the useful signal.
+        self._append_agent_memory_run(
+            need=need, framings=framings,
+            n_hyp_ok=sum(1 for h in hypotheses if h.get("ok")),
+            n_drafts=len(drafts),
+            run_id=run_id,
+        )
+
         return {"ok": True, "run_id": run_id, "hypotheses": hypotheses,
                 "chosen": chosen, "rejected_summary": rejected_summary,
                 "drafts": drafts, "approval_ids": approval_ids,
@@ -600,6 +693,17 @@ class ReflectionAgent:
             user_parts.append(
                 "Existing memory (prefer `update` if a relevant entry "
                 f"is already present):\n{memory_index_block}"
+            )
+        # CC port: per-agent MEMORY.md Observations — persistent notes that
+        # survive across reflect runs (context is thrown away, MEMORY.md is
+        # not). Inject before transcripts so the hypothesis can weight its
+        # extraction by what the agent has learned before.
+        if self._agent_memory_observations:
+            user_parts.append(
+                "Prior reflection observations (from this agent's own "
+                f"persistent memory — weight your extraction accordingly, "
+                f"but base claims on the transcripts, not these notes):\n"
+                f"{self._agent_memory_observations}"
             )
         user_parts.append(f"Transcripts:\n{sources_block}")
         user_content = "\n\n".join(user_parts)

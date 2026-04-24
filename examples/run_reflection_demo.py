@@ -124,14 +124,39 @@ async def boot_and_run() -> int:
     memory_root = WORK_DIR / "memory"
 
     # Direct construction — skip gateway register/install.
+    # CC port: wire agent_memory_path so the demo also exercises the per-
+    # agent MEMORY.md read/write path. Pre-seed the file with a sample
+    # Observations section so we can see it flow into the first-turn prompt.
+    agent_memory_path = WORK_DIR / "agent_memory_demo" / "MEMORY.md"
+    agent_memory_path.parent.mkdir(parents=True, exist_ok=True)
+    agent_memory_path.write_text(
+        "---\n"
+        "agent: reflection_agent\n"
+        "scope: project\n"
+        "---\n"
+        "# reflection_agent — agent memory (demo)\n\n"
+        "## Observations\n\n"
+        "- demo seed: 过去观察到命名约定讨论最容易 drift 到实现细节,\n"
+        "  hypothesis 里优先标记出 rule-level 和 impl-level 的分界。\n"
+        "- demo seed: update 优于 add 当存在相关条目时。\n",
+        encoding="utf-8",
+    )
+
     ctx = SimpleNamespace(
         bus=bus,
         agent_dir=WORK_DIR / "_fake_agent_dir",
         name="reflection_agent",
         loader=loader,
+        agent_memory_path=agent_memory_path,
     )
     ctx.agent_dir.mkdir(exist_ok=True)
     agent = ReflectionAgent(ctx)
+
+    # CC port: install() would load observations — we bypass install() in
+    # this demo but still want them in the prompt, so prime the cache now.
+    agent._agent_memory_observations = agent._load_agent_memory_observations()
+    print(f"\n=== loaded Observations (injected into each hypothesis prompt) ===")
+    print(agent._agent_memory_observations or "(none)")
 
     log = logging.getLogger("reflection_demo")
     log.info("running reflect: pool=%s model=%s sources=%d",
@@ -205,6 +230,11 @@ async def boot_and_run() -> int:
         p = Path(d["path"])
         print(f"\n--- {p.name} ---")
         print(p.read_text(encoding="utf-8")[:1500])
+
+    # CC port dogfood: show MEMORY.md after the run. The "## Runs" section
+    # should now have one new bullet from this invocation.
+    print(f"\n=== agent MEMORY.md after run ({agent_memory_path}) ===")
+    print(agent_memory_path.read_text(encoding="utf-8"))
 
     return 0
 

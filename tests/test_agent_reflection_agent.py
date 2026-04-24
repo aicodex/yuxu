@@ -974,3 +974,152 @@ async def test_compress_sources_compressor_raises_falls_back():
     block, warns = await _compress_sources(bus, loaded, task="x")
     assert "alpha" in block
     assert any("raised" in w for w in warns)
+
+
+# ----------------------------------------------------------------------------
+# CC port: per-agent MEMORY.md (ctx.agent_memory_path) integration
+# ----------------------------------------------------------------------------
+
+
+def _make_ctx_with_memory(tmp_path: Path, bus: Bus,
+                             memory_body: str | None = None) -> SimpleNamespace:
+    """Like _make_ctx but also wires agent_memory_path, optionally seeding
+    the MEMORY.md body."""
+    project_root = tmp_path / "proj"
+    project_root.mkdir(exist_ok=True)
+    (project_root / "yuxu.json").write_text("{}")
+    agent_dir = project_root / "_system" / "reflection_agent"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    mem_path = (project_root / "data" / "agent-memory"
+                / "reflection_agent" / "MEMORY.md")
+    mem_path.parent.mkdir(parents=True, exist_ok=True)
+    if memory_body is not None:
+        mem_path.write_text(
+            f"---\nagent: reflection_agent\nscope: project\n---\n{memory_body}\n",
+            encoding="utf-8",
+        )
+    return SimpleNamespace(
+        bus=bus, agent_dir=agent_dir,
+        name="reflection_agent", loader=None,
+        agent_memory_path=mem_path,
+    )
+
+
+async def test_load_agent_memory_observations_extracts_section(tmp_path):
+    bus = Bus()
+    body = (
+        "# reflection_agent — agent memory\n\n"
+        "## Observations\n\n"
+        "- focus on anti-patterns first\n"
+        "- prefer updates over adds\n\n"
+        "## Runs\n\n"
+        "- 2026-04-24T10:00 / run=abc / need=\"foo\"\n"
+    )
+    ctx = _make_ctx_with_memory(tmp_path, bus, memory_body=body)
+    agent = ReflectionAgent(ctx)
+    obs = agent._load_agent_memory_observations()
+    assert "focus on anti-patterns first" in obs
+    assert "prefer updates over adds" in obs
+    # The Runs section must NOT leak into the injected observations —
+    # that's run metadata, not prompt signal.
+    assert "run=abc" not in obs
+    assert "2026-04-24T10:00" not in obs
+
+
+async def test_load_agent_memory_observations_missing_section(tmp_path):
+    bus = Bus()
+    ctx = _make_ctx_with_memory(
+        tmp_path, bus,
+        memory_body="# reflection_agent — agent memory\n\nno sections yet.\n",
+    )
+    agent = ReflectionAgent(ctx)
+    assert agent._load_agent_memory_observations() == ""
+
+
+async def test_load_agent_memory_observations_no_path(tmp_path):
+    bus = Bus()
+    ctx = _make_ctx_with_memory(tmp_path, bus)  # file not written
+    ctx.agent_memory_path = None  # simulate Loader didn't wire it
+    agent = ReflectionAgent(ctx)
+    assert agent._load_agent_memory_observations() == ""
+
+
+async def test_load_agent_memory_observations_file_missing(tmp_path):
+    bus = Bus()
+    ctx = _make_ctx_with_memory(tmp_path, bus)
+    # path is set but the file doesn't exist yet
+    assert not ctx.agent_memory_path.exists()
+    agent = ReflectionAgent(ctx)
+    assert agent._load_agent_memory_observations() == ""
+
+
+async def test_append_agent_memory_run_creates_runs_section(tmp_path):
+    bus = Bus()
+    ctx = _make_ctx_with_memory(
+        tmp_path, bus,
+        memory_body=("# reflection_agent — agent memory\n\n"
+                      "## Observations\n\nsome note\n"),
+    )
+    agent = ReflectionAgent(ctx)
+    agent._append_agent_memory_run(
+        need="improve harness logs", framings=[{"id": "pattern"}, {"id": "anti"}],
+        n_hyp_ok=2, n_drafts=1, run_id="abc123",
+    )
+    text = ctx.agent_memory_path.read_text(encoding="utf-8")
+    assert "## Runs" in text
+    assert "run=abc123" in text
+    assert "hypotheses=2" in text
+    assert "drafts=1" in text
+    assert "framings=[pattern,anti]" in text
+    assert 'need="improve harness logs"' in text
+
+
+async def test_append_agent_memory_run_appends_to_existing_runs(tmp_path):
+    bus = Bus()
+    ctx = _make_ctx_with_memory(
+        tmp_path, bus,
+        memory_body=(
+            "# reflection_agent — agent memory\n\n"
+            "## Runs\n\n"
+            "- 2026-04-24T10:00 / run=older / need=\"x\"\n"
+        ),
+    )
+    agent = ReflectionAgent(ctx)
+    agent._append_agent_memory_run(
+        need="y", framings=[{"id": "pattern"}],
+        n_hyp_ok=1, n_drafts=0, run_id="newer",
+    )
+    text = ctx.agent_memory_path.read_text(encoding="utf-8")
+    # Both entries present, old one unharmed
+    assert "run=older" in text
+    assert "run=newer" in text
+    assert text.count("## Runs") == 1  # didn't duplicate the section
+
+
+async def test_append_agent_memory_run_truncates_long_need(tmp_path):
+    bus = Bus()
+    ctx = _make_ctx_with_memory(
+        tmp_path, bus,
+        memory_body="# reflection_agent — agent memory\n\n",
+    )
+    agent = ReflectionAgent(ctx)
+    long_need = "x" * 500
+    agent._append_agent_memory_run(
+        need=long_need, framings=[{"id": "p"}],
+        n_hyp_ok=1, n_drafts=0, run_id="r",
+    )
+    text = ctx.agent_memory_path.read_text(encoding="utf-8")
+    # Short need = 119 chars + ellipsis, not the full 500
+    assert "x" * 500 not in text
+    assert "\u2026" in text  # ellipsis marker
+
+
+async def test_append_agent_memory_run_no_path_is_noop(tmp_path):
+    bus = Bus()
+    ctx = _make_ctx_with_memory(tmp_path, bus)
+    ctx.agent_memory_path = None
+    agent = ReflectionAgent(ctx)
+    # Must not raise
+    agent._append_agent_memory_run(
+        need="x", framings=[], n_hyp_ok=0, n_drafts=0, run_id="r",
+    )
