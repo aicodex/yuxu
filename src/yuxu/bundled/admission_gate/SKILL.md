@@ -3,7 +3,7 @@ name: admission_gate
 version: "0.1.0"
 author: yuxu
 license: MIT
-description: Three-stage quality gate run on memory writes (write-admission, per I6). `surface_check` uses an LLM judge to decide if the entry is an actionable rule vs verbose-obvious/opinion/mis-typed content; `golden_replay` verifies that any `originSessionId` citation points to a session archive that actually exists; `noop_baseline` flags near-duplicates of existing entries. Any stage fail → `pass: false`; caller (today, `approval_applier`) archives the draft instead of writing it.
+description: "Three-stage quality gate run on memory writes (write-admission, per I6). `surface_check` uses an LLM judge to decide if the entry is an actionable rule vs verbose-obvious/opinion/mis-typed content; `golden_replay` verifies that any `originSessionId` citation points to a session archive that actually exists; `noop_baseline` flags near-duplicates of existing entries. Any stage fail → pass false; caller (today, `approval_applier`) archives the draft instead of writing it."
 triggers: [admission gate, memory gate, check memory entry]
 parameters:
   type: object
