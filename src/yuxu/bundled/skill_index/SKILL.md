@@ -95,19 +95,22 @@ fetches the chosen L2 body via tool-use. Use the
 `build_directive(xml_block)` helper in handler.py or copy verbatim:
 
 ```
-## Available Skills (mandatory)
-Before replying: scan <available_skills> <description> entries below.
-- If exactly one skill clearly applies: call the `invoke_skill` tool with
-  `{"name": "<skill>"}` to load its full SKILL.md, then follow it.
-- If multiple could apply: choose the most specific one, then invoke it.
-- If none clearly apply: do not invoke any skill.
-Constraints: never invoke more than one skill up front; only invoke after
-selecting.
+The following skills are available for use with the invoke_skill tool:
 
 <available_skills>
   ...
 </available_skills>
 ```
+
+That is intentionally the entire directive — ported from Claude Code
+2.1.88 `utils/messages.ts:3734` (skill_listing attachment). All
+selection / invocation / anti-duplicate discipline lives in
+`invoke_skill.TOOL_SCHEMA.description` (itself ported from CC
+`tools/SkillTool/prompt.ts`), not in this wrapper. CC's own attachment
+is a single declarative line; stuffing "scan / pick the most specific /
+never invoke more than one" into the attachment observably encouraged
+MiniMax M2.7 to treat follow-up `invoke_skill` calls as exploration
+(verified 2026-04-24 — see `reference_cc_skilltool_prompt.md`).
 
 ## Discovery
 

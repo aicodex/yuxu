@@ -68,14 +68,37 @@ PROMPTS = [
     "给我读一下某个 skill 的 SKILL.md 说明",
 ]
 
-SYSTEM_PROMPT = (
-    "You are yuxu's test assistant. You have access to a catalog of yuxu "
-    "skills (exposed to you as <available_skills> via a system-reminder). "
-    "Follow the directive in that reminder precisely. When you invoke a "
-    "skill via the `invoke_skill` tool, after reading its SKILL.md body, "
-    "summarise (in one short paragraph, in Chinese) what you would do "
-    "next for the user's request — do NOT actually call any other tool."
-)
+# System prompt skeleton ported from Claude Code 2.1.88
+# `constants/prompts.ts:186-197` (getSimpleSystemSection). yuxu adaptations:
+#   - Dropped the Github-flavored markdown / monospace bullet (not relevant
+#     to a bus-dispatched test harness; answers are printed, not rendered).
+#   - Dropped the hooks / context-window-compaction bullets (yuxu has no
+#     hooks layer yet and the demo is short enough to never hit compaction).
+#   - Kept verbatim: the `do not re-attempt the exact same tool call` rule
+#     (CC:189) and the `<system-reminder>` explanation (CC:190) — these are
+#     the two anti-fishing anchors we specifically want MiniMax to honour.
+#
+# DEMO-SPECIFIC FINAL PARAGRAPH — NOT FROM CC. CC's production prompt
+# assumes the model also has Bash/Grep/FileRead to actually *follow* a
+# loaded skill's instructions operationally. This demo ships ONE tool
+# (invoke_skill), so the model must describe, not execute. Observed
+# 2026-04-24: omitting this paragraph regresses prompt 1+2 to
+# max_iter/6 — the model reads a SKILL.md that mentions ops it can't
+# perform and starts fishing for other skills whose bodies might expose
+# a path. Once yuxu lands a real NL entry point with a fuller toolset,
+# revert this paragraph and re-run — the CC attachment + tool
+# description anchors alone should then suffice.
+SYSTEM_PROMPT = """You are yuxu's test assistant. Use the instructions below and the tools available to you to assist the user.
+
+# System
+ - Tools are executed in a user-selected permission mode. When you attempt to call a tool that is not automatically allowed by the user's permission mode or permission settings, the user will be prompted so that they can approve or deny the execution. If the user denies a tool you call, do not re-attempt the exact same tool call. Instead, think about why the user has denied the tool call and adjust your approach.
+ - Tool results and user messages may include <system-reminder> or other tags. Tags contain information from the system. They bear no direct relation to the specific tool results or user messages in which they appear.
+
+# Demo-specific constraints
+ - The only tool available to you is `invoke_skill`. You have no shell, no file-read, no grep, no web, no other tools.
+ - After `invoke_skill` returns a SKILL.md body, do NOT attempt to execute the operations it describes — you cannot. Instead, write one short paragraph in Chinese that describes what you *would* do to handle the user's request if you had the full toolchain. Then stop.
+ - If the user's request is small talk or clearly outside the catalog, do not invoke any skill — answer in Chinese directly.
+"""
 
 
 def write_rate_limits() -> Path:

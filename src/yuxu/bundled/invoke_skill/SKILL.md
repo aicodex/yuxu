@@ -76,3 +76,22 @@ back through the standard tool_result → next-iteration path in
 
 Stateless. No lifecycle, no bus subscribes, no persistent state. Every
 call does one bus hop and returns.
+
+## Prompt provenance (do not soften)
+
+`TOOL_SCHEMA["description"]` is ported verbatim from Claude Code 2.1.88
+`tools/SkillTool/prompt.ts:173-195` with three adaptations documented
+inline in `handler.py`:
+
+- `"Skill tool" / "this tool"` → `"invoke_skill tool"`
+- example skill names → yuxu bundled skills
+- `<COMMAND_NAME_TAG>` sentinel → "a previous invoke_skill tool call in
+  this turn already returned a SKILL.md body" (yuxu's equivalent entry
+  point for an already-loaded skill is the tool_result stream, not a
+  slash-command wrapper in the user message)
+
+The four anti-fishing anchors are tested by
+`tests/test_skill_invoke_skill.py::test_description_carries_cc_anti_fishing_anchors`.
+Do not reword these without re-porting from the CC source — LLM
+behaviour on MiniMax M2.7 shifted measurably when they were absent
+(2026-04-24 observation; see `reference_cc_skilltool_prompt.md`).

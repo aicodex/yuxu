@@ -54,6 +54,22 @@ async def test_tool_schema_shape():
     assert TOOL_SCHEMA["parameters"]["required"] == ["name"]
 
 
+async def test_description_carries_cc_anti_fishing_anchors():
+    """Verbatim port from Claude Code 2.1.88 `tools/SkillTool/prompt.ts`.
+    These four anchors are the reason CC doesn't 'fish' — do not soften
+    them without a re-port from CC."""
+    desc = TOOL_SCHEMA["description"]
+    # Opening line (verbatim)
+    assert "Execute a skill within the main conversation" in desc
+    # BLOCKING REQUIREMENT (verbatim) — forces single up-front invocation
+    assert "BLOCKING REQUIREMENT" in desc
+    # NEVER mention without calling (verbatim) — kills mention-then-skip loop
+    assert "NEVER mention a skill without actually calling this tool" in desc
+    # ALREADY loaded rule (adapted to yuxu tool_result semantics) — kills
+    # the fishing loop after first invoke returns a body.
+    assert "ALREADY been loaded" in desc
+
+
 # -- unwrap ----------------------------------------------------
 
 

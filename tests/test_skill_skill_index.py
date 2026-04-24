@@ -337,19 +337,25 @@ async def test_unknown_op_errors(tmp_path: Path):
 # -- directive helper -----------------------------------------
 
 
-async def test_build_directive_contains_scan_instruction():
+async def test_build_directive_wraps_xml_block():
+    """Directive is intentionally minimal — CC-style: one declarative line
+    plus the XML block. All selection/invocation discipline lives in
+    invoke_skill.TOOL_SCHEMA.description, not here."""
     block = "<available_skills>\n</available_skills>"
     out = build_directive(block)
-    assert "## Available Skills (mandatory)" in out
-    assert "Before replying: scan" in out
-    assert "never invoke more than one skill up front" in out
+    assert "The following skills are available for use with the invoke_skill tool:" in out
     assert block in out
 
 
-async def test_directive_template_points_to_invoke_skill_tool():
+async def test_directive_template_is_minimal():
+    """Anti-regression: do not re-introduce selection narrative in the
+    attachment. CC puts this in the tool prompt, not the catalog wrapper."""
     assert "invoke_skill" in DIRECTIVE_TEMPLATE
-    assert '"name"' in DIRECTIVE_TEMPLATE
-    # No longer tells the LLM to call skill_index directly.
+    # Bullets / multi-option narrative from the previous wording must stay out.
+    assert "scan" not in DIRECTIVE_TEMPLATE
+    assert "choose" not in DIRECTIVE_TEMPLATE
+    assert "Constraints" not in DIRECTIVE_TEMPLATE
+    # No skill_index-direct-invocation leftovers.
     assert '{"op": "read"' not in DIRECTIVE_TEMPLATE
 
 

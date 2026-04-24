@@ -307,14 +307,7 @@ def _render_with_budget(entries: list[dict],
 # -- directive helper (importable) ----------------------------
 
 
-DIRECTIVE_TEMPLATE = """## Available Skills (mandatory)
-Before replying: scan <available_skills> <description> entries below.
-- If exactly one skill clearly applies: call the `invoke_skill` tool \
-with `{{"name": "<skill>"}}` to load its full SKILL.md, then follow it.
-- If multiple could apply: choose the most specific one, then invoke it.
-- If none clearly apply: do not invoke any skill.
-Constraints: never invoke more than one skill up front; only invoke after \
-selecting.
+DIRECTIVE_TEMPLATE = """The following skills are available for use with the invoke_skill tool:
 
 {xml_block}
 """
