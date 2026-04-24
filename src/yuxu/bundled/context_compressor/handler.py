@@ -32,7 +32,11 @@ NAME = "context_compressor"
 COMPRESSED_TOPIC = "context.compressed"
 
 DEFAULT_TARGET_TOKENS = 2000
-DEFAULT_MAX_BYTES_PER_MAP = 60_000
+# 500KB per map call — MiniMax 2.7 has 256k context (~1MB bytes), leaves
+# plenty of room for system prompt + LLM output. Raised from initial 60KB
+# after reference_compressor_measured_quality.md showed the old cap dropped
+# 99%+ of large session JSONLs. Caller can still override per call.
+DEFAULT_MAX_BYTES_PER_MAP = 500_000
 BYTES_PER_TOKEN_ESTIMATE = 4  # rough — no tokenizer dependency
 
 # Shared directive injected into every compression prompt. Ported from

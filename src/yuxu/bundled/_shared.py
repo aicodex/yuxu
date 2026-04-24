@@ -19,25 +19,54 @@ import yaml
 
 # -- frontmatter writer (shared between approval_applier + performance_ranker)
 
+_YAML_UNSAFE_RE = None  # lazy
+
+
+def _needs_quoting(s: str) -> bool:
+    """Return True if `s` can't safely appear as a YAML bare scalar.
+    Conservative — errs on the side of quoting."""
+    if not s:
+        return True
+    if s[0] in "!&*-?,:[]{}#|>@`\"'%":
+        return True
+    # Reserved YAML scalars
+    if s.lower() in ("true", "false", "null", "yes", "no", "on", "off", "~"):
+        return True
+    # Any ": " sequence (YAML key/value split), `#` (comment), newlines
+    if ": " in s or " #" in s or "\n" in s or "\t" in s:
+        return True
+    # Structural characters
+    if any(ch in s for ch in "{}[]\"'"):
+        return True
+    return False
+
+
 def dump_frontmatter(fm: dict) -> str:
     """Serialize a frontmatter dict to a `---`-bounded block matching the
     convention used by bundled memory writers:
 
     - JSON for dicts/lists (round-trippable through `yaml.safe_load`)
     - `true` / `false` for bools, `null` for None
-    - plain repr for scalars
-    - key order preserved from dict iteration
+    - Strings with YAML-special chars get JSON-quoted so they survive a
+      round-trip through `yaml.safe_load`. Plain word strings stay bare.
+    - Other scalars as-is
+    - Key order preserved from dict iteration
 
     Caller appends the entry body.
     """
     lines = ["---"]
     for k, v in fm.items():
-        if isinstance(v, (dict, list)):
-            lines.append(f"{k}: {json.dumps(v, ensure_ascii=False)}")
-        elif isinstance(v, bool):
+        if isinstance(v, bool):
             lines.append(f"{k}: {'true' if v else 'false'}")
         elif v is None:
             lines.append(f"{k}: null")
+        elif isinstance(v, (dict, list)):
+            lines.append(f"{k}: {json.dumps(v, ensure_ascii=False)}")
+        elif isinstance(v, str):
+            if _needs_quoting(v):
+                lines.append(f"{k}: {json.dumps(v, ensure_ascii=False)}")
+            else:
+                lines.append(f"{k}: {v}")
         else:
             lines.append(f"{k}: {v}")
     lines.append("---")

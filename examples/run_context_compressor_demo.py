@@ -50,7 +50,10 @@ BASE_URL = (os.environ.get("LLM_BASE_URL")
 WORK_DIR = HERE / "_context_compressor_run_local"
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-SESSIONS_ROOT = HERE.parent / "docs" / "experiences" / "sessions_raw"
+SESSIONS_ROOT = Path(
+    os.environ.get("CC_DEMO_SESSIONS_DIR")
+    or str(HERE.parent / "docs" / "experiences" / "sessions_raw")
+).expanduser()
 
 
 def write_rate_limits() -> Path:
