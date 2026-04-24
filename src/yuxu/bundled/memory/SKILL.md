@@ -84,3 +84,47 @@ missing frontmatter `name` / `description`.
 Entries without `evidence_level` default to `observed` for filter purposes;
 without `status` default to `current`. Keeps Phase 1 ungraded entries
 addressable under execute mode.
+
+## When to call (LLM-facing guidance)
+
+**Default to `execute` mode** — it returns the validated/consensus/observed
+entries the caller actually needs to act on, minus probation. Switch modes
+only when you need a different slice:
+
+- **`execute`** (default) — executing a task, need proven rules only
+- **`explore`** — starting a new task, want the minimal mandatory rules
+- **`reflect`** — post-mortem / learning from past runs, include archived
+  and probation entries so you see the whole history
+- **`blank`** — you want to verify behavior without memory bias (test-time,
+  debugging a prompt)
+- **`debug`** — archaeology: show me what was observed then archived
+
+**Op selection:**
+
+- **Start with `stats`** when unsure of scope. `{op: "stats"}` is O(1)-payload
+  and tells you how many entries exist, by type/scope/evidence. Cheap probe.
+- **`list`** when you need the filtered index — never dumps full bodies, just
+  the frontmatter. Use `type` / `scope` / `tags` / `evidence_level` filters
+  to narrow. If the expected result is > 30 entries, add filters or switch
+  to `search`.
+- **`search`** when you have a keyword and want ranked top-K. Ranks name
+  hits heavier than description hits. Cheap ranked fuzzy match; not
+  semantic.
+- **`get`** when you already have a path (from `list` or `search`) and need
+  the full body. One `get` per entry — don't bulk-fetch.
+
+**Do NOT:**
+
+- Do NOT read memory files with `rglob` / filesystem scans — violates I6's
+  lazy-access contract; the skill exists precisely to mediate this.
+- Do NOT auto-inject all memory into every prompt — retrieval is opt-in per
+  turn, stays tool-mediated.
+- Do NOT write memory through this skill. All writes flow through
+  `memory_curator` → `approval_queue` → `approval_applier` → `admission_gate`.
+  This skill is read-only.
+- Do NOT bypass `mode` when the caller context suggests it matters; e.g.
+  don't pass `include_probation=true` from an `execute`-mode agent unless
+  you're explicitly doing post-mortem analysis.
+- Do NOT use memory for temporary TODO state, session progress, or
+  completed-work logs — those belong to session transcripts, not memory.
+  Memory is for durable cross-session facts.
