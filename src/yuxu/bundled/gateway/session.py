@@ -72,6 +72,13 @@ class SessionEntry:
     created_at: str = field(default_factory=_now_iso)
     last_inbound_ts: Optional[str] = None
     last_outbound_message_id: Optional[str] = None
+    # TODO(yuxu/compaction-gateway): when yuxu grows a per-session
+    # conversation history (not just routing metadata), add `history:
+    # list[dict] = field(default_factory=list)` here and wire an auto-
+    # trigger on _on_inbound that calls compactor.microcompact when
+    # len(history) or byte-size passes a threshold. compactor skill is
+    # already shipped; only the history buffer + trigger are missing.
+    # See `project_pending_todos.md` under 🔧 compaction.
 
     def as_dict(self) -> dict:
         return {

@@ -140,6 +140,18 @@ class LlmDriver:
         for m in messages:
             await self._log_message(agent, m)
 
+        # TODO(yuxu/compaction-llm_driver): auto-invoke compactor between
+        # iterations when `messages` exceeds a byte budget OR tool_count
+        # passes a threshold. The mechanism is already shipped as the
+        # `compactor` bundled skill (microcompact + full_compact); what's
+        # missing is the trigger. Risk that held it back: wrong cut could
+        # orphan a tool_call_id — needs integration-tested against real
+        # tool-heavy agents (harness_pro_max's multi-call loops, any
+        # future iteration_agent rollouts). Until then callers can opt in
+        # explicitly: call compactor.microcompact on their `messages`
+        # before passing into run_turn, or wrap run_turn in a loop that
+        # compacts between iterations. See
+        # `project_pending_todos.md` under 🔧 compaction.
         for it in range(max_iterations):
             iterations_done = it + 1
             api_messages: list[dict] = [{"role": "system", "content": system_prompt}]
