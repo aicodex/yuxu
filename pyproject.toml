@@ -61,3 +61,6 @@ target-version = "py310"
 [tool.pytest.ini_options]
 asyncio_mode = "strict"
 testpaths = ["tests"]
+markers = [
+    "slow: real-provider integration tests (LLM / network); skipped by default, enable with -m slow",
+]
