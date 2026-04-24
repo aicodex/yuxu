@@ -309,12 +309,11 @@ def _render_with_budget(entries: list[dict],
 
 DIRECTIVE_TEMPLATE = """## Available Skills (mandatory)
 Before replying: scan <available_skills> <description> entries below.
-- If exactly one skill clearly applies: call `skill_index` with \
-`{{"op": "read", "name": "<skill>"}}` to load its full SKILL.md, then \
-follow it.
-- If multiple could apply: choose the most specific one, then read/follow it.
-- If none clearly apply: do not read any SKILL.md.
-Constraints: never read more than one skill up front; only read after \
+- If exactly one skill clearly applies: call the `invoke_skill` tool \
+with `{{"name": "<skill>"}}` to load its full SKILL.md, then follow it.
+- If multiple could apply: choose the most specific one, then invoke it.
+- If none clearly apply: do not invoke any skill.
+Constraints: never invoke more than one skill up front; only invoke after \
 selecting.
 
 {xml_block}

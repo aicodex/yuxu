@@ -342,14 +342,15 @@ async def test_build_directive_contains_scan_instruction():
     out = build_directive(block)
     assert "## Available Skills (mandatory)" in out
     assert "Before replying: scan" in out
-    assert "never read more than one skill up front" in out
+    assert "never invoke more than one skill up front" in out
     assert block in out
 
 
-async def test_directive_template_has_read_op_instruction():
-    assert "skill_index" in DIRECTIVE_TEMPLATE
-    assert "op" in DIRECTIVE_TEMPLATE
-    assert "read" in DIRECTIVE_TEMPLATE
+async def test_directive_template_points_to_invoke_skill_tool():
+    assert "invoke_skill" in DIRECTIVE_TEMPLATE
+    assert '"name"' in DIRECTIVE_TEMPLATE
+    # No longer tells the LLM to call skill_index directly.
+    assert '{"op": "read"' not in DIRECTIVE_TEMPLATE
 
 
 # -- loader discovery path -----------------------------------

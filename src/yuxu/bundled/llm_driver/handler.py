@@ -121,6 +121,7 @@ class LlmDriver:
         cost_hint: Optional[float] = None,
         thinking: Any = None,
         max_tokens: Optional[int] = None,
+        attachments: Optional[list[str]] = None,
     ) -> dict:
         dispatch = tool_dispatch or {}
         total_prompt = 0
@@ -141,7 +142,14 @@ class LlmDriver:
 
         for it in range(max_iterations):
             iterations_done = it + 1
-            api_messages = [{"role": "system", "content": system_prompt}, *messages]
+            api_messages: list[dict] = [{"role": "system", "content": system_prompt}]
+            if attachments:
+                for att in attachments:
+                    api_messages.append({
+                        "role": "user",
+                        "content": f"<system-reminder>\n{att}\n</system-reminder>",
+                    })
+            api_messages.extend(messages)
             base_req: dict[str, Any] = {
                 "pool": pool,
                 "model": model,
@@ -351,6 +359,7 @@ class LlmDriver:
             cost_hint=payload.get("cost_hint"),
             thinking=payload.get("thinking"),
             max_tokens=payload.get("max_tokens"),
+            attachments=payload.get("attachments"),
         )
         result["messages"] = messages
         return result
