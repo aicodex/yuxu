@@ -31,9 +31,10 @@ COMMAND_HELP = (
 AUTO_KEYWORD = "auto"
 
 DEFAULT_HYPOTHESES = 3
-MAX_SOURCE_BYTES = 8_192       # per source file, post-truncation
+MAX_SOURCE_BYTES = 500_000     # per source file — safety cap; compressor handles budget
 MAX_DRAFT_BYTES = 4_096        # per drafted memory entry body
-MAX_TOTAL_SOURCE_BYTES = 64_000  # combined sources passed to one LLM call
+MAX_TOTAL_SOURCE_BYTES = 5_000_000  # safety cap; context_compressor enforces real budget
+DEFAULT_COMPRESS_TARGET_TOKENS = 10_000  # post-compression budget fed to LLM
 
 # Three framings; each one is a different prompt persona that biases the
 # extractor toward a complementary slice of the transcript.
@@ -204,6 +205,52 @@ def _format_sources(sources: list[dict]) -> str:
     for s in sources:
         parts.append(f"### Source: {s['path']}\n\n{s['text']}\n")
     return "\n---\n".join(parts)
+
+
+async def _compress_sources(bus, sources: list[dict], *, task: str,
+                              target_tokens: int = DEFAULT_COMPRESS_TARGET_TOKENS,
+                              pool: Optional[str] = None,
+                              model: Optional[str] = None
+                              ) -> tuple[str, list[str]]:
+    """Run loaded sources through context_compressor. Gracefully falls back
+    to `_format_sources` when the skill isn't loaded or errors out, and
+    when the compressor reports `skipped=true` (input under budget).
+    Returns (sources_block, warnings).
+    """
+    if not sources:
+        return "", []
+    documents = [{"id": s.get("path") or "src", "body": s.get("text") or ""}
+                  for s in sources]
+    try:
+        r = await bus.request("context_compressor", {
+            "op": "summarize",
+            "documents": documents,
+            "task": task,
+            "target_tokens": target_tokens,
+            "pool": pool,
+            "model": model,
+        }, timeout=300.0)
+    except LookupError:
+        return _format_sources(sources), [
+            "context_compressor not loaded; using raw sources"]
+    except Exception as e:
+        return _format_sources(sources), [
+            f"context_compressor raised: {e}; using raw sources"]
+    if not isinstance(r, dict) or not r.get("ok"):
+        err = r.get("error") if isinstance(r, dict) else "non-dict"
+        return _format_sources(sources), [
+            f"context_compressor not ok ({err}); using raw sources"]
+    if r.get("skipped"):
+        # Already under budget — compressor returned concatenated originals.
+        return r.get("merged_summary") or _format_sources(sources), []
+    merged = r.get("merged_summary") or ""
+    warns: list[str] = []
+    if r.get("fallback_used"):
+        warns.append("context_compressor used head+tail fallback (LLM unavailable)")
+    if not merged.strip():
+        return _format_sources(sources), (warns +
+            ["context_compressor returned empty; using raw sources"])
+    return merged, warns
 
 
 def _extract_json(text: str) -> Any:
@@ -434,8 +481,15 @@ class ReflectionAgent:
         model = model or os.environ.get("REFLECTION_MODEL") \
             or os.environ.get("TFE_MODEL") or "gpt-4o-mini"
 
-        # Phase 1: parallel hypotheses
-        sources_block = _format_sources(loaded)
+        # Phase 1: parallel hypotheses. Compress first — context_compressor
+        # short-circuits when total input is under budget, so small inputs
+        # pass through unchanged. When absent, falls back to raw format.
+        sources_block, compress_warnings = await _compress_sources(
+            self.ctx.bus, loaded, task=need,
+            target_tokens=DEFAULT_COMPRESS_TARGET_TOKENS,
+            pool=pool, model=model,
+        )
+        warnings.extend(compress_warnings)
         hyp_results = await asyncio.gather(*[
             self._explore(need=need, framing=fr, sources_block=sources_block,
                           memory_index_block=memory_index_block,

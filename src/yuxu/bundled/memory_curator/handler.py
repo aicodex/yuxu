@@ -25,6 +25,8 @@ from pathlib import Path
 from typing import Optional
 
 from yuxu.bundled.reflection_agent.handler import (
+    DEFAULT_COMPRESS_TARGET_TOKENS,
+    _compress_sources,
     _content_hash,
     _extract_json,
     _format_sources,
@@ -417,6 +419,12 @@ class MemoryCurator:
         log_path = mem_root / "_improvement_log.md"
 
         # Load content
+        # Resolve pool/model first — compress call below shares them.
+        pool = pool or os.environ.get("CURATOR_POOL") \
+            or os.environ.get("NEWSFEED_POOL") or "openai"
+        model = model or os.environ.get("CURATOR_MODEL") \
+            or os.environ.get("TFE_MODEL") or "gpt-4o-mini"
+
         if transcript:
             body_text = transcript
             loaded = [{"path": "<inline>", "text": transcript}]
@@ -429,7 +437,16 @@ class MemoryCurator:
                 await self._publish_skip(run_id, "no readable sources")
                 return {"ok": False, "run_id": run_id,
                         "reason": "no readable sources", "warnings": warnings}
-            body_text = _format_sources(loaded)
+            # Compress loaded sources before feeding the LLM. Short-circuits
+            # on small inputs; falls back to raw format when context_compressor
+            # is absent.
+            body_text, compress_warnings = await _compress_sources(
+                self.ctx.bus, loaded,
+                task=f"curate improvements and memory edits ({context_hint or 'general'})",
+                target_tokens=DEFAULT_COMPRESS_TARGET_TOKENS,
+                pool=pool, model=model,
+            )
+            warnings.extend(compress_warnings)
 
         # Floor: skip trivially short content
         if len(body_text.strip()) < MIN_SOURCE_CHARS:
@@ -438,11 +455,6 @@ class MemoryCurator:
             return {"ok": False, "run_id": run_id,
                     "reason": f"transcript too short ({len(body_text)} chars)",
                     "warnings": warnings}
-
-        pool = pool or os.environ.get("CURATOR_POOL") \
-            or os.environ.get("NEWSFEED_POOL") or "openai"
-        model = model or os.environ.get("CURATOR_MODEL") \
-            or os.environ.get("TFE_MODEL") or "gpt-4o-mini"
 
         ctx_block = (f"\nContext hint: {context_hint.strip()}\n"
                      if context_hint else "")

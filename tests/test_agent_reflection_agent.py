@@ -849,3 +849,128 @@ def test_format_memory_index_caps_at_max_lines():
 def test_format_memory_index_empty_returns_empty_string():
     from yuxu.bundled.reflection_agent.handler import _format_memory_index
     assert _format_memory_index([]) == ""
+
+
+# -- context_compressor wiring --------------------------------
+
+
+@pytest.mark.asyncio
+async def test_compress_sources_fallback_when_skill_missing():
+    """No context_compressor registered → _compress_sources falls back
+    to _format_sources, returns a warning, never raises."""
+    from yuxu.bundled.reflection_agent.handler import _compress_sources
+
+    bus = Bus()  # nothing registered
+    loaded = [{"path": "a.md", "text": "alpha body"},
+               {"path": "b.md", "text": "beta body"}]
+    block, warns = await _compress_sources(bus, loaded, task="test")
+    # Fallback formatting includes both sources
+    assert "alpha body" in block
+    assert "beta body" in block
+    # Warning names the missing skill
+    assert any("context_compressor not loaded" in w for w in warns)
+
+
+@pytest.mark.asyncio
+async def test_compress_sources_uses_compressor_when_registered():
+    bus = Bus()
+    captured: list[dict] = []
+
+    async def fake_compressor(msg):
+        captured.append(dict(msg.payload))
+        return {
+            "ok": True,
+            "merged_summary": "COMPRESSED OUTPUT",
+            "per_document": [],
+            "total_tokens_before": 100,
+            "total_tokens_after": 10,
+            "savings_ratio": 0.9,
+            "fallback_used": False,
+            "skipped": False,
+        }
+    bus.register("context_compressor", fake_compressor)
+
+    from yuxu.bundled.reflection_agent.handler import _compress_sources
+    loaded = [{"path": "a.md", "text": "alpha"},
+               {"path": "b.md", "text": "beta"}]
+    block, warns = await _compress_sources(bus, loaded, task="distill")
+
+    assert block == "COMPRESSED OUTPUT"
+    assert warns == []
+    # Compressor was called with the two documents + task
+    assert captured[0]["op"] == "summarize"
+    assert len(captured[0]["documents"]) == 2
+    assert captured[0]["task"] == "distill"
+
+
+@pytest.mark.asyncio
+async def test_compress_sources_skip_passes_through():
+    """When compressor reports skipped=true (input under budget),
+    _compress_sources uses its merged_summary without warning — no
+    actual compression happened, just pass-through."""
+    bus = Bus()
+
+    async def fake_compressor(msg):
+        return {
+            "ok": True,
+            "merged_summary": "## a.md\nalpha\n\n## b.md\nbeta",
+            "total_tokens_before": 5,
+            "total_tokens_after": 5,
+            "savings_ratio": 0.0,
+            "fallback_used": False,
+            "skipped": True,
+        }
+    bus.register("context_compressor", fake_compressor)
+
+    from yuxu.bundled.reflection_agent.handler import _compress_sources
+    loaded = [{"path": "a.md", "text": "alpha"},
+               {"path": "b.md", "text": "beta"}]
+    block, warns = await _compress_sources(bus, loaded, task="x")
+    assert "alpha" in block and "beta" in block
+    assert warns == []
+
+
+@pytest.mark.asyncio
+async def test_compress_sources_compressor_fallback_reports_warning():
+    bus = Bus()
+
+    async def fake_compressor(msg):
+        return {
+            "ok": True,
+            "merged_summary": "head... [elided] ...tail",
+            "total_tokens_before": 1000,
+            "total_tokens_after": 50,
+            "savings_ratio": 0.95,
+            "fallback_used": True,
+            "skipped": False,
+        }
+    bus.register("context_compressor", fake_compressor)
+
+    from yuxu.bundled.reflection_agent.handler import _compress_sources
+    loaded = [{"path": "a.md", "text": "x" * 100}]
+    block, warns = await _compress_sources(bus, loaded, task="x")
+    assert "elided" in block
+    assert any("head+tail fallback" in w for w in warns)
+
+
+@pytest.mark.asyncio
+async def test_compress_sources_empty_input_noop():
+    from yuxu.bundled.reflection_agent.handler import _compress_sources
+    block, warns = await _compress_sources(Bus(), [], task="x")
+    assert block == ""
+    assert warns == []
+
+
+@pytest.mark.asyncio
+async def test_compress_sources_compressor_raises_falls_back():
+    bus = Bus()
+
+    async def broken(msg):
+        raise RuntimeError("compressor boom")
+    bus.register("context_compressor", broken)
+
+    from yuxu.bundled.reflection_agent.handler import _compress_sources
+    loaded = [{"path": "a.md", "text": "alpha"}]
+    block, warns = await _compress_sources(bus, loaded, task="x")
+    assert "alpha" in block
+    assert any("raised" in w for w in warns)
