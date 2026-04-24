@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""yum — client for the yuxu memory daemon (examples/memory_daemon.py).
+
+Defaults are LLM-budget-aware:
+    - list / search: entries print as `[type] path  name\\n  └ description`
+      (frontmatter only, no bodies — already short)
+    - get: body is tail-truncated to ~2000 chars unless --full is given
+    - --raw prints the daemon JSON verbatim (debug only)
+
+Usage:
+    yum stats
+    yum list [--mode=execute|reflect|debug] [--type=X,Y] [--scope=project]
+             [--tags=a,b] [--limit=N]
+    yum get <path>                 # path as returned by list
+    yum search "<query>" [--k=10]
+
+Env:
+    YUXU_MEMORY_SOCK   socket path (default /tmp/yuxu_memory.sock)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import socket
+import sys
+
+SOCK = os.environ.get("YUXU_MEMORY_SOCK", "/tmp/yuxu_memory.sock")
+DEFAULT_BODY_MAX = 2000
+DEFAULT_DESC_MAX = 200
+
+
+def _query(req: dict) -> dict:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(SOCK)
+    except FileNotFoundError:
+        sys.stderr.write(
+            f"yum: daemon socket not found at {SOCK}\n"
+            f"  start it: cd yuxu && python examples/memory_daemon.py &\n"
+        )
+        sys.exit(2)
+    except ConnectionRefusedError:
+        sys.stderr.write(f"yum: daemon not accepting connections at {SOCK}\n")
+        sys.exit(2)
+    try:
+        s.sendall((json.dumps(req) + "\n").encode("utf-8"))
+        s.shutdown(socket.SHUT_WR)
+        buf = b""
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+        if not buf:
+            sys.stderr.write("yum: empty response from daemon\n")
+            sys.exit(3)
+        return json.loads(buf.decode("utf-8"))
+    finally:
+        s.close()
+
+
+def _trunc(text: str, n: int) -> str:
+    if len(text) <= n:
+        return text
+    return text[:n] + f"\n...[+{len(text) - n} chars truncated; --full to see]"
+
+
+def _fail(resp: dict) -> None:
+    sys.stderr.write(f"yum: {resp.get('error', 'unknown error')}\n")
+    sys.exit(1)
+
+
+def _cmd_stats(args) -> None:
+    resp = _query({"op": "stats"})
+    if args.raw:
+        print(json.dumps(resp, ensure_ascii=False, indent=2)); return
+    if not resp.get("ok"):
+        _fail(resp)
+    print(f"memory_root: {resp.get('memory_root')}")
+    print(f"total:       {resp.get('total')}")
+    print(f"probation:   {resp.get('probation_count')}")
+    print(f"mandatory:   {resp.get('mandatory_count')}")
+    for field in ("by_type", "by_scope", "by_status", "by_evidence_level"):
+        bucket = resp.get(field) or {}
+        if not bucket:
+            continue
+        print(f"{field}:")
+        for k, v in sorted(bucket.items(), key=lambda x: -x[1]):
+            print(f"  {k:<14} {v}")
+
+
+def _cmd_list(args) -> None:
+    req: dict = {"op": "list", "mode": args.mode}
+    if args.type:
+        req["types"] = [s.strip() for s in args.type.split(",") if s.strip()]
+    if args.scope:
+        req["scopes"] = [s.strip() for s in args.scope.split(",") if s.strip()]
+    if args.tags:
+        req["tags"] = [s.strip() for s in args.tags.split(",") if s.strip()]
+    resp = _query(req)
+    if args.raw:
+        print(json.dumps(resp, ensure_ascii=False, indent=2)); return
+    if not resp.get("ok"):
+        _fail(resp)
+    entries = resp.get("entries") or []
+    shown = entries[: args.limit] if args.limit else entries
+    for e in shown:
+        t = e.get("type") or "?"
+        print(f"  [{t:<9}] {e['path']}  {e['name']}")
+        desc = (e.get("description") or "").strip()
+        if desc:
+            print(f"    └ {_trunc(desc, DEFAULT_DESC_MAX)}")
+    omitted = len(entries) - len(shown)
+    tail = f" ({omitted} more, pass --limit to see)" if omitted else ""
+    print(f"\n{len(shown)}/{len(entries)} entries; mode={resp.get('mode')}{tail}")
+
+
+def _cmd_get(args) -> None:
+    resp = _query({"op": "get", "path": args.path})
+    if args.raw:
+        print(json.dumps(resp, ensure_ascii=False, indent=2)); return
+    if not resp.get("ok"):
+        _fail(resp)
+    fm = resp.get("frontmatter") or {}
+    print(f"# {fm.get('name') or args.path}")
+    print(f"path:        {resp.get('path')}")
+    print(f"type:        {fm.get('type')}")
+    print(f"scope:       {fm.get('scope')}")
+    print(f"evidence:    {fm.get('evidence_level')}")
+    print(f"status:      {fm.get('status')}")
+    print(f"tags:        {fm.get('tags')}")
+    print(f"updated:     {fm.get('updated')}")
+    print(f"bytes:       {resp.get('bytes')}")
+    print()
+    body = resp.get("body") or ""
+    if args.full:
+        print(body)
+    else:
+        print(_trunc(body, DEFAULT_BODY_MAX))
+
+
+def _cmd_search(args) -> None:
+    req = {"op": "search", "query": args.query, "limit": args.k, "mode": args.mode}
+    resp = _query(req)
+    if args.raw:
+        print(json.dumps(resp, ensure_ascii=False, indent=2)); return
+    if not resp.get("ok"):
+        _fail(resp)
+    entries = resp.get("entries") or []
+    for e in entries:
+        t = e.get("type") or "?"
+        print(f"  [{t:<9}] {e['path']}  {e['name']}")
+        desc = (e.get("description") or "").strip()
+        if desc:
+            print(f"    └ {_trunc(desc, DEFAULT_DESC_MAX)}")
+    print(f"\n{len(entries)} hit(s) for: {args.query!r}")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        prog="yum",
+        description="client for the yuxu memory daemon",
+    )
+    ap.add_argument("--raw", action="store_true",
+                    help="print daemon JSON verbatim (debug)")
+    ap.add_argument("--full", action="store_true",
+                    help="disable body truncation on `get`")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("stats", help="counts by type / scope / status / evidence")
+
+    p_list = sub.add_parser("list", help="list memory entries (frontmatter only)")
+    p_list.add_argument("--mode", default="execute",
+                        choices=["blank", "explore", "execute", "reflect", "debug"])
+    p_list.add_argument("--type", help="comma-separated types (feedback,project,...)")
+    p_list.add_argument("--scope", help="comma-separated scopes")
+    p_list.add_argument("--tags", help="comma-separated required tags")
+    p_list.add_argument("--limit", type=int, default=None)
+
+    p_get = sub.add_parser("get", help="fetch one entry's body (truncated)")
+    p_get.add_argument("path")
+
+    p_search = sub.add_parser("search", help="keyword search name+description")
+    p_search.add_argument("query")
+    p_search.add_argument("--k", type=int, default=10)
+    p_search.add_argument("--mode", default="reflect",
+                          choices=["blank", "explore", "execute", "reflect", "debug"])
+
+    args = ap.parse_args()
+    {
+        "stats": _cmd_stats,
+        "list": _cmd_list,
+        "get": _cmd_get,
+        "search": _cmd_search,
+    }[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()
